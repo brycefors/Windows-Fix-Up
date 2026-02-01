@@ -32,7 +32,7 @@ set "PS_SCRIPT=%SCRIPT_DIR%Windows-Fix-Up.ps1"
 :: Check if the script exists. If not, download it.
 IF NOT EXIST "%PS_SCRIPT%" (
     ECHO Windows-Fix-Up.ps1 not found. Downloading from GitHub...
-    powershell -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/skilldiego/Windows-Fix-Up/refs/heads/main/Windows-Fix-Up.ps1' -OutFile '%PS_SCRIPT%'"
+    powershell -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Fix-Up.ps1' -OutFile '%PS_SCRIPT%'"
     IF NOT EXIST "%PS_SCRIPT%" (
         ECHO Failed to download Windows-Fix-Up.ps1.
         PAUSE
