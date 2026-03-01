@@ -546,7 +546,20 @@ if ($DisableHibernation) {
 
 # Run check disk on need startup
 Invoke-Task -Description 'Scheduling a disk check (CHKDSK) for the next restart...' -ScriptBlock {
-    'y' | CHKDSK.exe $WindowsDriveLetter /F /R /X
+    $DriveLetterNoColon = $WindowsDriveLetter.Trim(':')
+    try {
+        $PhysicalDisk = Get-Partition -DriveLetter $DriveLetterNoColon -ErrorAction Stop | Get-Disk -ErrorAction Stop | Get-PhysicalDisk -ErrorAction Stop
+        if ('SSD' -in $PhysicalDisk.MediaType) {
+            Write-HostTimestamp "SSD detected. Scheduling file system check only (/F)..."
+            'y' | CHKDSK.exe $WindowsDriveLetter /F /X
+        } else {
+            Write-HostTimestamp "HDD detected. Scheduling full surface scan (/R)..."
+            'y' | CHKDSK.exe $WindowsDriveLetter /F /R /X
+        }
+    } catch {
+        Write-HostTimestamp "Could not determine media type. Defaulting to full scan." -ForegroundColor Yellow
+        'y' | CHKDSK.exe $WindowsDriveLetter /F /R /X
+    }
 }
 
 # Optimize Windows disk
