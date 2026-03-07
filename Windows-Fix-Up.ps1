@@ -450,7 +450,7 @@ if ($ResetWindowsUpdate -or $InstallWindowsUpdates) {
         }
         else {
             Write-HostTimestamp 'NuGet package provider needs to be installed...'
-            Install-PackageProvider -Name NuGet -Force -ForceBootstrap
+            Install-PackageProvider -Name NuGet -Force -ForceBootstrap -Confirm:$false
         }
         if (Get-Module -ListAvailable -Name PSWindowsUpdate) {
             Write-HostTimestamp 'PSWindowsUpdate module is already installed. Checking for updates...'
