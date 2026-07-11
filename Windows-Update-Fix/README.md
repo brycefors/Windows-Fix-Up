@@ -49,6 +49,7 @@ The script supports the following optional parameters:
 | `-ResetAllPolicies` | **Aggressive.** Also removes the broader Software Policies registry hive, not just the Windows Update keys. Automatically enabled by `-Remediate` when a system is classified as *severe*. |
 | `-IncludeGroupPolicyUsers` | Also clears the per-user Local Group Policy store (`C:\Windows\System32\GroupPolicyUsers`). Off by default to avoid wiping intentional per-user policy. |
 | `-RepairComponentStore` | Also runs `DISM /RestoreHealth` and `SFC /scannow` to repair the component store (slow). Automatically enabled by `-Remediate` when a system is classified as *severe*. |
+| `-SkipOnlineBuildDate` | Skips the online lookup of the current build's exact release date and KB article. By default the script queries Microsoft's public release-information page (best-effort; falls back silently if offline or unmatched) to report, e.g., `Build 26200.8737 released: 2026-06-23 via KB5095093`. |
 | `-TriggerUpdateScan` | Triggers a fresh Windows Update detection scan after the fix. Automatically enabled by `-Remediate`. |
 | `-SkipInteractive` | Skips the interactive confirmation prompt while still showing output. |
 
@@ -58,11 +59,15 @@ Running with `-Remediate` makes the script inspect the Windows Update history (i
 
 | Severity | Trigger | Action |
 |---|---|---|
-| **Healthy** | A genuine patch was installed within `-StaleDays`, and there are no action-worthy failures. | Does nothing and exits. |
-| **Mild** | Updates are stale, or there are unresolved failures while stale. | Baseline repair: clear Local Group Policy, remove the Windows Update policy keys, reset the cache/BITS queue, re-register the DLLs, verify services, and run `gpupdate /force`. |
-| **Severe** | Never patched / older than **2 × `-StaleDays`**, or more than `-FailureFixThreshold` unresolved failures. | Everything in *Mild*, **plus** `-ResetAllPolicies` and `-RepairComponentStore` (DISM/SFC). |
+| **Healthy** | A genuine patch was installed within `-StaleDays`, the installed build was released within `-StaleDays`, and there are no action-worthy failures. | Does nothing and exits. |
+| **Mild** | Updates are stale (no recent patch *or* the installed build was released more than `-StaleDays` days ago), or there are unresolved failures while stale. | Baseline repair: clear Local Group Policy, remove the Windows Update policy keys, reset the cache/BITS queue, re-register the DLLs, verify services, and run `gpupdate /force`. |
+| **Severe** | Never patched / no patch and no build newer than **2 × `-StaleDays`**, or more than `-FailureFixThreshold` unresolved failures. | Everything in *Mild*, **plus** `-ResetAllPolicies` and `-RepairComponentStore` (DISM/SFC). |
 
 In every remediation case a fresh Windows Update scan is triggered afterward, and the whole process runs hands-off (no prompts). Remediation also honors the false-positive logic: a small number of unresolved failures alongside a recent successful patch are reported but ignored.
+
+Staleness is judged from **two** independent signals: the date of the last successful patch in the update history, and the Microsoft release date of the currently-installed build revision (resolved online, unless `-SkipOnlineBuildDate` is set). The build-date signal catches machines whose update history has been cleared or truncated but which are nonetheless running an old build. If the online lookup is unavailable (offline or unmatched), the script silently falls back to the update-history signal alone.
+
+> **Note on empty update history:** On modern Windows 11, cumulative updates are often installed through the Unified Update Platform and do **not** appear in the legacy Windows Update history (`Microsoft.Update.Session` can report zero entries). When the history is empty, the script does not blindly assume the machine is unpatched — it falls back to the installed build's release date. A recent build keeps the machine classified as *healthy*; only an old build (or an unavailable build date) is treated as stale.
 
 ## What the Script Does
 

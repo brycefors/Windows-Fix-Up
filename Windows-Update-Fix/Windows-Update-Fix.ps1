@@ -41,6 +41,8 @@ param(
     [int]$FailureFixThreshold = 5,
     [Parameter(HelpMessage = 'Also run DISM /RestoreHealth and SFC to repair the component store (slow)')]
     [switch]$RepairComponentStore,
+    [Parameter(HelpMessage = 'Skip the online lookup of the current build''s exact release date/KB (Microsoft release information)')]
+    [switch]$SkipOnlineBuildDate,
     [switch]$SkipInteractive # Skips the interactive confirmation prompt
 )
 
@@ -155,9 +157,172 @@ function Set-ServiceStartupType {
     }
 }
 
-# Returns the Date of the most recent successfully installed Windows Update patch, excluding
+# Best-effort online lookup of the exact release date and KB article for a specific Windows build
+# revision (Build.UBR), using Microsoft's public release information page. Returns a PSCustomObject with
+# Date and KB (either may be $null), or $null if the build cannot be found.
+function Get-BuildReleaseDateOnline {
+    param(
+        [string]$BuildUbr,
+        [bool]$IsWin11
+    )
+    $Url = if ($IsWin11) {
+        'https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information'
+    }
+    else {
+        'https://learn.microsoft.com/en-us/windows/release-health/release-information'
+    }
+    try {
+        $Html = (Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop).Content
+    }
+    catch {
+        Write-HostTimestamp "  Could not reach the Microsoft release information page: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $null
+    }
+    # Flatten the HTML so each table row (date, build revision, KB article) sits on one line.
+    $Text = ($Html -replace '<[^>]+>', ' ') -replace '\s+', ' '
+    $Occurrences = [regex]::Matches($Text, [regex]::Escape($BuildUbr))
+    if ($Occurrences.Count -eq 0) { return $null }
+
+    $FallbackDate = $null
+    foreach ($Occurrence in $Occurrences) {
+        $Idx = $Occurrence.Index
+        # The release date is the date column closest before the build revision.
+        $Start = [Math]::Max(0, $Idx - 120)
+        $Prefix = $Text.Substring($Start, $Idx - $Start)
+        $Dates = [regex]::Matches($Prefix, '\d{4}-\d{2}-\d{2}')
+        $Date = if ($Dates.Count -gt 0) { $Dates[$Dates.Count - 1].Value } else { $null }
+
+        # In the release-history table the KB article follows immediately after the build revision.
+        $AfterStart = $Idx + $BuildUbr.Length
+        $AfterLength = [Math]::Min(20, $Text.Length - $AfterStart)
+        $After = $Text.Substring($AfterStart, $AfterLength)
+        $KbMatch = [regex]::Match($After, 'KB\d+')
+
+        if ($KbMatch.Success) {
+            # This occurrence has an associated KB - the most specific match.
+            return [PSCustomObject]@{ Date = $Date; KB = $KbMatch.Value }
+        }
+        if (-not $FallbackDate -and $Date) { $FallbackDate = $Date }
+    }
+    return [PSCustomObject]@{ Date = $FallbackDate; KB = $null }
+}
+
+# Resolves the currently-installed build revision (from the registry) and, unless online lookup is
+# disabled, its exact release date and KB from Microsoft's release information. Returns a PSCustomObject
+# with BuildUbr, ReleaseDate ([datetime] or $null) and KB, or $null if the build revision is unavailable.
+function Get-CurrentBuildReleaseInfo {
+    if ($script:BuildReleaseInfoResolved) { return $script:BuildReleaseInfo }
+    $script:BuildReleaseInfoResolved = $true
+    $Reg = $null
+    try { $Reg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop } catch { }
+    if (-not $Reg -or -not $Reg.CurrentBuildNumber -or $null -eq $Reg.UBR) {
+        $script:BuildReleaseInfo = $null
+        return $null
+    }
+    $Build = $Reg.CurrentBuildNumber
+    $Ubr = $Reg.UBR
+    $IsWin11 = ([int]$Build -ge 22000)
+    $BuildUbr = "$Build.$Ubr"
+    if ($SkipOnlineBuildDate) {
+        $script:BuildReleaseInfo = [PSCustomObject]@{ BuildUbr = $BuildUbr; ReleaseDate = $null; KB = $null }
+        return $script:BuildReleaseInfo
+    }
+    $Online = Get-BuildReleaseDateOnline -BuildUbr $BuildUbr -IsWin11 $IsWin11
+    $ReleaseDate = $null
+    if ($Online -and $Online.Date) {
+        try { $ReleaseDate = [datetime]::ParseExact($Online.Date, 'yyyy-MM-dd', $null) } catch { $ReleaseDate = $null }
+    }
+    $script:BuildReleaseInfo = [PSCustomObject]@{
+        BuildUbr    = $BuildUbr
+        ReleaseDate = $ReleaseDate
+        KB          = if ($Online) { $Online.KB } else { $null }
+    }
+    return $script:BuildReleaseInfo
+}
+
+# Writes the full Windows build version and, where known, the feature update's general-availability
+# date and the date the build was applied to this PC.
+function Show-WindowsBuildInfo {
+    $RegPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $Reg = $null
+    try { $Reg = Get-ItemProperty -Path $RegPath -ErrorAction Stop } catch { }
+    $Os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+
+    # Build the full version number: Major.Minor.Build.UBR (e.g. 10.0.26200.1234)
+    $Major = if ($Reg -and $Reg.CurrentMajorVersionNumber) { $Reg.CurrentMajorVersionNumber } else { 10 }
+    $Minor = if ($Reg -and $null -ne $Reg.CurrentMinorVersionNumber) { $Reg.CurrentMinorVersionNumber } else { 0 }
+    $Build = if ($Reg -and $Reg.CurrentBuildNumber) { $Reg.CurrentBuildNumber } else { $Os.BuildNumber }
+    $Ubr = if ($Reg) { $Reg.UBR } else { $null }
+    $FullVersion = if ($null -ne $Ubr) { "$Major.$Minor.$Build.$Ubr" } else { "$Major.$Minor.$Build" }
+
+    # The registry ProductName can still say "Windows 10" on Windows 11, so correct it by build number.
+    $IsWin11 = ([int]$Build -ge 22000)
+    $ProductName = if ($Reg) { $Reg.ProductName } else { $Os.Caption }
+    if ($IsWin11 -and $ProductName -like 'Windows 10*') {
+        $ProductName = $ProductName -replace '^Windows 10', 'Windows 11'
+    }
+    $Edition = if ($Reg) { $Reg.EditionID } else { $null }
+    $DisplayVersion = if ($Reg -and $Reg.DisplayVersion) { $Reg.DisplayVersion } elseif ($Reg) { $Reg.ReleaseId } else { $null }
+
+    # Approximate general-availability dates for each Windows feature update (DisplayVersion),
+    # keyed by "<11|10>-<DisplayVersion>". This only reflects when the feature update first shipped,
+    # not the exact release date of the current monthly (UBR) patch, which cannot be determined offline.
+    $ReleaseDates = @{
+        '11-21H2' = 'October 4, 2021'
+        '11-22H2' = 'September 20, 2022'
+        '11-23H2' = 'October 31, 2023'
+        '11-24H2' = 'October 1, 2024'
+        '11-25H2' = 'September 2025'
+        '10-1507' = 'July 29, 2015'
+        '10-1511' = 'November 10, 2015'
+        '10-1607' = 'August 2, 2016'
+        '10-1703' = 'April 5, 2017'
+        '10-1709' = 'October 17, 2017'
+        '10-1803' = 'April 30, 2018'
+        '10-1809' = 'November 13, 2018'
+        '10-1903' = 'May 21, 2019'
+        '10-1909' = 'November 12, 2019'
+        '10-2004' = 'May 27, 2020'
+        '10-20H2' = 'October 20, 2020'
+        '10-21H1' = 'May 18, 2021'
+        '10-21H2' = 'November 16, 2021'
+        '10-22H2' = 'October 18, 2022'
+    }
+    $ReleaseKey = ('{0}-{1}' -f $(if ($IsWin11) { '11' } else { '10' }), $DisplayVersion)
+    $ReleaseDate = $ReleaseDates[$ReleaseKey]
+
+    Write-Host $LineBreak
+    Write-HostTimestamp "Operating System: $ProductName$(if ($Edition) { " (Edition: $Edition)" })" -ForegroundColor Cyan
+    Write-Host "  Feature update : $DisplayVersion"
+    Write-Host "  Full version   : $FullVersion"
+    if ($ReleaseDate) {
+        Write-Host "  $DisplayVersion first released: $ReleaseDate (feature update general availability)"
+    }
+    else {
+        Write-Host "  Release date   : not available in local reference for '$DisplayVersion'"
+    }
+    # By default, look up the exact release date and KB of this specific build revision online.
+    if (-not $SkipOnlineBuildDate -and $null -ne $Ubr) {
+        Write-Host "  Looking up the exact release for build $Build.$Ubr online..."
+        $BuildRelease = Get-CurrentBuildReleaseInfo
+        if ($BuildRelease -and ($BuildRelease.ReleaseDate -or $BuildRelease.KB)) {
+            $ReleasedOn = if ($BuildRelease.ReleaseDate) { $BuildRelease.ReleaseDate.ToString('yyyy-MM-dd') } else { 'unknown date' }
+            $ViaKb = if ($BuildRelease.KB) { " via $($BuildRelease.KB)" } else { '' }
+            Write-Host "  Build $Build.$Ubr released: $ReleasedOn$ViaKb (per Microsoft release information)"
+        }
+        else {
+            Write-Host "  Exact build release could not be determined online." -ForegroundColor Yellow
+        }
+    }
+    if ($Os -and $Os.InstallDate) {
+        Write-Host "  Applied on this PC: $($Os.InstallDate) (when this build/feature update was installed here)"
+    }
+    Write-Host $LineBreak
+}
+
+# Returns the most recent successfully installed Windows Update patch (Date and Title), excluding
 # driver updates and Microsoft Defender/antivirus definition updates. Returns $null if none found.
-function Get-LastUpdatePatchDate {
+function Get-LastUpdatePatch {
     try {
         $Session = New-Object -ComObject Microsoft.Update.Session
         $Searcher = $Session.CreateUpdateSearcher()
@@ -170,7 +335,7 @@ function Get-LastUpdatePatchDate {
         return $null
     }
 
-    $LastDate = $null
+    $LastEntry = $null
     foreach ($Entry in $History) {
         # Operation 1 = Installation, ResultCode 2 = Succeeded
         if ($Entry.Operation -ne 1 -or $Entry.ResultCode -ne 2) { continue }
@@ -180,9 +345,10 @@ function Get-LastUpdatePatchDate {
         }
         if ($IsExcluded) { continue }
         if ($Entry.Title -match 'driver|Defender|Security Intelligence|Definition Update|Antivirus') { continue }
-        if (-not $LastDate -or $Entry.Date -gt $LastDate) { $LastDate = $Entry.Date }
+        if (-not $LastEntry -or $Entry.Date -gt $LastEntry.Date) { $LastEntry = $Entry }
     }
-    return $LastDate
+    if (-not $LastEntry) { return $null }
+    return [PSCustomObject]@{ Date = $LastEntry.Date; Title = $LastEntry.Title }
 }
 
 # Returns failed Windows Update installations within the given number of days, excluding driver
@@ -275,16 +441,16 @@ if ($Remediate) {
     Clear-Host
     Write-HostTimestamp "Running in adaptive Remediation mode on $($env:ComputerName) - assessing Windows Update health..." -ForegroundColor Cyan
 
-    $LastPatchDate = Get-LastUpdatePatchDate
+    $LastPatch = Get-LastUpdatePatch
     $RecentFailures = Get-RecentUpdateFailures -Days $StaleDays
     $UnresolvedFailures = @($RecentFailures | Where-Object { -not $_.Resolved })
     $UnresolvedCount = $UnresolvedFailures.Count
     $Cutoff = (Get-Date).AddDays(-$StaleDays)
     $VeryStaleCutoff = (Get-Date).AddDays(-2 * $StaleDays)
 
-    if ($LastPatchDate) {
-        $DaysSince = [math]::Round(((Get-Date) - $LastPatchDate).TotalDays, 1)
-        Write-HostTimestamp "Last non-driver, non-definition patch was installed on $LastPatchDate ($DaysSince days ago)."
+    if ($LastPatch) {
+        $DaysSince = [math]::Round(((Get-Date) - $LastPatch.Date).TotalDays, 1)
+        Write-HostTimestamp "Last successful patch: $($LastPatch.Title) - installed $($LastPatch.Date) ($DaysSince days ago)."
     }
     else {
         Write-HostTimestamp 'No qualifying Windows Update patch was found in the update history.' -ForegroundColor Yellow
@@ -302,16 +468,42 @@ if ($Remediate) {
         }
     }
 
+    # Additional staleness signal: how long ago the currently-installed build revision was released by
+    # Microsoft. If a newer monthly build exists that this PC never installed, its build will look old,
+    # which can catch staleness that the update history alone misses (e.g. a truncated/cleared history).
+    $BuildInfo = Get-CurrentBuildReleaseInfo
+    $BuildStale = $false
+    $BuildVeryStale = $false
+    if ($BuildInfo -and $BuildInfo.ReleaseDate) {
+        $BuildAgeDays = [math]::Round(((Get-Date) - $BuildInfo.ReleaseDate).TotalDays, 1)
+        $BuildStale = ($BuildInfo.ReleaseDate -lt $Cutoff)
+        $BuildVeryStale = ($BuildInfo.ReleaseDate -lt $VeryStaleCutoff)
+        $KbNote = if ($BuildInfo.KB) { " ($($BuildInfo.KB))" } else { '' }
+        Write-HostTimestamp "Installed build $($BuildInfo.BuildUbr)$KbNote was released $($BuildInfo.ReleaseDate.ToString('yyyy-MM-dd')) ($BuildAgeDays days ago)."
+    }
+
     # Classify severity.
-    $NeverPatched = (-not $LastPatchDate)
-    $IsStale = ($NeverPatched -or $LastPatchDate -lt $Cutoff)
-    $IsVeryStale = ($NeverPatched -or $LastPatchDate -lt $VeryStaleCutoff)
+    # The legacy update history is often empty on modern Windows 11 (updates installed via the Unified
+    # Update Platform do not populate it), so an absent history is only treated as stale when the
+    # installed build is not recent either. The build-release date remains an independent stale signal
+    # that can also catch a recently-recorded patch sitting on an old build.
+    $NeverPatched = (-not $LastPatch)
+    $HaveBuildDate = ($BuildInfo -and $BuildInfo.ReleaseDate)
+    $BuildRecent = ($HaveBuildDate -and $BuildInfo.ReleaseDate -ge $Cutoff)
+    $BuildVeryRecent = ($HaveBuildDate -and $BuildInfo.ReleaseDate -ge $VeryStaleCutoff)
+    $PatchStale = ($LastPatch -and $LastPatch.Date -lt $Cutoff)
+    $PatchVeryStale = ($LastPatch -and $LastPatch.Date -lt $VeryStaleCutoff)
+    # An empty/absent history counts as stale only when a recent build does not rescue it.
+    $UnknownStale = ($NeverPatched -and -not $BuildRecent)
+    $UnknownVeryStale = ($NeverPatched -and -not $BuildVeryRecent)
+    $IsStale = ($PatchStale -or $BuildStale -or $UnknownStale)
+    $IsVeryStale = ($PatchVeryStale -or $BuildVeryStale -or $UnknownVeryStale)
     $ManyFailures = ($UnresolvedCount -gt $FailureFixThreshold)
     # A few unresolved failures alongside a recent successful patch are treated as likely false positives.
     $FailuresRequireFix = ($UnresolvedCount -gt 0 -and $IsStale) -or $ManyFailures
 
     if (-not $IsStale -and -not $FailuresRequireFix) {
-        Write-HostTimestamp "Windows Update looks healthy (a patch was installed within the last $StaleDays days and no action-worthy failures were found). No remediation needed." -ForegroundColor Green
+        Write-HostTimestamp "Windows Update looks healthy (patched within the last $StaleDays days by patch history or build release date, and no action-worthy failures were found). No remediation needed." -ForegroundColor Green
         Write-Host $LineBreak
         Stop-Transcript | Out-Null
         exit 0
@@ -329,15 +521,19 @@ if ($Remediate) {
     $TriggerUpdateScan = $true
 
     if ($Severe) {
-        $Reason = if ($NeverPatched) { 'no qualifying patch found in history' }
-                  elseif ($IsVeryStale) { "no patch within the last $([int](2 * $StaleDays)) days" }
+        $Reason = if ($UnknownVeryStale) { 'no patch in history and the installed build is not recent' }
+                  elseif ($PatchVeryStale) { "no patch within the last $([int](2 * $StaleDays)) days" }
+                  elseif ($BuildVeryStale) { "the installed build was released more than $([int](2 * $StaleDays)) days ago" }
                   else { "more than $FailureFixThreshold unresolved update failures" }
         Write-HostTimestamp "Severity: SEVERE ($Reason). Applying the full repair, including -ResetAllPolicies and -RepairComponentStore." -ForegroundColor Red
         $ResetAllPolicies = $true
         $RepairComponentStore = $true
     }
     else {
-        $Reason = if ($IsStale) { "no patch within the last $StaleDays days" } else { 'unresolved update failures' }
+        $Reason = if ($PatchStale) { "no patch within the last $StaleDays days" }
+                  elseif ($BuildStale) { "the installed build was released more than $StaleDays days ago" }
+                  elseif ($UnknownStale) { 'no patch in history and the installed build is not recent' }
+                  else { 'unresolved update failures' }
         Write-HostTimestamp "Severity: MILD ($Reason). Applying the baseline Windows Update repair." -ForegroundColor Yellow
     }
 
@@ -350,6 +546,8 @@ if ($Remediate) {
 if (-not $Unattended -and -not $SkipInteractive) {
     Clear-Host
     Write-HostTimestamp "Running Windows Update Fix on $($env:ComputerName)..." -Foreground Yellow
+    # Show the full Windows build version (and optional online release date) before asking to continue
+    Show-WindowsBuildInfo
     Write-Host "This tool repairs Windows Update by resetting Local Group Policy and Windows Update policy settings."
     Write-Host ""
     Write-Host "It will perform the following actions:"
@@ -373,20 +571,38 @@ if (-not $Unattended -and -not $SkipInteractive) {
     }
     Write-Host ""
     # Show the last real Windows Update patch and whether it is considered stale
-    $LastPatchInfo = Get-LastUpdatePatchDate
+    $LastPatchInfo = Get-LastUpdatePatch
     $HasRecentPatch = $false
     if ($LastPatchInfo) {
-        $DaysSincePatch = [math]::Round(((Get-Date) - $LastPatchInfo).TotalDays, 1)
-        if ($LastPatchInfo -ge (Get-Date).AddDays(-$StaleDays)) {
+        $DaysSincePatch = [math]::Round(((Get-Date) - $LastPatchInfo.Date).TotalDays, 1)
+        if ($LastPatchInfo.Date -ge (Get-Date).AddDays(-$StaleDays)) {
             $HasRecentPatch = $true
-            Write-Host "Last Windows Update patch: $LastPatchInfo ($DaysSincePatch days ago) - within the $StaleDays day threshold (not stale)." -ForegroundColor Green
+            Write-Host "Last Windows Update patch: $($LastPatchInfo.Title) - installed $($LastPatchInfo.Date) ($DaysSincePatch days ago) - within the $StaleDays day threshold (not stale)." -ForegroundColor Green
         }
         else {
-            Write-Host "Last Windows Update patch: $LastPatchInfo ($DaysSincePatch days ago) - STALE (older than $StaleDays days)." -ForegroundColor Yellow
+            Write-Host "Last Windows Update patch: $($LastPatchInfo.Title) - installed $($LastPatchInfo.Date) ($DaysSincePatch days ago) - STALE (older than $StaleDays days)." -ForegroundColor Yellow
         }
     }
     else {
-        Write-Host "Last Windows Update patch: none found in history - considered STALE." -ForegroundColor Yellow
+        # The legacy Windows Update history can be empty on modern Windows 11 (cumulative updates
+        # installed via the Unified Update Platform do not populate the WUA history). Fall back to the
+        # installed build's Microsoft release date as the patch signal instead of assuming STALE.
+        $BuildInfo = Get-CurrentBuildReleaseInfo
+        if ($BuildInfo -and $BuildInfo.ReleaseDate) {
+            $DaysSinceBuild = [math]::Round(((Get-Date) - $BuildInfo.ReleaseDate).TotalDays, 1)
+            $KbNote = if ($BuildInfo.KB) { " ($($BuildInfo.KB))" } else { '' }
+            if ($BuildInfo.ReleaseDate -ge (Get-Date).AddDays(-$StaleDays)) {
+                $HasRecentPatch = $true
+                Write-Host "Last Windows Update patch: build $($BuildInfo.BuildUbr)$KbNote - released $($BuildInfo.ReleaseDate.ToString('yyyy-MM-dd')) ($DaysSinceBuild days ago) - within the $StaleDays day threshold (not stale)." -ForegroundColor Green
+            }
+            else {
+                Write-Host "Last Windows Update patch: build $($BuildInfo.BuildUbr)$KbNote - released $($BuildInfo.ReleaseDate.ToString('yyyy-MM-dd')) ($DaysSinceBuild days ago) - STALE (older than $StaleDays days)." -ForegroundColor Yellow
+            }
+            Write-Host "  (No entries in the legacy Windows Update history; using the installed build's release date instead.)" -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host "Last Windows Update patch: none found in history - considered STALE." -ForegroundColor Yellow
+        }
     }
     # Show any recent failed update installations
     $RecentFailures = Get-RecentUpdateFailures -Days $StaleDays
@@ -428,6 +644,11 @@ if ($Unattended) {
     Write-Host $LineBreak
 }
 
+# Report the full Windows build version for non-interactive runs (the interactive prompt shows it above)
+if ($Unattended -or $SkipInteractive) {
+    Show-WindowsBuildInfo
+}
+
 # Change directory to System32 in case path is not set correctly
 try {
     $System32Path = "$env:windir\System32"
@@ -452,13 +673,13 @@ if ($NoSystem32) {
 # more than -FailureFixThreshold unresolved failures still triggers a repair.
 if ($FixIfStale -and -not $Remediate) {
     Write-HostTimestamp "Checking Windows Update health (-FixIfStale, threshold = $StaleDays days)..."
-    $LastPatchDate = Get-LastUpdatePatchDate
+    $LastPatch = Get-LastUpdatePatch
     $RecentFailures = Get-RecentUpdateFailures -Days $StaleDays
     $UnresolvedFailures = @($RecentFailures | Where-Object { -not $_.Resolved })
     $Cutoff = (Get-Date).AddDays(-$StaleDays)
-    if ($LastPatchDate) {
-        $DaysSince = [math]::Round(((Get-Date) - $LastPatchDate).TotalDays, 1)
-        Write-HostTimestamp "Last non-driver, non-definition patch was installed on $LastPatchDate ($DaysSince days ago)."
+    if ($LastPatch) {
+        $DaysSince = [math]::Round(((Get-Date) - $LastPatch.Date).TotalDays, 1)
+        Write-HostTimestamp "Last successful patch: $($LastPatch.Title) - installed $($LastPatch.Date) ($DaysSince days ago)."
     }
     else {
         Write-HostTimestamp 'No qualifying Windows Update patch was found in the update history.' -ForegroundColor Yellow
@@ -476,7 +697,21 @@ if ($FixIfStale -and -not $Remediate) {
         }
     }
 
-    $IsStale = (-not $LastPatchDate -or $LastPatchDate -lt $Cutoff)
+    # Additional staleness signal: how long ago the currently-installed build revision was released.
+    $BuildInfo = Get-CurrentBuildReleaseInfo
+    $BuildStale = $false
+    $BuildRecent = $false
+    if ($BuildInfo -and $BuildInfo.ReleaseDate) {
+        $BuildAgeDays = [math]::Round(((Get-Date) - $BuildInfo.ReleaseDate).TotalDays, 1)
+        $BuildStale = ($BuildInfo.ReleaseDate -lt $Cutoff)
+        $BuildRecent = ($BuildInfo.ReleaseDate -ge $Cutoff)
+        $KbNote = if ($BuildInfo.KB) { " ($($BuildInfo.KB))" } else { '' }
+        Write-HostTimestamp "Installed build $($BuildInfo.BuildUbr)$KbNote was released $($BuildInfo.ReleaseDate.ToString('yyyy-MM-dd')) ($BuildAgeDays days ago)."
+    }
+    # The legacy update history is often empty on modern Windows 11, so treat an absent history as stale
+    # only when a recent build does not rescue it; a recorded patch that is old (or an old build) is stale.
+    $PatchStale = if (-not $LastPatch) { -not $BuildRecent } else { $LastPatch.Date -lt $Cutoff }
+    $IsStale = ($PatchStale -or $BuildStale)
     $UnresolvedCount = $UnresolvedFailures.Count
     # Failures force a repair when there is no recent successful patch, or when they exceed the tolerated count.
     $FailuresRequireFix = ($UnresolvedCount -gt 0 -and $IsStale) -or ($UnresolvedCount -gt $FailureFixThreshold)
@@ -489,14 +724,15 @@ if ($FixIfStale -and -not $Remediate) {
     }
 
     if (-not $IsStale -and -not $FailuresRequireFix) {
-        Write-HostTimestamp "A patch was installed within the last $StaleDays days and no action-worthy failures were found. Windows Update looks healthy - no action needed." -ForegroundColor Green
+        Write-HostTimestamp "Patched within the last $StaleDays days (by patch history or build release date) and no action-worthy failures were found. Windows Update looks healthy - no action needed." -ForegroundColor Green
         Write-Host $LineBreak
         Stop-Transcript | Out-Null
         exit 0
     }
     else {
         $Reason = if ($IsStale -and $FailuresRequireFix) { "no recent patch and unresolved update failures" }
-                  elseif ($IsStale) { "no patch within the last $StaleDays days" }
+                  elseif ($PatchStale) { "no patch within the last $StaleDays days" }
+                  elseif ($BuildStale) { "the installed build was released more than $StaleDays days ago" }
                   else { "more than $FailureFixThreshold unresolved update failures" }
         Write-HostTimestamp "Proceeding with the Windows Update policy repair ($Reason)..." -ForegroundColor Cyan
     }
