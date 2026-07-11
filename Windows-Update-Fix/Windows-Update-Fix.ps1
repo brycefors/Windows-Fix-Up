@@ -644,6 +644,13 @@ if (-not $Unattended -and -not $SkipInteractive) {
     Write-HostTimestamp "Running Windows Update Fix on $($env:ComputerName)..." -Foreground Yellow
     # Show the full Windows build version (and optional online release date) before asking to continue
     Show-WindowsBuildInfo
+    # Show current free disk space on the system drive, color-coded against the thresholds
+    $FreeGB = Get-SystemDriveFreeGB
+    if ($null -ne $FreeGB) {
+        $DiskColor = if ($FreeGB -lt 5) { 'Red' } elseif ($FreeGB -lt 20) { 'Yellow' } else { 'Green' }
+        Write-Host "Free disk space on $env:SystemDrive : $FreeGB GB" -ForegroundColor $DiskColor
+        Write-Host ""
+    }
     Write-Host "This tool repairs Windows Update by resetting Local Group Policy and Windows Update policy settings."
     Write-Host ""
     Write-Host "It will perform the following actions:"
