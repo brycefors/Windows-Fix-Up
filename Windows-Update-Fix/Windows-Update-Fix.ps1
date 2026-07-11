@@ -429,6 +429,102 @@ function Get-RecentUpdateFailures {
     return @($Failures | Sort-Object Date -Descending)
 }
 
+# Removes the SoftwareDistribution.old_* and catroot2.old_* backup folders that earlier runs of this
+# script create when they rename those folders, so the backups do not accumulate on repeated runs.
+function Remove-OldUpdateBackups {
+    $System32 = Join-Path -Path $env:windir -ChildPath 'System32'
+    $BackupLocations = @(
+        @{ Parent = $env:windir; Pattern = 'SoftwareDistribution.old_*' },
+        @{ Parent = $System32;   Pattern = 'catroot2.old_*' }
+    )
+    foreach ($Location in $BackupLocations) {
+        if (Test-Path $Location.Parent) {
+            Get-ChildItem -Path $Location.Parent -Directory -Filter $Location.Pattern -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction Stop
+                    Write-HostTimestamp "  Removed old backup: $($_.FullName)"
+                }
+                catch {
+                    Write-HostTimestamp "  Could not remove old backup $($_.FullName): $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+}
+
+# Returns the free space on the system drive (e.g. C:) in GB, rounded to two decimals, or $null if it
+# cannot be determined.
+function Get-SystemDriveFreeGB {
+    try {
+        $Drive = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'" -ErrorAction Stop
+        if ($Drive -and $Drive.FreeSpace) {
+            return [math]::Round($Drive.FreeSpace / 1GB, 2)
+        }
+    }
+    catch { }
+    return $null
+}
+
+# Best-effort, safe disk cleanup to free space before attempting updates: removes leftover update-folder
+# backups from previous runs, clears the Windows Update download cache (Windows re-downloads as needed),
+# and empties the user and Windows temp folders.
+function Invoke-LightDiskCleanup {
+    Write-HostTimestamp 'Performing light disk cleanup to free space...' -ForegroundColor Cyan
+
+    # Remove leftover *.old_* backups created by previous runs of this script.
+    Remove-OldUpdateBackups
+
+    # Clear the Windows Update download cache.
+    $DownloadCache = Join-Path -Path $env:windir -ChildPath 'SoftwareDistribution\Download'
+    if (Test-Path $DownloadCache) {
+        Get-ChildItem -Path $DownloadCache -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Write-HostTimestamp '  Cleared the Windows Update download cache.'
+    }
+
+    # Clear the user and Windows temp folders.
+    foreach ($Temp in @($env:TEMP, (Join-Path -Path $env:windir -ChildPath 'Temp'))) {
+        if ($Temp -and (Test-Path $Temp)) {
+            Get-ChildItem -Path $Temp -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-HostTimestamp '  Cleared temporary files.'
+}
+
+# --- Disk space check ---
+# Windows Update needs free space to download and stage updates. Gate the run on available space:
+#   * under 1 GB  -> refuse to run (updates cannot function reliably);
+#   * under 5 GB  -> run a light proactive cleanup to free space, then continue;
+#   * under 20 GB -> warn (feature updates may need more room) but continue.
+$FreeGB = Get-SystemDriveFreeGB
+if ($null -eq $FreeGB) {
+    Write-HostTimestamp 'Could not determine free disk space on the system drive. Continuing.' -ForegroundColor Yellow
+}
+else {
+    Write-HostTimestamp "Free space on $env:SystemDrive : $FreeGB GB"
+    if ($FreeGB -lt 1) {
+        Write-HostTimestamp "CRITICAL: Less than 1 GB of free disk space ($FreeGB GB). Windows Update cannot function reliably, so this script will not run. Free up space and try again." -ForegroundColor Red
+        Stop-Transcript | Out-Null
+        exit 1
+    }
+    elseif ($FreeGB -lt 5) {
+        Write-HostTimestamp "WARNING: Low disk space ($FreeGB GB free). Running a light proactive cleanup to free space before continuing..." -ForegroundColor Yellow
+        Invoke-LightDiskCleanup
+        $FreeGB = Get-SystemDriveFreeGB
+        if ($null -ne $FreeGB) {
+            Write-HostTimestamp "Free space after cleanup: $FreeGB GB"
+            if ($FreeGB -lt 1) {
+                Write-HostTimestamp "CRITICAL: Still under 1 GB of free disk space after cleanup ($FreeGB GB). This script will not run." -ForegroundColor Red
+                Stop-Transcript | Out-Null
+                exit 1
+            }
+        }
+    }
+    elseif ($FreeGB -lt 20) {
+        Write-HostTimestamp "WARNING: Free disk space is below 20 GB ($FreeGB GB). Windows feature updates may need more room, but the script will continue." -ForegroundColor Yellow
+    }
+}
+Write-Host $LineBreak
+
 # --- Adaptive remediation (optional) ---
 # When -Remediate is used, the script inspects the Windows Update history and automatically decides both
 # WHETHER to act and HOW aggressively, based on how broken things look:
@@ -838,6 +934,9 @@ Invoke-Task -Description 'Removing Windows Update policy registry keys...' -Scri
 # 3. Reset the Windows Update cache and BITS transfer queue
 Invoke-Task -Description 'Resetting the Windows Update cache (SoftwareDistribution, catroot2, BITS queue)...' -ScriptBlock {
     $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+    # Remove any leftover *.old_* backups from previous runs so they do not accumulate.
+    Remove-OldUpdateBackups
 
     # Clear the BITS transfer queue (qmgr*.dat)
     $BitsQueue = Join-Path -Path $env:ALLUSERSPROFILE -ChildPath 'Microsoft\Network\Downloader'

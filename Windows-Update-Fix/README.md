@@ -69,6 +69,18 @@ Staleness is judged from **two** independent signals: the date of the last succe
 
 > **Note on empty update history:** On modern Windows 11, cumulative updates are often installed through the Unified Update Platform and do **not** appear in the legacy Windows Update history (`Microsoft.Update.Session` can report zero entries). When the history is empty, the script does not blindly assume the machine is unpatched — it falls back to the installed build's release date. A recent build keeps the machine classified as *healthy*; only an old build (or an unavailable build date) is treated as stale.
 
+## Disk Space Check
+
+Before doing any work, the script checks the free space on the system drive, because Windows Update needs room to download and stage updates:
+
+| Free space | Behavior |
+|---|---|
+| **Under 1 GB** | Refuses to run — logs a critical message and exits, since updates cannot function reliably. |
+| **Under 5 GB** | Runs a light, safe proactive cleanup to free space, then continues (only aborts if it is *still* under 1 GB afterward). |
+| **Under 20 GB** | Warns that feature updates may need more room, but continues. |
+
+The light cleanup is non-destructive to user data: it removes leftover `SoftwareDistribution.old_*` / `catroot2.old_*` backups from previous runs, clears the Windows Update download cache (`SoftwareDistribution\Download`, which Windows re-downloads as needed), and empties the user and Windows temp folders.
+
 ## What the Script Does
 
 When it proceeds with a repair, the script performs the following actions in sequence:
@@ -83,7 +95,7 @@ When it proceeds with a repair, the script performs the following actions in seq
     *   Deletes the `HKLM` Windows Update policy keys (including the `WOW6432Node` variant) that block or misconfigure updates. With `-ResetAllPolicies`, the broader Software Policies hive is removed as well.
 
 4.  **Reset the Windows Update Cache**
-    *   Clears the BITS transfer queue (`qmgr*.dat`) and renames `SoftwareDistribution` and `catroot2` to timestamped `.old_*` backups so Windows rebuilds them cleanly (falling back to clearing their contents if a rename is blocked).
+    *   Removes any leftover `.old_*` backups from previous runs, then clears the BITS transfer queue (`qmgr*.dat`) and renames `SoftwareDistribution` and `catroot2` to timestamped `.old_*` backups so Windows rebuilds them cleanly (falling back to clearing their contents if a rename is blocked).
 
 5.  **Re-register Windows Update Components**
     *   Re-registers the set of DLLs Windows Update depends on via `regsvr32 /s`.
@@ -124,4 +136,4 @@ Every run writes a timestamped transcript to the script's folder, named `Windows
 
 - A **restart is recommended** after the fix to fully apply the Group Policy and service changes.
 - Requires **PowerShell 5.0+** and **Windows 10 / Server 2016** or newer.
-- The `SoftwareDistribution.old_*` and `catroot2.old_*` backup folders are safe to delete once Windows Update is confirmed working.
+- The `SoftwareDistribution.old_*` and `catroot2.old_*` backup folders are safe to delete once Windows Update is confirmed working. The script also removes any leftover backups automatically on its next run.
