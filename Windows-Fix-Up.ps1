@@ -25,8 +25,10 @@ param(
     [switch]$DisableBrandBloat, 
     [Parameter(HelpMessage = 'Trims or defrags C: drive')]
     [switch]$RunDiskOptimization,
-    [Parameter(HelpMessage = 'Runs Disk Cleanup excluding Downloads folder')]
+    [Parameter(HelpMessage = 'Runs Disk Cleanup, clears temp/log/WER/crash/Delivery Optimization cache (excludes Downloads)')]
     [switch]$RunDiskCleanup,
+    [Parameter(HelpMessage = 'Remove leftover Windows upgrade folders (Windows.old, $Windows.~BT, etc.)')]
+    [switch]$CleanupUpgradeFolders,
     [Parameter(HelpMessage = 'Reset TCP/IP stack and release/renew IP')]
     [switch]$ResetNetwork,
     [Parameter(HelpMessage = 'Cleanup all networking devices. Will force a reboot after completion')]
@@ -423,6 +425,82 @@ if ($RunDiskCleanup) {
         } until (($CleanmgrTime -eq (Get-Process -Name cleanmgr -ErrorAction SilentlyContinue).TotalProcessorTime) -and ($DismHostTime -eq (Get-Process -Name dismhost -ErrorAction SilentlyContinue).TotalProcessorTime))
         # Stopping this will stop dismhost as well
         Stop-Process -Name cleanmgr -Force -ErrorAction SilentlyContinue
+    }
+
+    # Clear system and per-user Temp folders (catches what cleanmgr misses)
+    Invoke-Task -Description 'Clearing system and per-user Temp folders...' -ScriptBlock {
+        Remove-Item -Path "$env:windir\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $UserTemp = Join-Path $_.FullName 'AppData\Local\Temp'
+            if (Test-Path $UserTemp) {
+                Remove-Item -Path "$UserTemp\*" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # Clear Windows Error Reporting archives (system-wide and per-user)
+    Invoke-Task -Description 'Clearing Windows Error Reporting archives...' -ScriptBlock {
+        $WerPaths = @(
+            "$env:ProgramData\Microsoft\Windows\WER\ReportArchive",
+            "$env:ProgramData\Microsoft\Windows\WER\ReportQueue"
+        )
+        Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $WerPaths += Join-Path $_.FullName 'AppData\Local\Microsoft\Windows\WER\ReportArchive'
+            $WerPaths += Join-Path $_.FullName 'AppData\Local\Microsoft\Windows\WER\ReportQueue'
+        }
+        foreach ($WerPath in $WerPaths) {
+            if (Test-Path $WerPath) {
+                Remove-Item -Path "$WerPath\*" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # Clear CBS/DISM log files (can grow large after SFC/DISM runs)
+    Invoke-Task -Description 'Clearing CBS and DISM log files...' -ScriptBlock {
+        Remove-Item -Path "$env:windir\Logs\CBS\*" -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # Clear Windows setup (Panther) logs left by in-place upgrades
+    Invoke-Task -Description 'Clearing Windows setup (Panther) logs...' -ScriptBlock {
+        Remove-Item -Path "$env:windir\Panther\*" -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # Clear crash dump files
+    Invoke-Task -Description 'Clearing crash dump files...' -ScriptBlock {
+        Remove-Item -Path "$env:windir\Minidump\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "$env:windir\MEMORY.DMP" -Force -ErrorAction SilentlyContinue
+    }
+
+    # Clear Delivery Optimization cache (can be several GB on managed machines)
+    Invoke-Task -Description 'Clearing Delivery Optimization cache...' -ScriptBlock {
+        if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
+            Delete-DeliveryOptimizationCache -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-HostTimestamp 'Delete-DeliveryOptimizationCache not available. Skipping.' -ForegroundColor Yellow
+        }
+    }
+}
+
+# Remove leftover Windows upgrade folders
+if ($CleanupUpgradeFolders) {
+    Invoke-Task -Description 'Removing leftover Windows upgrade folders...' -ScriptBlock {
+        $UpgradePaths = @(
+            "$WindowsDriveLetter\Windows.old",
+            "$WindowsDriveLetter\`$Windows.~BT",
+            "$WindowsDriveLetter\`$Windows.~WS",
+            "$WindowsDriveLetter\`$WinREAgent",
+            "$WindowsDriveLetter\`$GetCurrent"
+        )
+        foreach ($UpgradePath in $UpgradePaths) {
+            if (Test-Path $UpgradePath) {
+                Write-HostTimestamp "Removing $UpgradePath..."
+                takeown.exe /F $UpgradePath /R /A /D Y 2>&1 | Out-Null
+                icacls.exe $UpgradePath /grant Administrators:F /T /C /Q 2>&1 | Out-Null
+                Remove-Item -Path $UpgradePath -Recurse -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-HostTimestamp "$UpgradePath not found. Skipping."
+            }
+        }
     }
 }
 

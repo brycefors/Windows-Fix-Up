@@ -39,7 +39,8 @@ The script supports the following optional parameters for automation:
 | `-DisableHibernation` | Disables hibernation and fast startup by running `powercfg.exe /hibernate off`. See [Why Disable Hibernation and Fast Startup?](#why-disable-hibernation-and-fast-startup) for more details. |
 | `-DisableBrandBloat` | Disables startup services from common computer manufacturers (e.g., HP, Dell, ASUS, Lenovo, Acer) to reduce background processes. |
 | `-ResetNetwork` | Resets the network stack (Winsock, TCP/IP), flushes the DNS cache, and renews the IP address. |
-| `-RunDiskCleanup` | Runs the Windows Disk Cleanup utility, clearing all categories except for the `Downloads` folder. |
+| `-RunDiskCleanup` | Runs the Windows Disk Cleanup utility (all categories except `Downloads`), then additionally clears system and per-user Temp folders, Windows Error Reporting archives, CBS/DISM logs, Panther setup logs, crash dumps, and the Delivery Optimization cache. |
+| `-CleanupUpgradeFolders` | Removes leftover Windows upgrade folders (`Windows.old`, `$Windows.~BT`, `$Windows.~WS`, `$WinREAgent`, `$GetCurrent`). These can reclaim 10–30 GB after an in-place upgrade but are not needed once the new OS is confirmed stable. |
 | `-RunDiskOptimization` | Performs a disk optimization on the C: drive. It will run a re-trim on an SSD or a defragmentation on an HDD. |
 | `-ResetWindowsUpdate` | Resets the components of Windows Update by stopping services and renaming the `SoftwareDistribution` and `catroot2` folders. |
 | `-InstallWindowsUpdates` | Installs all available Windows Updates using the `PSWindowsUpdate` module. |
@@ -79,6 +80,10 @@ The script performs the following actions in sequence to repair and optimize you
 7.  **Disk Cleanup (Optional)**
     *   If the `-RunDiskCleanup` parameter is used, this step automates the Windows Disk Cleanup utility (`cleanmgr.exe`) to remove temporary files, system logs, old update files, and other unnecessary data. **The Downloads folder is explicitly excluded.**
     *   The script includes a monitor to prevent the Disk Cleanup process from getting stuck, which can happen. If it detects no activity for 30 seconds, it will forcefully close the process.
+    *   After `cleanmgr` finishes, the script performs additional manual cleanup that `cleanmgr` typically misses: system and per-user `Temp` folders, Windows Error Reporting archives (`WER\ReportArchive` / `ReportQueue`) for all user profiles, CBS/DISM log files (`C:\Windows\Logs\CBS`), Windows setup logs (`C:\Windows\Panther`), crash dump files (`Minidump` and `MEMORY.DMP`), and the Delivery Optimization peer cache.
+
+7b. **Upgrade Folder Cleanup (Optional)**
+    *   If the `-CleanupUpgradeFolders` parameter is used, the script removes folders left behind by Windows in-place upgrades: `Windows.old`, `$Windows.~BT`, `$Windows.~WS`, `$WinREAgent`, and `$GetCurrent`. Because these folders are often protected, the script first takes ownership (`takeown`) and grants Administrators full control (`icacls`) before deleting them. This step can recover 10–30 GB of disk space but should only be run once you are confident the upgrade was successful and you no longer need to roll back.
 
 8.  **Print Spooler Reset** 
     *   Stops the Print Spooler service, clears out any stuck print jobs from the `C:\Windows\System32\spool\PRINTERS` directory, and then restarts the service. This can resolve issues where printers are offline or jobs won't print.
