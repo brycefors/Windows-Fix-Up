@@ -41,7 +41,7 @@ The script supports the following optional parameters:
 | Parameter | Description |
 |---|---|
 | `-Unattended` | Runs the script without any user prompts. If no level is specified, it picks one automatically from the free-space thresholds (falling back to *Light*). |
-| `-AutoReboot` | Automatically restarts the computer after a 60-second countdown once the cleanup completes. |
+| `-AutoReboot` | Restarts the computer after a 60-second countdown **only when a restart is actually warranted** (e.g. the Aggressive level disabled hibernation, or Windows reports a pending reboot). If nothing needs a restart, the reboot is skipped. During an interactive run the countdown can be cancelled with any keypress. |
 | `-Audit` | **Read-only.** Deletes nothing and makes no changes; instead reports what *would* be cleaned at the chosen level and estimates how much space would be freed. See [Audit Mode](#audit-mode). |
 | `-Remediate` | **Adaptive mode.** Measures free space on the system drive and automatically scales the cleanup to how full the drive is (see [Adaptive Remediation](#adaptive-remediation-recommended) below). Runs hands-off with no prompts. |
 | `-ForceLevel <Light\|Medium\|Severe\|Aggressive>` | **Forced mode.** Skips the free-space assessment entirely and applies the specified level directly. Runs hands-off with no prompts. Ignored if `-Remediate` is also passed. |
@@ -178,9 +178,24 @@ The following profiles are **always skipped**: special/system profiles, profiles
 > [!WARNING]
 > Removing a profile **permanently deletes that user's local data** (desktop, documents, app data). There is no undo.
 
-## Logging
+## Restart Behavior
 
-Every run writes a timestamped transcript named `Windows-Clean-Up_yyyy-MM-dd_HH-mm-ss.log`. By default logs are written to the script's folder; use `-LogPath` to redirect them elsewhere:
+The tool **never restarts on its own** — a reboot only ever happens when you pass `-AutoReboot`. Internally the script tracks whether a restart is *recommended*: this becomes true when a step makes a change a restart would finalize (currently the **Aggressive** level disabling hibernation) or when Windows itself reports a pending reboot (CBS `RebootPending`, Windows Update `RebootRequired`, or queued `PendingFileRenameOperations`).
+
+That "recommended" state is a **gate on `-AutoReboot`, not a trigger by itself** — so `-AutoReboot` won't needlessly reboot after a routine cleanup. The two combine as follows:
+
+| `-AutoReboot` | Restart recommended? | Result |
+|---|---|---|
+| Not passed | Yes (e.g. Aggressive) | Prints "A restart is recommended…" — **no reboot** |
+| Not passed | No | Prints "No restart is required" — no reboot |
+| Passed | Yes | 60-second countdown, then restarts (see below) |
+| Passed | No | Prints "…nothing here requires a restart - skipping the reboot" — **no reboot** |
+
+So reaching the Aggressive level does **not** reboot by itself; you must also pass `-AutoReboot` for the restart to happen automatically.
+
+During an **interactive** run (a real console, not `-Unattended`), the countdown can be cancelled by pressing any key. Unattended/automated runs count down and restart without waiting for input. Audit runs (`-Audit`) never restart.
+
+## Logging
 
 ```shell
 .\Run-Windows-Clean-Up.bat -Remediate -LogPath "C:\Logs\WindowsCleanUp"
@@ -194,5 +209,5 @@ The directory is created automatically if it does not exist. To prevent log accu
 > The **Aggressive** level is destructive to recovery options. It **prunes System Restore points** (keeping only the most recent), **removes the hibernation file** (which also disables Fast Startup — re-enable with `powercfg /hibernate on`), and **clears all Windows event logs**. Only use it when the disk is critically full and you understand the trade-offs.
 
 - The **Severe** level's `DISM ... /ResetBase` makes currently-installed updates permanent — they can no longer be uninstalled — in exchange for reclaiming the most component-store space.
-- A **restart** is only strictly required after the *Aggressive* level (for the hibernation change) but is generally harmless.
+- A **restart** is only strictly required after the *Aggressive* level (for the hibernation change) but is generally harmless. The tool never reboots on its own — see [Restart Behavior](#restart-behavior) for how `-AutoReboot` interacts with this.
 - Requires **PowerShell 5.0+** and **Windows 10 / Server 2016** or newer.

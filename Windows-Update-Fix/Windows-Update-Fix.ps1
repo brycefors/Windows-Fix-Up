@@ -1385,22 +1385,45 @@ if ($InstallUpdates) {
 Write-HostTimestamp 'Windows Update Fix completed!' -Foreground Green
 Write-Host 'A restart is recommended to fully apply the Group Policy and service changes.'
 if ($AutoReboot) {
-    (60..1) | ForEach-Object {
-        if ($_ -lt 10) {
-            Write-HostTimestamp "Restart in $_ $(if ($_ -eq 1){'second'}else{'seconds'})" -ForegroundColor Yellow
-        }
-        else {
-            if ($_ % 10 -eq 0) {
-                Write-HostTimestamp "Restart in $_ seconds"
-            }
-        }
-        Start-Sleep 1
+    # An interactive user (not an unattended/automated run) can abort the pending reboot with a keypress.
+    $CanCancel = $false
+    try { $CanCancel = ([Environment]::UserInteractive -and -not $Unattended) } catch { $CanCancel = $false }
+    if ($CanCancel) {
+        Write-HostTimestamp 'Auto-restart scheduled. Press any key to CANCEL...' -ForegroundColor Yellow
     }
-    shutdown.exe -r -t 5 -c 'Restarting to finish Windows Update fix...'
+    else {
+        Write-HostTimestamp 'Auto-restart scheduled.' -ForegroundColor Yellow
+    }
+
+    $Cancelled = $false
+    foreach ($Remaining in 60..1) {
+        if ($Remaining % 10 -eq 0 -or $Remaining -le 5) {
+            Write-HostTimestamp "Restarting in $Remaining $(if ($Remaining -eq 1) { 'second' } else { 'seconds' })..." -ForegroundColor Yellow
+        }
+        if ($CanCancel) {
+            try {
+                if ([System.Console]::KeyAvailable) {
+                    [void][System.Console]::ReadKey($true)
+                    $Cancelled = $true
+                    break
+                }
+            }
+            catch { $CanCancel = $false }
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    if ($Cancelled) {
+        Write-HostTimestamp 'Auto-restart cancelled. Please remember to restart your computer manually to complete the repairs.' -ForegroundColor Cyan
+    }
+    else {
+        Write-HostTimestamp 'Restarting now...' -ForegroundColor Yellow
+        shutdown.exe /r /t 0 /c 'Restarting to finish Windows Update fix...'
+    }
 }
 else {
     Write-HostTimestamp 'Restart not initiated. Please remember to restart your computer manually to complete the repairs.' -ForegroundColor Yellow
-    if (-not $Unattended -and -not $Remediate) {
+    if (-not $Unattended -and -not $Remediate -and -not $ForceRemediate) {
         Read-Host -Prompt 'Close window or press enter to exit.'
     }
 }

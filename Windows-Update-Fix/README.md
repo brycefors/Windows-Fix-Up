@@ -41,7 +41,7 @@ The script supports the following optional parameters:
 | Parameter | Description |
 |---|---|
 | `-Unattended` | Runs the script without any user prompts. It will not ask for confirmation to start. |
-| `-AutoReboot` | Automatically restarts the computer after a 60-second countdown once the fix completes. |
+| `-AutoReboot` | Restarts the computer after a 60-second countdown once the fix completes. **The script only reboots when this flag is set** — without it, the fix finishes and just reminds you to restart manually. During an interactive run the countdown can be cancelled by pressing any key. |
 | `-Remediate` | **Adaptive mode.** Assesses Windows Update health from the update history and automatically scales the repair to how broken things are (see [Adaptive Remediation](#adaptive-remediation-recommended) below). Runs hands-off with no prompts. |
 | `-ForceRemediate <Mild\|Severe>` | **Forced mode.** Skips the health assessment entirely and applies the specified repair level directly. `Mild` runs the baseline repair; `Severe` additionally enables `-ResetAllPolicies` and `-RepairComponentStore`. Also runs hands-off with no prompts and triggers an update scan. Useful when the update history is empty or unreliable. Ignored if `-Remediate` is also passed. |
 | `-CooldownDays <n>` | Minimum number of days that must pass before `-Remediate` or `-ForceRemediate` can run again on the same machine. The timestamp is stored in a `.last_remediation` file alongside the script. Default is `7`. Set to `0` to disable. Stamps older than `2 × CooldownDays` are automatically removed. |
@@ -234,6 +234,6 @@ To prevent log accumulation, the **30 most recent** log files are kept and any o
 > [!WARNING]
 > This script resets any settings applied through **Local Group Policy** back to "Not Configured." On a machine that is joined to a domain or managed with intentional local policy, those settings will be reapplied on the next policy refresh (or may need to be reconfigured). Do not run this blindly on managed endpoints.
 
-- A **restart is recommended** after the fix to fully apply the Group Policy and service changes.
+- A **restart is recommended** after the fix to fully apply the Group Policy and service changes. The script never reboots on its own — it only restarts when you pass `-AutoReboot` (which runs a 60-second countdown you can cancel with a keypress during an interactive run). Otherwise it just reminds you to restart manually.
 - Requires **PowerShell 5.0+** and **Windows 10 / Server 2016** or newer.
 - The `SoftwareDistribution.old_*` and `catroot2.old_*` backup folders are safe to delete once Windows Update is confirmed working. The script also removes any leftover backups automatically on its next run.

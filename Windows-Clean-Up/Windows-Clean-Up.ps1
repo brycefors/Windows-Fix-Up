@@ -304,6 +304,8 @@ if (-not (($LightThresholdGB -gt $MediumThresholdGB) -and ($MediumThresholdGB -g
 # estimates how much space it WOULD free and adds it to a running total reported at the end.
 $script:AuditMode = [bool]$Audit
 $script:AuditTotalBytes = 0
+# Tracks whether any step made a change that a restart would finalize (e.g. disabling hibernation).
+$script:RebootRecommended = $false
 if ($script:AuditMode) {
     $Host.UI.RawUI.WindowTitle = "Windows Clean-Up - AUDIT (read-only)"
     Write-HostTimestamp 'AUDIT MODE: read-only. Nothing will be deleted or changed; only estimates will be reported.' -ForegroundColor Cyan
@@ -862,6 +864,7 @@ if ($CleanupLevel -ge 4) {
         }
         if (Get-Command powercfg.exe -ErrorAction SilentlyContinue) {
             powercfg.exe /hibernate off 2>&1 | Out-Null
+            $script:RebootRecommended = $true
             Write-HostTimestamp '  Hibernation disabled and hiberfil.sys removed. Re-enable later with: powercfg /hibernate on' -ForegroundColor Yellow
         }
         else {
@@ -1076,27 +1079,80 @@ elseif ($null -ne $script:FreeSpaceAfter) {
 }
 Write-Host $LineBreak
 
-# Done, restart when necessary
+# Done. Decide whether a restart is genuinely warranted before offering / performing one.
 Write-HostTimestamp 'Windows Clean-Up completed!' -ForegroundColor Green
-if ($AutoReboot) {
-    Write-Host 'A restart will be performed to finish applying changes.'
-    (60..1) | ForEach-Object {
-        if ($_ -lt 10) {
-            Write-HostTimestamp "Restart in $_ $(if ($_ -eq 1){'second'}else{'seconds'})" -ForegroundColor Yellow
-        }
-        else {
-            if ($_ % 10 -eq 0) {
-                Write-HostTimestamp "Restart in $_ seconds"
-            }
-        }
-        Start-Sleep 1
+
+# A restart is worthwhile if a step made a change that needs one (e.g. hibernation), or if Windows
+# itself now reports a pending reboot / queued file-rename operations.
+$RebootRecommended = $script:RebootRecommended
+if (-not $RebootRecommended) {
+    $PendingRebootKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+    foreach ($Key in $PendingRebootKeys) {
+        if (Test-Path $Key) { $RebootRecommended = $true; break }
     }
-    shutdown.exe -r -t 5 -c 'Restarting to finish Windows Clean-Up...'
+    if (-not $RebootRecommended) {
+        try {
+            $SessionMgr = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+            $Pending = (Get-ItemProperty -Path $SessionMgr -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue).PendingFileRenameOperations
+            if ($Pending) { $RebootRecommended = $true }
+        }
+        catch { }
+    }
+}
+
+if ($RebootRecommended) {
+    Write-HostTimestamp 'A restart is recommended to finish applying these changes.' -ForegroundColor Yellow
 }
 else {
-    if (-not $Unattended -and -not $Remediate -and -not $ForceLevel) {
-        Read-Host -Prompt 'Close window or press enter to exit.'
+    Write-HostTimestamp 'No restart is required for this cleanup.' -ForegroundColor Green
+}
+
+if ($AutoReboot -and -not $RebootRecommended) {
+    # Do not reboot a machine that does not need it just because -AutoReboot was passed.
+    Write-HostTimestamp '-AutoReboot was requested, but nothing here requires a restart - skipping the reboot.' -ForegroundColor Cyan
+}
+elseif ($AutoReboot) {
+    # An interactive user (not an unattended/automated run) can abort the pending reboot with a keypress.
+    $CanCancel = $false
+    try { $CanCancel = ([Environment]::UserInteractive -and -not $Unattended) } catch { $CanCancel = $false }
+    if ($CanCancel) {
+        Write-HostTimestamp 'Auto-restart scheduled. Press any key to CANCEL...' -ForegroundColor Yellow
     }
+    else {
+        Write-HostTimestamp 'Auto-restart scheduled.' -ForegroundColor Yellow
+    }
+
+    $Cancelled = $false
+    foreach ($Remaining in 60..1) {
+        if ($Remaining % 10 -eq 0 -or $Remaining -le 5) {
+            Write-HostTimestamp "Restarting in $Remaining $(if ($Remaining -eq 1) { 'second' } else { 'seconds' })..." -ForegroundColor Yellow
+        }
+        if ($CanCancel) {
+            try {
+                if ([System.Console]::KeyAvailable) {
+                    [void][System.Console]::ReadKey($true)
+                    $Cancelled = $true
+                    break
+                }
+            }
+            catch { $CanCancel = $false }
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    if ($Cancelled) {
+        Write-HostTimestamp 'Auto-restart cancelled. Please remember to restart your computer manually.' -ForegroundColor Cyan
+    }
+    else {
+        Write-HostTimestamp 'Restarting now...' -ForegroundColor Yellow
+        shutdown.exe /r /t 0 /c 'Restarting to finish Windows Clean-Up...'
+    }
+}
+elseif (-not $Unattended -and -not $Remediate -and -not $ForceLevel) {
+    Read-Host -Prompt 'Close window or press enter to exit.'
 }
 
 # Stop logging
