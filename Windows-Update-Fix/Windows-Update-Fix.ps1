@@ -1317,7 +1317,33 @@ if ($InstallUpdates) {
             $WuSession  = New-Object -ComObject Microsoft.Update.Session
             $WuSearcher = $WuSession.CreateUpdateSearcher()
             Write-HostTimestamp '  Querying Windows Update (this may take a moment)...'
-            $SearchResult = $WuSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+
+            # The WUA client caps the number of server round trips per scan. Against a large catalog the
+            # search can return 0x80244010 (WU_E_PT_EXCEEDED_MAX_SERVER_TRIPS) - a benign, transient result
+            # that simply means "scan again to continue". Retry the search a few times before giving up.
+            $TransientScanCodes = @(0x80244010, 0x8024401C, 0x8024402C, 0x80244007)
+            $MaxSearchAttempts = 5
+            $SearchResult = $null
+            for ($Attempt = 1; $Attempt -le $MaxSearchAttempts; $Attempt++) {
+                try {
+                    $SearchResult = $WuSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+                    break
+                }
+                catch {
+                    $ScanHResult = $_.Exception.HResult -band 0xFFFFFFFF
+                    if (($TransientScanCodes -contains $ScanHResult) -and $Attempt -lt $MaxSearchAttempts) {
+                        Write-HostTimestamp ("  Scan returned 0x{0:X8} (transient - server round-trip limit). Retrying ({1}/{2})..." -f $ScanHResult, $Attempt, ($MaxSearchAttempts - 1)) -ForegroundColor Yellow
+                        Start-Sleep -Seconds 10
+                    }
+                    else {
+                        throw
+                    }
+                }
+            }
+            if ($null -eq $SearchResult) {
+                Write-HostTimestamp '  Windows Update scan did not complete after several retries (server round-trip limit). Try again later or use Settings > Windows Update.' -ForegroundColor Yellow
+                return
+            }
 
             # Exclude driver and definition/antivirus updates
             $PendingUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
