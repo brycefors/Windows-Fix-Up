@@ -54,6 +54,7 @@ The script supports the following optional parameters:
 | `-RepairComponentStore` | Also runs `DISM /RestoreHealth` and `SFC /scannow` to repair the component store (slow). Automatically enabled by `-Remediate` when a system is classified as *severe*. |
 | `-SkipOnlineBuildDate` | Skips the online lookup of the current build's exact release date and KB article. By default the script queries Microsoft's public release-information page (best-effort; falls back silently if offline or unmatched) to report, e.g., `Build 26200.8737 released: 2026-06-23 via KB5095093`. |
 | `-TriggerUpdateScan` | Triggers a fresh Windows Update detection scan after the fix. Automatically enabled by `-Remediate`. |
+| `-InstallUpdates` | After the fix, searches for available updates via the WUA COM API, downloads and installs them, then reports per-update results (succeeded / failed / reboot required). See [Installing Updates](#installing-updates) for details. |
 | `-LogPath <path>` | Directory to write log files to. Defaults to the script folder. The directory is created automatically if it does not exist. If the path is invalid or cannot be created, the script falls back to the script folder. |
 | `-SkipInteractive` | Skips the interactive confirmation prompt while still showing output. |
 
@@ -192,6 +193,29 @@ When it proceeds with a repair, the script performs the following actions in seq
 
 13. **Trigger an Update Scan (Optional)**
     *   With `-TriggerUpdateScan` (or any remediation), requests a fresh detection scan via `UsoClient StartScan` (with a COM fallback for older builds).
+
+## Installing Updates
+
+Pass `-InstallUpdates` to have the script search, download, and install available updates immediately after the fix completes, rather than just requesting a background scan.
+
+```shell
+.\Run-Windows-Update-Fix.bat -InstallUpdates
+.\Run-Windows-Update-Fix.bat -Remediate -InstallUpdates
+```
+
+The script uses the built-in **WUA COM API** (`Microsoft.Update.Session`) — no external modules required. It excludes driver and antivirus/definition updates (same filter used by the health assessment), then reports a result for every update:
+
+| Result | Meaning |
+|---|---|
+| `Succeeded` | Installed successfully. |
+| `SucceededWithErrors` | Installed but with non-fatal errors. |
+| `Failed` | Installation failed — HRESULT shown in parentheses. |
+| `Aborted` | Installation was aborted. |
+
+If a restart is needed to complete one or more updates, the script reports this. The existing `-AutoReboot` flag will then handle the countdown and reboot.
+
+> [!NOTE]
+> On **modern Windows 11**, cumulative updates are delivered through the **Unified Update Platform (UUP)** and are **not exposed by the WUA COM API**. If no updates are found here, use **Settings > Windows Update** or run `UsoClient.exe StartInstall` to trigger those. `-TriggerUpdateScan` (or `-Remediate`) is a better fit for fully automated modern-Windows pipelines where you just want to kick off a scan and let Windows handle the rest.
 
 ## Logging
 

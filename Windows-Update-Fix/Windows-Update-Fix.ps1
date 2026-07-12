@@ -29,6 +29,8 @@ param(
     [switch]$ResetAllPolicies,
     [Parameter(HelpMessage = 'Trigger a Windows Update detection scan after the fix')]
     [switch]$TriggerUpdateScan,
+    [Parameter(HelpMessage = 'Search, download, and install available Windows updates after the fix and report per-update results (uses WUA COM API; UUP-delivered updates on modern Windows 11 are not covered)')]
+    [switch]$InstallUpdates,
     [Parameter(HelpMessage = 'Also clear the per-user Local Group Policy store (GroupPolicyUsers)')]
     [switch]$IncludeGroupPolicyUsers,
     [Parameter(HelpMessage = 'Only run the fix if updates are stale or recent update failures exist (uses -StaleDays)')]
@@ -1302,6 +1304,79 @@ if ($TriggerUpdateScan) {
             # Fallback for older builds
             (New-Object -ComObject Microsoft.Update.AutoUpdate).DetectNow()
             Write-HostTimestamp 'Update scan requested via COM. Check Settings > Windows Update for results.'
+        }
+    }
+}
+
+# Optionally search, download, and install available Windows updates via the WUA COM API
+# NOTE: On modern Windows 11, UUP-delivered cumulative updates are not exposed by this API.
+# Those will still appear (and install) through Settings > Windows Update or UsoClient.
+if ($InstallUpdates) {
+    Invoke-Task -Description 'Searching for available Windows updates to install...' -ScriptBlock {
+        try {
+            $WuSession  = New-Object -ComObject Microsoft.Update.Session
+            $WuSearcher = $WuSession.CreateUpdateSearcher()
+            Write-HostTimestamp '  Querying Windows Update (this may take a moment)...'
+            $SearchResult = $WuSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+
+            # Exclude driver and definition/antivirus updates
+            $PendingUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
+            foreach ($Update in $SearchResult.Updates) {
+                $Excluded = $false
+                foreach ($Cat in $Update.Categories) {
+                    if ($Cat.Name -in @('Drivers', 'Definition Updates')) { $Excluded = $true; break }
+                }
+                if (-not $Excluded -and $Update.Title -notmatch 'driver|Defender|Security Intelligence|Definition Update|Antivirus') {
+                    $PendingUpdates.Add($Update) | Out-Null
+                }
+            }
+
+            if ($PendingUpdates.Count -eq 0) {
+                Write-HostTimestamp '  No applicable updates found via the WUA COM API. Windows appears up to date (UUP-delivered updates on modern Windows 11 are not shown here).' -ForegroundColor Green
+                return
+            }
+
+            Write-HostTimestamp "  Found $($PendingUpdates.Count) update(s):"
+            foreach ($Update in $PendingUpdates) {
+                Write-Host "    - $($Update.Title)"
+            }
+
+            # Download
+            Write-HostTimestamp '  Downloading updates...'
+            $Downloader         = $WuSession.CreateUpdateDownloader()
+            $Downloader.Updates = $PendingUpdates
+            $Downloader.Download() | Out-Null
+
+            # Install
+            Write-HostTimestamp '  Installing updates...'
+            $Installer         = $WuSession.CreateUpdateInstaller()
+            $Installer.Updates = $PendingUpdates
+            $InstallResult     = $Installer.Install()
+
+            # Report per-update results
+            $ResultCodeMap = @{ 0='NotStarted'; 1='InProgress'; 2='Succeeded'; 3='SucceededWithErrors'; 4='Failed'; 5='Aborted' }
+            $Succeeded = 0
+            $Failed    = 0
+            for ($i = 0; $i -lt $PendingUpdates.Count; $i++) {
+                $UpdResult = $InstallResult.GetUpdateResult($i)
+                $Code      = $UpdResult.ResultCode
+                $HResult   = $UpdResult.HResult
+                $Label     = $ResultCodeMap[$Code]
+                $Color     = if ($Code -eq 2) { 'Green' } elseif ($Code -eq 3) { 'Yellow' } else { 'Red' }
+                $HRStr     = if ($Code -ge 4) { " (0x$('{0:X8}' -f ($HResult -band 0xFFFFFFFF)))" } else { '' }
+                Write-Host "    [$Label] $($PendingUpdates.Item($i).Title)$HRStr" -ForegroundColor $Color
+                if ($Code -in @(2, 3)) { $Succeeded++ } else { $Failed++ }
+            }
+
+            $SummaryColor = if ($Failed -gt 0) { 'Yellow' } else { 'Green' }
+            Write-HostTimestamp "  Install complete: $Succeeded succeeded, $Failed failed." -ForegroundColor $SummaryColor
+            if ($InstallResult.RebootRequired) {
+                Write-HostTimestamp '  One or more updates require a restart to complete installation.' -ForegroundColor Yellow
+            }
+        }
+        catch {
+            Write-HostTimestamp "  Windows Update installation error: $($_.Exception.Message)" -ForegroundColor Red
+            Write-HostTimestamp '  If updates are not showing here, they may be UUP-delivered (modern Windows 11). Use Settings > Windows Update or run: UsoClient.exe StartInstall' -ForegroundColor Yellow
         }
     }
 }
