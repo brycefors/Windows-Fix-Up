@@ -34,6 +34,28 @@ Set-ExecutionPolicy Bypass -Force
 .\Windows-Clean-Up.ps1 -Remediate
 ```
 
+### Remote / One-Line Deployment
+
+To run the tool on a machine without cloning the repo (handy for RMM tools, remote sessions, or a quick fix), use this block to download `Windows-Clean-Up.ps1` into the temp folder and run it in adaptive remediation mode:
+
+```powershell
+# Fetch Windows-Clean-Up.ps1 to the temp folder and run it in adaptive remediation mode
+$Url  = 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Clean-Up/Windows-Clean-Up.ps1'
+$Dest = Join-Path $env:TEMP 'Windows-Clean-Up.ps1'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+powershell.exe -ExecutionPolicy Bypass -File $Dest -Remediate
+```
+
+Compact one-liner (handy for RMM command fields):
+
+```powershell
+$d="$env:TEMP\Windows-Clean-Up.ps1";[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;irm 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Clean-Up/Windows-Clean-Up.ps1' -OutFile $d;powershell -ExecutionPolicy Bypass -File $d -Remediate
+```
+
+> [!NOTE]
+> The script self-elevates, so a UAC prompt will appear unless it is launched from an already-elevated context (e.g. an RMM agent running as `SYSTEM`). `-Remediate` picks the cleanup level from free space and honors the 7-day cooldown — add `-IgnoreCooldown` to bypass it, or use `-Audit -Remediate` to preview with no changes.
+
 ## Command-Line Parameters
 
 The script supports the following optional parameters:

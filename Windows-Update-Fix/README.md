@@ -34,6 +34,28 @@ Set-ExecutionPolicy Bypass -Force
 .\Windows-Update-Fix.ps1 -Remediate
 ```
 
+### Remote / One-Line Deployment
+
+To run the tool on a machine without cloning the repo (handy for RMM tools, remote sessions, or a quick fix), use this block to download `Windows-Update-Fix.ps1` into the temp folder and run it in adaptive remediation mode:
+
+```powershell
+# Fetch Windows-Update-Fix.ps1 to the temp folder and run it in adaptive remediation mode
+$Url  = 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Update-Fix/Windows-Update-Fix.ps1'
+$Dest = Join-Path $env:TEMP 'Windows-Update-Fix.ps1'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+powershell.exe -ExecutionPolicy Bypass -File $Dest -Remediate
+```
+
+Compact one-liner (handy for RMM command fields):
+
+```powershell
+$d="$env:TEMP\Windows-Update-Fix.ps1";[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;irm 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Update-Fix/Windows-Update-Fix.ps1' -OutFile $d;powershell -ExecutionPolicy Bypass -File $d -Remediate
+```
+
+> [!NOTE]
+> The script self-elevates, so a UAC prompt will appear unless it is launched from an already-elevated context (e.g. an RMM agent running as `SYSTEM`). `-Remediate` assesses Windows Update health and scales the repair automatically, and honors the 7-day cooldown — add `-IgnoreCooldown` to bypass it. For a machine you know needs fixing regardless of history, swap in `-ForceRemediate Mild` or `-ForceRemediate Severe`.
+
 ## Command-Line Parameters
 
 The script supports the following optional parameters:
