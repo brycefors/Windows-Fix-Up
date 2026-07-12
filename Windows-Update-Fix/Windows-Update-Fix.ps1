@@ -38,6 +38,10 @@ param(
     [Parameter(HelpMessage = 'Skip health assessment and force a specific repair level: Mild (baseline) or Severe (baseline + ResetAllPolicies + RepairComponentStore)')]
     [ValidateSet('Mild', 'Severe')]
     [string]$ForceRemediate,
+    [Parameter(HelpMessage = 'Days before -Remediate or -ForceRemediate can run again on the same machine (default 7, set to 0 to disable)')]
+    [int]$CooldownDays = 7,
+    [Parameter(HelpMessage = 'Bypass the cooldown and run -Remediate or -ForceRemediate regardless of when it last ran')]
+    [switch]$IgnoreCooldown,
     [Parameter(HelpMessage = 'Number of days used by -FixIfStale to consider updates stale (default 45)')]
     [int]$StaleDays = 45,
     [Parameter(HelpMessage = 'Max unresolved standard update failures tolerated when a recent patch succeeded (default 5)')]
@@ -570,6 +574,35 @@ else {
 }
 Write-Host $LineBreak
 
+# --- Cooldown check for automated modes ---
+# Prevents -Remediate and -ForceRemediate from running more often than -CooldownDays on the same machine.
+# The last-run timestamp is stored in a small file alongside the script.
+# Set -CooldownDays 0 or pass -IgnoreCooldown to bypass.
+if (($Remediate -or $ForceRemediate) -and $CooldownDays -gt 0 -and -not $IgnoreCooldown) {
+    $script:CooldownFile = Join-Path -Path $PSScriptRoot -ChildPath '.last_remediation'
+    if (Test-Path $script:CooldownFile) {
+        try {
+            $LastRun = [datetime]::ParseExact((Get-Content $script:CooldownFile -Raw -ErrorAction Stop).Trim(), 'yyyy-MM-dd HH:mm:ss', $null)
+            $DaysSinceLastRun = [math]::Round(((Get-Date) - $LastRun).TotalDays, 1)
+            if ($DaysSinceLastRun -lt $CooldownDays) {
+                Write-HostTimestamp "Cooldown active: remediation last ran $DaysSinceLastRun day(s) ago on $($env:ComputerName) (cooldown = $CooldownDays days). Use -IgnoreCooldown to bypass." -ForegroundColor Yellow
+                Write-Host $LineBreak
+                Stop-Transcript | Out-Null
+                exit 0
+            }
+            Write-HostTimestamp "Cooldown elapsed: last ran $DaysSinceLastRun day(s) ago. Proceeding."
+            # Remove a significantly stale stamp file; the repair will write a fresh one when it commits.
+            if ($DaysSinceLastRun -ge (2 * $CooldownDays)) {
+                Remove-Item -Path $script:CooldownFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+            Write-HostTimestamp "Could not read cooldown file ($($_.Exception.Message)). Proceeding." -ForegroundColor Yellow
+        }
+    }
+}
+Write-Host $LineBreak
+
 # --- Adaptive remediation (optional) ---
 # When -Remediate is used, the script inspects the Windows Update history and automatically decides both
 # WHETHER to act and HOW aggressively, based on how broken things look:
@@ -925,6 +958,20 @@ $RequiredServices = @(
 $ServicesToStart = @('CryptSvc', 'gpsvc', 'BITS', 'wuauserv')
 
 # Stop the update services first so files/keys are not locked while we clean up
+# Write the cooldown timestamp now that we are committed to running the repair.
+if (($Remediate -or $ForceRemediate) -and $CooldownDays -gt 0) {
+    if (-not $script:CooldownFile) {
+        $script:CooldownFile = Join-Path -Path $PSScriptRoot -ChildPath '.last_remediation'
+    }
+    try {
+        (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Set-Content -Path $script:CooldownFile -Encoding UTF8 -ErrorAction Stop
+        Write-HostTimestamp "Cooldown stamp written. Next -Remediate / -ForceRemediate run allowed in $CooldownDays day(s)." -ForegroundColor DarkGray
+    }
+    catch {
+        Write-HostTimestamp "Could not write cooldown stamp: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 Invoke-Task -Description 'Stopping Windows Update services before cleanup...' -ScriptBlock {
     foreach ($Svc in @('wuauserv', 'UsoSvc', 'BITS', 'DoSvc', 'CryptSvc', 'msiserver')) {
         $Service = Get-Service -Name $Svc -ErrorAction SilentlyContinue

@@ -44,6 +44,8 @@ The script supports the following optional parameters:
 | `-AutoReboot` | Automatically restarts the computer after a 60-second countdown once the fix completes. |
 | `-Remediate` | **Adaptive mode.** Assesses Windows Update health from the update history and automatically scales the repair to how broken things are (see [Adaptive Remediation](#adaptive-remediation-recommended) below). Runs hands-off with no prompts. |
 | `-ForceRemediate <Mild\|Severe>` | **Forced mode.** Skips the health assessment entirely and applies the specified repair level directly. `Mild` runs the baseline repair; `Severe` additionally enables `-ResetAllPolicies` and `-RepairComponentStore`. Also runs hands-off with no prompts and triggers an update scan. Useful when the update history is empty or unreliable. Ignored if `-Remediate` is also passed. |
+| `-CooldownDays <n>` | Minimum number of days that must pass before `-Remediate` or `-ForceRemediate` can run again on the same machine. The timestamp is stored in a `.last_remediation` file alongside the script. Default is `7`. Set to `0` to disable. Stamps older than `2 × CooldownDays` are automatically removed. |
+| `-IgnoreCooldown` | Bypasses the cooldown check for a single run without changing the default. |
 | `-FixIfStale` | Only runs the fix if updates look stale or unresolved failures exist (uses `-StaleDays`). If Windows Update looks healthy, the script exits without making changes. |
 | `-StaleDays <n>` | Number of days used by `-Remediate` / `-FixIfStale` to consider updates stale. Default is `45`. |
 | `-FailureFixThreshold <n>` | Maximum number of unresolved standard update failures tolerated when a recent patch has succeeded (below this, they are treated as likely false positives). Default is `5`. |
@@ -77,6 +79,34 @@ If you want to skip the health assessment and force a specific level regardless 
 In every remediation case a fresh Windows Update scan is triggered afterward, and the whole process runs hands-off (no prompts). Remediation also honors the false-positive logic: a small number of unresolved failures alongside a recent successful patch are reported but ignored.
 
 Staleness is judged from **two** independent signals: the date of the last successful patch in the update history, and the Microsoft release date of the currently-installed build revision (resolved online, unless `-SkipOnlineBuildDate` is set). The build-date signal catches machines whose update history has been cleared or truncated but which are nonetheless running an old build. If the online lookup is unavailable (offline or unmatched), the script silently falls back to the update-history signal alone.
+
+## Remediation Cooldown
+
+To prevent `-Remediate` and `-ForceRemediate` from running too frequently in automated scenarios (e.g., a scheduled task or RMM deployment), the script enforces a cooldown period between repairs.
+
+When a repair commits, it writes the current timestamp to a `.last_remediation` file stored alongside the script. On the next run, if the elapsed time is less than `-CooldownDays` (default: `7`), the script exits immediately with a message rather than running the repair again.
+
+| Situation | Behavior |
+|---|---|
+| File does not exist | No cooldown — proceeds normally. |
+| File is newer than `-CooldownDays` | Exits with `"Cooldown active"` message. |
+| File is older than `-CooldownDays` but newer than `2 ×` | Proceeds; file is overwritten with a new stamp when repair commits. |
+| File is older than `2 × CooldownDays` | File is deleted proactively; repair proceeds and writes a fresh stamp. |
+| `-Remediate` exits as **Healthy** (no repair run) | Stamp file is not updated. |
+| Interactive / manual run (no `-Remediate` or `-ForceRemediate`) | Stamp file is not touched at all. |
+
+To reset the cooldown manually, delete the `.last_remediation` file or use `-IgnoreCooldown`:
+
+```shell
+# Bypass for a single run
+.\Run-Windows-Update-Fix.bat -Remediate -IgnoreCooldown
+
+# Disable the cooldown entirely
+.\Run-Windows-Update-Fix.bat -Remediate -CooldownDays 0
+
+# Use a longer cooldown for monthly maintenance
+.\Run-Windows-Update-Fix.bat -Remediate -CooldownDays 30
+```
 
 > **Note on empty update history:** On modern Windows 11, cumulative updates are often installed through the Unified Update Platform and do **not** appear in the legacy Windows Update history (`Microsoft.Update.Session` can report zero entries). When the history is empty, the script does not blindly assume the machine is unpatched — it falls back to the installed build's release date. A recent build keeps the machine classified as *healthy*; only an old build (or an unavailable build date) is treated as stale.
 
