@@ -43,6 +43,7 @@ The script supports the following optional parameters:
 | `-Unattended` | Runs the script without any user prompts. It will not ask for confirmation to start. |
 | `-AutoReboot` | Automatically restarts the computer after a 60-second countdown once the fix completes. |
 | `-Remediate` | **Adaptive mode.** Assesses Windows Update health from the update history and automatically scales the repair to how broken things are (see [Adaptive Remediation](#adaptive-remediation-recommended) below). Runs hands-off with no prompts. |
+| `-ForceRemediate <Mild\|Severe>` | **Forced mode.** Skips the health assessment entirely and applies the specified repair level directly. `Mild` runs the baseline repair; `Severe` additionally enables `-ResetAllPolicies` and `-RepairComponentStore`. Also runs hands-off with no prompts and triggers an update scan. Useful when the update history is empty or unreliable. Ignored if `-Remediate` is also passed. |
 | `-FixIfStale` | Only runs the fix if updates look stale or unresolved failures exist (uses `-StaleDays`). If Windows Update looks healthy, the script exits without making changes. |
 | `-StaleDays <n>` | Number of days used by `-Remediate` / `-FixIfStale` to consider updates stale. Default is `45`. |
 | `-FailureFixThreshold <n>` | Maximum number of unresolved standard update failures tolerated when a recent patch has succeeded (below this, they are treated as likely false positives). Default is `5`. |
@@ -63,6 +64,16 @@ Running with `-Remediate` makes the script inspect the Windows Update history (i
 | **Mild** | Updates are stale (no recent patch *or* the installed build was released more than `-StaleDays` days ago), or there are unresolved failures while stale. | Baseline repair: clear Local Group Policy, remove the Windows Update policy keys, reset the cache/BITS queue, re-register the DLLs, verify services, and run `gpupdate /force`. |
 | **Severe** | Never patched / no patch and no build newer than **2 × `-StaleDays`**, or more than `-FailureFixThreshold` unresolved failures. | Everything in *Mild*, **plus** `-ResetAllPolicies` and `-RepairComponentStore` (DISM/SFC). |
 
+If you want to skip the health assessment and force a specific level regardless of what the history shows, use `-ForceRemediate Mild` or `-ForceRemediate Severe` instead. This is useful when the update history is empty (common on modern Windows 11) or when you simply know the machine needs fixing.
+
+```shell
+# Baseline repair, no health check
+.\Run-Windows-Update-Fix.bat -ForceRemediate Mild
+
+# Full repair (ResetAllPolicies + DISM/SFC), no health check
+.\Run-Windows-Update-Fix.bat -ForceRemediate Severe
+```
+
 In every remediation case a fresh Windows Update scan is triggered afterward, and the whole process runs hands-off (no prompts). Remediation also honors the false-positive logic: a small number of unresolved failures alongside a recent successful patch are reported but ignored.
 
 Staleness is judged from **two** independent signals: the date of the last successful patch in the update history, and the Microsoft release date of the currently-installed build revision (resolved online, unless `-SkipOnlineBuildDate` is set). The build-date signal catches machines whose update history has been cleared or truncated but which are nonetheless running an old build. If the online lookup is unavailable (offline or unmatched), the script silently falls back to the update-history signal alone.
@@ -79,7 +90,15 @@ Before doing any work, the script checks the free space on the system drive, bec
 | **Under 5 GB** | Runs a light, safe proactive cleanup to free space, then continues (only aborts if it is *still* under 1 GB afterward). |
 | **Under 20 GB** | Warns that feature updates may need more room, but continues. |
 
-The light cleanup is non-destructive to user data: it removes leftover `SoftwareDistribution.old_*` / `catroot2.old_*` backups from previous runs, clears the Windows Update download cache (`SoftwareDistribution\Download`, which Windows re-downloads as needed), and empties the user and Windows temp folders.
+The light cleanup is non-destructive to user data. It removes:
+- Leftover `SoftwareDistribution.old_*` / `catroot2.old_*` backups from previous runs
+- The Windows Update download cache (`SoftwareDistribution\Download`, which Windows re-downloads as needed)
+- User and Windows Temp folders
+- Delivery Optimization peer cache (can be several GB)
+- Windows Error Reporting archives (`WER\ReportArchive` / `ReportQueue`)
+- CBS/DISM log files (`C:\Windows\Logs\CBS`)
+- Crash dump files (`Minidump\*` and `MEMORY.DMP`)
+- Windows Update internal logs (`SoftwareDistribution\DataStore\Logs`)
 
 ## What the Script Does
 
@@ -94,13 +113,16 @@ When it proceeds with a repair, the script performs the following actions in seq
 3.  **Remove Windows Update Policy Registry Keys**
     *   Deletes the `HKLM` Windows Update policy keys (including the `WOW6432Node` variant) that block or misconfigure updates. With `-ResetAllPolicies`, the broader Software Policies hive is removed as well.
 
-4.  **Reset the Windows Update Cache**
+4.  **Clear Stale Reboot-Pending Flags**
+    *   Removes the `RebootRequired`, `RebootPending`, and `RebootInProgress` registry keys left over from previous (or phantom) update cycles. These flags silently block new update installations without requiring an actual reboot to clear them.
+
+5.  **Reset the Windows Update Cache**
     *   Removes any leftover `.old_*` backups from previous runs, then clears the BITS transfer queue (`qmgr*.dat`) and renames `SoftwareDistribution` and `catroot2` to timestamped `.old_*` backups so Windows rebuilds them cleanly (falling back to clearing their contents if a rename is blocked).
 
-5.  **Re-register Windows Update Components**
+6.  **Re-register Windows Update Components**
     *   Re-registers the set of DLLs Windows Update depends on via `regsvr32 /s`.
 
-6.  **Verify and Enable Required Services**
+7.  **Verify and Enable Required Services**
     *   Ensures the services below are not disabled and are set to their healthy default startup type, starting the ones that must be running:
 
     | Service | Startup Type | Display Name |
@@ -116,13 +138,28 @@ When it proceeds with a repair, the script performs the following actions in seq
     | `AppIDSvc` | Manual | Application Identity |
     | `gpsvc` | Automatic | Group Policy Client |
 
-7.  **Force a Group Policy Refresh**
+8.  **Re-enable Windows Update Scheduled Tasks**
+    *   Re-enables the scheduled tasks that drive automatic scanning and installation. If these are disabled, Windows Update will never auto-scan or install regardless of service state:
+
+    | Task | Path |
+    |---|---|
+    | `Scheduled Start` | `\Microsoft\Windows\WindowsUpdate\` |
+    | `ScanForUpdates` | `\Microsoft\Windows\InstallService\` |
+    | `ScanForUpdatesAsUser` | `\Microsoft\Windows\InstallService\` |
+
+9.  **Force a Group Policy Refresh**
     *   Runs `gpupdate /force` so the machine rebuilds a clean policy set.
 
-8.  **Repair the Component Store (Optional)**
+10. **Reset WinHTTP Proxy**
+    *   Checks whether a WinHTTP proxy is configured. If one is found, it is reset to Direct Access (no proxy). A stale proxy left over from a domain join, VPN, or MDM enrolment is a common silent cause of Windows Update connectivity failures. If the machine requires a proxy, it can be re-configured afterward with `netsh winhttp set proxy <proxy:port>`.
+
+11. **Check Hosts File for Blocked Windows Update Domains**
+    *   Scans `C:\Windows\System32\drivers\etc\hosts` for entries matching Windows Update domains (`windowsupdate.com`, `update.microsoft.com`, `download.microsoft.com`, etc.). Some "privacy" tools and malware redirect these to `0.0.0.0` or `127.0.0.1`, silently preventing updates. The script reports any matches in red with instructions to remove them manually.
+
+12. **Repair the Component Store (Optional)**
     *   With `-RepairComponentStore` (or *severe* remediation), runs `DISM /Online /Cleanup-Image /RestoreHealth` followed by `SFC /scannow`.
 
-9.  **Trigger an Update Scan (Optional)**
+13. **Trigger an Update Scan (Optional)**
     *   With `-TriggerUpdateScan` (or any remediation), requests a fresh detection scan via `UsoClient StartScan` (with a COM fallback for older builds).
 
 ## Logging

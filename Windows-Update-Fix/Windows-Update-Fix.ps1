@@ -35,6 +35,9 @@ param(
     [switch]$FixIfStale,
     [Parameter(HelpMessage = 'Adaptive mode: assess Windows Update health and automatically scale the repair to how broken it is')]
     [switch]$Remediate,
+    [Parameter(HelpMessage = 'Skip health assessment and force a specific repair level: Mild (baseline) or Severe (baseline + ResetAllPolicies + RepairComponentStore)')]
+    [ValidateSet('Mild', 'Severe')]
+    [string]$ForceRemediate,
     [Parameter(HelpMessage = 'Number of days used by -FixIfStale to consider updates stale (default 45)')]
     [int]$StaleDays = 45,
     [Parameter(HelpMessage = 'Max unresolved standard update failures tolerated when a recent patch succeeded (default 5)')]
@@ -488,6 +491,48 @@ function Invoke-LightDiskCleanup {
         }
     }
     Write-HostTimestamp '  Cleared temporary files.'
+
+    # Clear Delivery Optimization cache (peer-caching leftovers can be several GB).
+    if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
+        Delete-DeliveryOptimizationCache -Force -ErrorAction SilentlyContinue
+        Write-HostTimestamp '  Cleared Delivery Optimization cache.'
+    }
+
+    # Clear Windows Error Reporting archives.
+    foreach ($WerPath in @(
+        (Join-Path -Path $env:ProgramData -ChildPath 'Microsoft\Windows\WER\ReportArchive'),
+        (Join-Path -Path $env:ProgramData -ChildPath 'Microsoft\Windows\WER\ReportQueue')
+    )) {
+        if (Test-Path $WerPath) {
+            Get-ChildItem -Path $WerPath -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-HostTimestamp '  Cleared Windows Error Reporting archives.'
+
+    # Clear CBS/DISM log files (this script itself may have grown them).
+    $CbsLogs = Join-Path -Path $env:windir -ChildPath 'Logs\CBS'
+    if (Test-Path $CbsLogs) {
+        Get-ChildItem -Path $CbsLogs -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Write-HostTimestamp '  Cleared CBS/DISM log files.'
+    }
+
+    # Clear crash dump files.
+    $MiniDump = Join-Path -Path $env:windir -ChildPath 'Minidump'
+    if (Test-Path $MiniDump) {
+        Get-ChildItem -Path $MiniDump -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $FullDump = Join-Path -Path $env:windir -ChildPath 'MEMORY.DMP'
+    if (Test-Path $FullDump) {
+        Remove-Item -Path $FullDump -Force -ErrorAction SilentlyContinue
+    }
+    Write-HostTimestamp '  Cleared crash dump files.'
+
+    # Clear SoftwareDistribution DataStore logs (Windows Update internal logs; regenerated automatically).
+    $DataStoreLogs = Join-Path -Path $env:windir -ChildPath 'SoftwareDistribution\DataStore\Logs'
+    if (Test-Path $DataStoreLogs) {
+        Get-ChildItem -Path $DataStoreLogs -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Write-HostTimestamp '  Cleared SoftwareDistribution DataStore logs.'
+    }
 }
 
 # --- Disk space check ---
@@ -635,6 +680,25 @@ if ($Remediate) {
 
     # Remediation is hands-off: skip the interactive confirmation and the final wait prompt.
     $SkipInteractive = $true
+    Write-Host $LineBreak
+}
+
+# --- Forced remediation (optional) ---
+# Skips the health assessment entirely and applies the specified severity directly.
+# Useful when you know a machine needs fixing regardless of what the history shows.
+if ($ForceRemediate -and -not $Remediate) {
+    Clear-Host
+    Write-HostTimestamp "Running in Forced Remediation mode ($ForceRemediate) on $($env:ComputerName)..." -ForegroundColor Cyan
+    $TriggerUpdateScan = $true
+    $SkipInteractive = $true
+    if ($ForceRemediate -eq 'Severe') {
+        Write-HostTimestamp 'Severity: SEVERE (forced). Applying the full repair, including -ResetAllPolicies and -RepairComponentStore.' -ForegroundColor Red
+        $ResetAllPolicies = $true
+        $RepairComponentStore = $true
+    }
+    else {
+        Write-HostTimestamp 'Severity: MILD (forced). Applying the baseline Windows Update repair.' -ForegroundColor Yellow
+    }
     Write-Host $LineBreak
 }
 
@@ -938,6 +1002,33 @@ Invoke-Task -Description 'Removing Windows Update policy registry keys...' -Scri
     }
 }
 
+# 2b. Clear stale reboot-pending registry flags
+# When these keys are left over from a previous (or phantom) update cycle they silently block new
+# installations. Removing them does not skip a required reboot - it just clears the stale gate.
+Invoke-Task -Description 'Clearing stale Windows Update reboot-pending flags...' -ScriptBlock {
+    $PendingKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootInProgress'
+    )
+    $Found = $false
+    foreach ($Key in $PendingKeys) {
+        if (Test-Path $Key) {
+            $Found = $true
+            try {
+                Remove-Item -Path $Key -Recurse -Force -ErrorAction Stop
+                Write-HostTimestamp "  Removed stale reboot-pending flag: $Key"
+            }
+            catch {
+                Write-HostTimestamp "  Could not remove $Key : $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+    }
+    if (-not $Found) {
+        Write-HostTimestamp '  No stale reboot-pending flags found.'
+    }
+}
+
 # 3. Reset the Windows Update cache and BITS transfer queue
 Invoke-Task -Description 'Resetting the Windows Update cache (SoftwareDistribution, catroot2, BITS queue)...' -ScriptBlock {
     $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -1029,6 +1120,31 @@ Invoke-Task -Description 'Verifying and enabling required Windows Update service
     }
 }
 
+# 5b. Re-enable Windows Update scheduled tasks
+# If these tasks are disabled, Windows Update will never auto-scan or install regardless of service state.
+Invoke-Task -Description 'Re-enabling Windows Update scheduled tasks...' -ScriptBlock {
+    $WuTasks = @(
+        @{ Path = '\Microsoft\Windows\WindowsUpdate\';   Name = 'Scheduled Start' },      # Main WU scan trigger (all versions)
+        @{ Path = '\Microsoft\Windows\InstallService\';  Name = 'ScanForUpdates' },        # Win 11 update orchestration
+        @{ Path = '\Microsoft\Windows\InstallService\';  Name = 'ScanForUpdatesAsUser' }   # Win 11 per-user scan
+    )
+    foreach ($Task in $WuTasks) {
+        try {
+            $TaskObj = Get-ScheduledTask -TaskPath $Task.Path -TaskName $Task.Name -ErrorAction Stop
+            if ($TaskObj.State -eq 'Disabled') {
+                Enable-ScheduledTask -TaskPath $Task.Path -TaskName $Task.Name -ErrorAction Stop | Out-Null
+                Write-HostTimestamp "  Re-enabled: $($Task.Path)$($Task.Name)"
+            }
+            else {
+                Write-HostTimestamp "  Already enabled: $($Task.Path)$($Task.Name)"
+            }
+        }
+        catch {
+            Write-HostTimestamp "  Task not found or could not be enabled: $($Task.Path)$($Task.Name) - $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+}
+
 # Force a Group Policy refresh so the machine rebuilds a clean policy set
 Invoke-Task -Description 'Forcing a Group Policy refresh (gpupdate /force)...' -ScriptBlock {
     if (Get-Command gpupdate.exe -ErrorAction SilentlyContinue) {
@@ -1036,6 +1152,57 @@ Invoke-Task -Description 'Forcing a Group Policy refresh (gpupdate /force)...' -
     }
     else {
         Write-HostTimestamp 'gpupdate.exe not found. Skipping Group Policy refresh.' -ForegroundColor Yellow
+    }
+}
+
+# Reset WinHTTP proxy to Direct Access.
+# A stale proxy left over from a domain, VPN, or MDM enrolment silently prevents WU from reaching
+# Microsoft's servers. Only resets when a proxy is actually configured - Direct Access is left alone.
+Invoke-Task -Description 'Checking and resetting WinHTTP proxy settings...' -ScriptBlock {
+    if (Get-Command netsh.exe -ErrorAction SilentlyContinue) {
+        $ProxyOutput = (netsh.exe winhttp show proxy 2>&1) -join ' '
+        if ($ProxyOutput -notmatch '(?i)Direct access') {
+            Write-HostTimestamp "  WinHTTP proxy is configured: $ProxyOutput" -ForegroundColor Yellow
+            Write-HostTimestamp '  Resetting WinHTTP proxy to Direct Access (no proxy)...' -ForegroundColor Yellow
+            netsh.exe winhttp reset proxy | Out-Null
+            Write-HostTimestamp '  WinHTTP proxy reset to Direct Access.'
+            Write-HostTimestamp '  If a proxy is required to reach Windows Update, re-configure after this script: netsh winhttp set proxy <proxy:port>' -ForegroundColor Cyan
+        }
+        else {
+            Write-HostTimestamp '  WinHTTP proxy is already Direct Access (no proxy configured).'
+        }
+    }
+    else {
+        Write-HostTimestamp '  netsh.exe not found. Skipping WinHTTP proxy check.' -ForegroundColor Yellow
+    }
+}
+
+# Check the hosts file for entries that block Windows Update domains.
+# Some "privacy" tools and malware redirect WU domains to 0.0.0.0 or 127.0.0.1.
+Invoke-Task -Description 'Checking hosts file for blocked Windows Update domains...' -ScriptBlock {
+    $HostsFile = Join-Path -Path $env:windir -ChildPath 'System32\drivers\etc\hosts'
+    $WuDomains = @(
+        'windowsupdate.com', 'windowsupdate.microsoft.com', 'update.microsoft.com',
+        'download.windowsupdate.com', 'download.microsoft.com', 'wustat.windows.com',
+        'ntservicepack.microsoft.com', 'go.microsoft.com'
+    )
+    $BlockedEntries = @()
+    if (Test-Path $HostsFile) {
+        foreach ($Line in (Get-Content -Path $HostsFile -ErrorAction SilentlyContinue)) {
+            $Trimmed = $Line.Trim()
+            if ([string]::IsNullOrWhiteSpace($Trimmed) -or $Trimmed.StartsWith('#')) { continue }
+            foreach ($Domain in $WuDomains) {
+                if ($Trimmed -match [regex]::Escape($Domain)) { $BlockedEntries += $Trimmed; break }
+            }
+        }
+    }
+    if ($BlockedEntries.Count -gt 0) {
+        Write-HostTimestamp "  WARNING: The hosts file contains $($BlockedEntries.Count) entry(ies) that may block Windows Update:" -ForegroundColor Red
+        $BlockedEntries | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+        Write-HostTimestamp "  Edit '$HostsFile' and remove these entries, then re-run this script." -ForegroundColor Yellow
+    }
+    else {
+        Write-HostTimestamp '  No Windows Update domains are blocked in the hosts file.'
     }
 }
 
