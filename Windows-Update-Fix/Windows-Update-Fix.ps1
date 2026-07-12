@@ -50,6 +50,8 @@ param(
     [switch]$RepairComponentStore,
     [Parameter(HelpMessage = 'Skip the online lookup of the current build''s exact release date/KB (Microsoft release information)')]
     [switch]$SkipOnlineBuildDate,
+    [Parameter(HelpMessage = 'Directory to write log files to (defaults to the script folder)')]
+    [string]$LogPath,
     [switch]$SkipInteractive # Skips the interactive confirmation prompt
 )
 
@@ -89,12 +91,24 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 $Host.UI.RawUI.WindowTitle = "Windows Update Fix - Running as Administrator"
 
 # --- Start Logging ---
-# Create a log file in the same directory as the script
-$LogFile = Join-Path -Path $PSScriptRoot -ChildPath "Windows-Update-Fix_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss').log"
+# Resolve the log directory: use -LogPath if provided, otherwise default to the script folder
+$LogDir = $PSScriptRoot
+if ($LogPath) {
+    try {
+        if (-not (Test-Path $LogPath)) {
+            New-Item -ItemType Directory -Path $LogPath -Force -ErrorAction Stop | Out-Null
+        }
+        $LogDir = $LogPath
+    }
+    catch {
+        Write-Warning "Could not use -LogPath '$LogPath': $($_.Exception.Message). Falling back to script folder."
+    }
+}
+$LogFile = Join-Path -Path $LogDir -ChildPath "Windows-Update-Fix_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss').log"
 Start-Transcript -Path $LogFile | Out-Null
 
 # Rotate logs: keep only the 30 most recent, delete the rest
-Get-ChildItem -Path $PSScriptRoot -Filter 'Windows-Update-Fix_*.log' -File |
+Get-ChildItem -Path $LogDir -Filter 'Windows-Update-Fix_*.log' -File |
     Sort-Object -Property LastWriteTime -Descending |
     Select-Object -Skip 30 |
     Remove-Item -Force -ErrorAction SilentlyContinue

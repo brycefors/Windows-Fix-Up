@@ -54,6 +54,7 @@ The script supports the following optional parameters:
 | `-RepairComponentStore` | Also runs `DISM /RestoreHealth` and `SFC /scannow` to repair the component store (slow). Automatically enabled by `-Remediate` when a system is classified as *severe*. |
 | `-SkipOnlineBuildDate` | Skips the online lookup of the current build's exact release date and KB article. By default the script queries Microsoft's public release-information page (best-effort; falls back silently if offline or unmatched) to report, e.g., `Build 26200.8737 released: 2026-06-23 via KB5095093`. |
 | `-TriggerUpdateScan` | Triggers a fresh Windows Update detection scan after the fix. Automatically enabled by `-Remediate`. |
+| `-LogPath <path>` | Directory to write log files to. Defaults to the script folder. The directory is created automatically if it does not exist. If the path is invalid or cannot be created, the script falls back to the script folder. |
 | `-SkipInteractive` | Skips the interactive confirmation prompt while still showing output. |
 
 ## Adaptive Remediation (Recommended)
@@ -194,7 +195,15 @@ When it proceeds with a repair, the script performs the following actions in seq
 
 ## Logging
 
-Every run writes a timestamped transcript to the script's folder, named `Windows-Update-Fix_yyyy-MM-dd_HH-mm-ss.log`, so you can review exactly what was changed.
+Every run writes a timestamped transcript named `Windows-Update-Fix_yyyy-MM-dd_HH-mm-ss.log`. By default logs are written to the script's folder; use `-LogPath` to redirect them elsewhere:
+
+```shell
+.\Run-Windows-Update-Fix.bat -Remediate -LogPath "C:\Logs\WindowsUpdateFix"
+```
+
+The directory is created automatically if it does not exist. If it is invalid or cannot be created, the script warns and falls back to the script folder.
+
+To prevent log accumulation, the **30 most recent** log files are kept and any older ones are automatically deleted at the start of each run.
 
 ## Important Notes
 
