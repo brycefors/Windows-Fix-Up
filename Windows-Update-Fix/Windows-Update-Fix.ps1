@@ -93,6 +93,12 @@ $Host.UI.RawUI.WindowTitle = "Windows Update Fix - Running as Administrator"
 $LogFile = Join-Path -Path $PSScriptRoot -ChildPath "Windows-Update-Fix_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss').log"
 Start-Transcript -Path $LogFile | Out-Null
 
+# Rotate logs: keep only the 30 most recent, delete the rest
+Get-ChildItem -Path $PSScriptRoot -Filter 'Windows-Update-Fix_*.log' -File |
+    Sort-Object -Property LastWriteTime -Descending |
+    Select-Object -Skip 30 |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
 $ProgressPreference = 'SilentlyContinue'
 $LineBreakCharacter = '-'
 $LineBreak = $null
