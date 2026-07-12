@@ -56,6 +56,41 @@ $d="$env:TEMP\Windows-Update-Fix.ps1";[Net.ServicePointManager]::SecurityProtoco
 > [!NOTE]
 > The script self-elevates, so a UAC prompt will appear unless it is launched from an already-elevated context (e.g. an RMM agent running as `SYSTEM`). `-Remediate` assesses Windows Update health and scales the repair automatically, and honors the 7-day cooldown — add `-IgnoreCooldown` to bypass it. For a machine you know needs fixing regardless of history, swap in `-ForceRemediate Mild` or `-ForceRemediate Severe`.
 
+### Running Across Machines with `Invoke-Command`
+
+If PowerShell Remoting (WinRM) is enabled on the targets (`Enable-PSRemoting -Force`) and you have admin credentials, you can download-and-run the script on one or many machines at once. Remoting sessions are already elevated, so there is no UAC prompt.
+
+```powershell
+$Computers = 'PC01', 'PC02', 'PC03'
+$Cred = Get-Credential   # an admin account on the targets
+
+Invoke-Command -ComputerName $Computers -Credential $Cred -ScriptBlock {
+    $Url  = 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Update-Fix/Windows-Update-Fix.ps1'
+    $Dest = Join-Path $env:TEMP 'Windows-Update-Fix.ps1'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+    & $Dest -Remediate -Unattended
+}
+```
+
+- Call the script inline with `& $Dest` (not a nested `powershell.exe`) so output and errors flow back to you; results are tagged with `PSComputerName` per machine.
+- Include `-Unattended` so it never waits for a prompt — there is no interactive console on the remote side.
+- To pass flags from your side, build an array locally and splat it with `$using:`:
+
+  ```powershell
+  $Flags = @('-ForceRemediate', 'Severe', '-Unattended')
+  Invoke-Command -ComputerName $Computers -Credential $Cred -ScriptBlock {
+      $Url  = 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Update-Fix/Windows-Update-Fix.ps1'
+      $Dest = Join-Path $env:TEMP 'Windows-Update-Fix.ps1'
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+      & $Dest @using:Flags
+  }
+  ```
+
+> [!NOTE]
+> Targets need outbound internet to reach both GitHub and Windows Update; if they cannot reach GitHub, copy the script over a session instead (`$s = New-PSSession ...; Copy-Item .\Windows-Update-Fix.ps1 -ToSession $s -Destination "$env:TEMP\"; Invoke-Command -Session $s { & "$env:TEMP\Windows-Update-Fix.ps1" -Remediate -Unattended }`). Adding `-AutoReboot` will reboot the machine and drop the session, so only use it when that is intended.
+
 ## Command-Line Parameters
 
 The script supports the following optional parameters:

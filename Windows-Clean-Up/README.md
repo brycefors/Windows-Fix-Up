@@ -56,6 +56,41 @@ $d="$env:TEMP\Windows-Clean-Up.ps1";[Net.ServicePointManager]::SecurityProtocol=
 > [!NOTE]
 > The script self-elevates, so a UAC prompt will appear unless it is launched from an already-elevated context (e.g. an RMM agent running as `SYSTEM`). `-Remediate` picks the cleanup level from free space and honors the 7-day cooldown — add `-IgnoreCooldown` to bypass it, or use `-Audit -Remediate` to preview with no changes.
 
+### Running Across Machines with `Invoke-Command`
+
+If PowerShell Remoting (WinRM) is enabled on the targets (`Enable-PSRemoting -Force`) and you have admin credentials, you can download-and-run the script on one or many machines at once. Remoting sessions are already elevated, so there is no UAC prompt.
+
+```powershell
+$Computers = 'PC01', 'PC02', 'PC03'
+$Cred = Get-Credential   # an admin account on the targets
+
+Invoke-Command -ComputerName $Computers -Credential $Cred -ScriptBlock {
+    $Url  = 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Clean-Up/Windows-Clean-Up.ps1'
+    $Dest = Join-Path $env:TEMP 'Windows-Clean-Up.ps1'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+    & $Dest -Remediate -Unattended
+}
+```
+
+- Call the script inline with `& $Dest` (not a nested `powershell.exe`) so output and errors flow back to you; results are tagged with `PSComputerName` per machine.
+- Include `-Unattended` so it never waits for a prompt — there is no interactive console on the remote side.
+- To pass flags from your side, build an array locally and splat it with `$using:`:
+
+  ```powershell
+  $Flags = @('-Audit', '-Remediate', '-Unattended')
+  Invoke-Command -ComputerName $Computers -Credential $Cred -ScriptBlock {
+      $Url  = 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Clean-Up/Windows-Clean-Up.ps1'
+      $Dest = Join-Path $env:TEMP 'Windows-Clean-Up.ps1'
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+      & $Dest @using:Flags
+  }
+  ```
+
+> [!NOTE]
+> Targets need outbound internet to reach GitHub; if they do not, copy the script over a session instead (`$s = New-PSSession ...; Copy-Item .\Windows-Clean-Up.ps1 -ToSession $s -Destination "$env:TEMP\"; Invoke-Command -Session $s { & "$env:TEMP\Windows-Clean-Up.ps1" -Remediate -Unattended }`). Adding `-AutoReboot` will reboot the machine and drop the session, so only use it when that is intended.
+
 ## Command-Line Parameters
 
 The script supports the following optional parameters:
