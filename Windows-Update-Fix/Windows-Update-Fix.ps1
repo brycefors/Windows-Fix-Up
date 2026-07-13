@@ -349,11 +349,58 @@ function Show-WindowsBuildInfo {
     Write-Host $LineBreak
 }
 
+# Detects whether the script is running inside a remote session (PowerShell Remoting / WinRM). The
+# Windows Update Agent blocks Download()/Install() over a remote connection by design, so this is a
+# common source of "access denied" (0x80070005) that no amount of elevation will fix.
+function Test-IsRemoteSession {
+    if ($PSSenderInfo) { return $true }
+    try {
+        $ProcessId = $PID
+        # Walk up a bounded number of parent processes looking for the WinRM host (wsmprovhost.exe).
+        for ($Depth = 0; $Depth -lt 10 -and $ProcessId; $Depth++) {
+            $Process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
+            if (-not $Process) { break }
+            if ($Process.Name -eq 'wsmprovhost.exe') { return $true }
+            $ProcessId = $Process.ParentProcessId
+        }
+    }
+    catch { }
+    return $false
+}
+
+# Creates a Windows Update Agent (WUA) COM session with a stable client ID. The WUA API returns
+# "access denied" (0x80070005) in three main situations, so this helper surfaces clear guidance:
+#   1. The process is not elevated (this script self-elevates, so this is rare here).
+#   2. Download()/Install() are called from a REMOTE session (WinRM / PowerShell Remoting) - WUA
+#      blocks this by design; run the script locally or via a scheduled task running as SYSTEM.
+#   3. A policy such as DisableWindowsUpdateAccess is set (this script clears the WU policy keys).
+function New-UpdateSession {
+    try {
+        $Session = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop
+        # A ClientApplicationID makes WUA logging attributable and is expected by some WUA calls.
+        try { $Session.ClientApplicationID = 'Windows-Update-Fix' } catch { }
+        return $Session
+    }
+    catch {
+        $HResult = $_.Exception.HResult -band 0xFFFFFFFF
+        if ($HResult -eq 0x80070005) {
+            Write-HostTimestamp '  Access denied creating the Windows Update session (0x80070005).' -ForegroundColor Red
+            if (Test-IsRemoteSession) {
+                Write-HostTimestamp '  You appear to be in a REMOTE session. WUA blocks remote update calls by design - run this script locally or via a scheduled task running as SYSTEM.' -ForegroundColor Yellow
+            }
+            else {
+                Write-HostTimestamp '  Ensure the script is running elevated and that no policy (e.g. DisableWindowsUpdateAccess) is blocking access.' -ForegroundColor Yellow
+            }
+        }
+        throw
+    }
+}
+
 # Returns the most recent successfully installed Windows Update patch (Date and Title), excluding
 # driver updates and Microsoft Defender/antivirus definition updates. Returns $null if none found.
 function Get-LastUpdatePatch {
     try {
-        $Session = New-Object -ComObject Microsoft.Update.Session
+        $Session = New-UpdateSession
         $Searcher = $Session.CreateUpdateSearcher()
         $HistoryCount = $Searcher.GetTotalHistoryCount()
         if ($HistoryCount -le 0) { return $null }
@@ -388,7 +435,7 @@ function Get-RecentUpdateFailures {
 
     $Failures = @()
     try {
-        $Session = New-Object -ComObject Microsoft.Update.Session
+        $Session = New-UpdateSession
         $Searcher = $Session.CreateUpdateSearcher()
         $HistoryCount = $Searcher.GetTotalHistoryCount()
         if ($HistoryCount -le 0) { return $Failures }
@@ -1314,7 +1361,7 @@ if ($TriggerUpdateScan) {
 if ($InstallUpdates) {
     Invoke-Task -Description 'Searching for available Windows updates to install...' -ScriptBlock {
         try {
-            $WuSession  = New-Object -ComObject Microsoft.Update.Session
+            $WuSession  = New-UpdateSession
             $WuSearcher = $WuSession.CreateUpdateSearcher()
             Write-HostTimestamp '  Querying Windows Update (this may take a moment)...'
 
@@ -1401,7 +1448,16 @@ if ($InstallUpdates) {
             }
         }
         catch {
+            $HResult = $_.Exception.HResult -band 0xFFFFFFFF
             Write-HostTimestamp "  Windows Update installation error: $($_.Exception.Message)" -ForegroundColor Red
+            if ($HResult -eq 0x80070005) {
+                if (Test-IsRemoteSession) {
+                    Write-HostTimestamp '  Access denied (0x80070005) in a REMOTE session. WUA blocks remote download/install by design - run this script locally or via a scheduled task running as SYSTEM.' -ForegroundColor Yellow
+                }
+                else {
+                    Write-HostTimestamp '  Access denied (0x80070005). Confirm the script is elevated and that no policy (e.g. DisableWindowsUpdateAccess) is blocking Windows Update.' -ForegroundColor Yellow
+                }
+            }
             Write-HostTimestamp '  If updates are not showing here, they may be UUP-delivered (modern Windows 11). Use Settings > Windows Update or run: UsoClient.exe StartInstall' -ForegroundColor Yellow
         }
     }
