@@ -236,7 +236,7 @@ The light cleanup is non-destructive to user data. It removes:
 When it proceeds with a repair, the script performs the following actions in sequence:
 
 1.  **Stop Update Services**
-    *   Temporarily sets `WaaSMedicSvc`, `UsoSvc`, `wuauserv`, `BITS`, `DoSvc`, `CryptSvc`, and `msiserver` to **Disabled** and then stops them, so Windows cannot trigger-start them again and re-lock files or registry keys mid-cleanup. The Windows Update Medic Service (`WaaSMedicSvc`) in particular is known to silently revive the other update services during a repair. After a brief pause the script re-checks each one and force-stops anything that restarted itself. Step 7 restores every service to its healthy startup type at the end of the run.
+    *   Temporarily sets `WaaSMedicSvc`, `UsoSvc`, `wuauserv`, `BITS`, `DoSvc`, `CryptSvc`, and `msiserver` to **Disabled** and then stops them, so Windows cannot trigger-start them again and re-lock files or registry keys mid-cleanup. The Windows Update Medic Service (`WaaSMedicSvc`) in particular is known to silently revive the other update services during a repair. For each service it **confirms the disabled state actually took effect** (via the live service start mode, falling back to the registry `Start` value) and **retries stopping until the service stays down**. A final verification pass checks that every targeted service is both stopped and disabled before any files are renamed, and reports any that could not be — so a locked-file outcome is never silent. Step 7 restores every service to its healthy startup type at the end of the run.
 
 2.  **Clear the Local Group Policy Store**
     *   Removes the contents of `C:\Windows\System32\GroupPolicy` (and `GroupPolicyUsers` when `-IncludeGroupPolicyUsers` is used).
@@ -421,3 +421,6 @@ To prevent log accumulation, the **30 most recent** log files are kept and any o
 - A **restart is recommended** after the fix to fully apply the Group Policy and service changes. The script never reboots on its own — it only restarts when you pass `-AutoReboot` (which runs a 60-second countdown you can cancel with a keypress during an interactive run). Otherwise it just reminds you to restart manually.
 - Requires **PowerShell 5.0+** and **Windows 10 / Server 2016** or newer.
 - The `SoftwareDistribution.old_*` and `catroot2.old_*` backup folders are safe to delete once Windows Update is confirmed working. The script also removes any leftover backups automatically on its next run.
+
+> [!NOTE]
+> Deleting `SoftwareDistribution` content can fail with **"Could not find a part of the path"** because the update cache routinely nests folders past the legacy 260-character (`MAX_PATH`) limit, which `Remove-Item` cannot handle. To work around this, the script deletes these trees with a robust helper that escalates automatically: a normal recursive delete first, then a **robocopy mirror-from-empty purge** (which walks long/deep trees natively), and finally `rd /s /q` via the **`\\?\` long-path prefix**. If a tree still cannot be fully removed (usually an open file handle), the script says so and a reboot will release the remaining locks.

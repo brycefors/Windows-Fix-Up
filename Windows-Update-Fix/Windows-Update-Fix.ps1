@@ -993,6 +993,51 @@ function Get-RecentUpdateFailures {
     return @($Failures | Sort-Object Date -Descending)
 }
 
+# Robustly deletes a folder tree. Windows' Remove-Item throws "Could not find a part of the path" (and
+# gives up) on deeply nested paths that exceed the legacy MAX_PATH limit (260 chars) - extremely common
+# inside SoftwareDistribution\Download. This helper escalates through three strategies and returns $true
+# only once the folder is actually gone:
+#   1. A normal Remove-Item -Recurse (fast path for shallow trees).
+#   2. A robocopy "mirror from an empty folder" purge, which walks and empties long/deep trees natively.
+#   3. rd /s /q via the \\?\ long-path prefix as a last resort.
+function Remove-FolderRobust {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+
+    # 1. Normal recursive delete - fastest when the tree is within MAX_PATH.
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    }
+    catch { }
+
+    # 2. Robocopy mirror from an empty folder reliably empties long/deep trees that Remove-Item chokes on.
+    if (Test-Path -LiteralPath $Path) {
+        $EmptyDir = Join-Path -Path $env:TEMP -ChildPath ('empty_' + [guid]::NewGuid().ToString('N'))
+        try {
+            New-Item -ItemType Directory -Path $EmptyDir -Force -ErrorAction Stop | Out-Null
+            # /MIR makes $Path match the (empty) source, i.e. deletes everything inside it. /R:1 /W:1
+            # avoids long stalls on transiently locked files; the log switches keep output quiet.
+            $null = robocopy $EmptyDir $Path /MIR /NFL /NDL /NJH /NJS /NP /R:1 /W:1 2>$null
+        }
+        catch { }
+        finally {
+            Remove-Item -LiteralPath $EmptyDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        # The tree should now be empty; remove the (empty) top folder.
+        try { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop } catch { }
+    }
+
+    # 3. Last resort: rd with the \\?\ long-path prefix, which bypasses the MAX_PATH limit entirely.
+    if (Test-Path -LiteralPath $Path) {
+        $Prefixed = if ($Path -like '\\?\*' -or $Path -like '\\*') { $Path } else { "\\?\$Path" }
+        & cmd.exe /c "rd /s /q `"$Prefixed`"" 2>$null | Out-Null
+    }
+
+    return (-not (Test-Path -LiteralPath $Path))
+}
+
 # Removes the SoftwareDistribution.old_* and catroot2.old_* backup folders that earlier runs of this
 # script create when they rename those folders, so the backups do not accumulate on repeated runs.
 function Remove-OldUpdateBackups {
@@ -1004,12 +1049,11 @@ function Remove-OldUpdateBackups {
     foreach ($Location in $BackupLocations) {
         if (Test-Path $Location.Parent) {
             Get-ChildItem -Path $Location.Parent -Directory -Filter $Location.Pattern -Force -ErrorAction SilentlyContinue | ForEach-Object {
-                try {
-                    Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction Stop
+                if (Remove-FolderRobust -Path $_.FullName) {
                     Write-HostTimestamp "  Removed old backup: $($_.FullName)"
                 }
-                catch {
-                    Write-HostTimestamp "  Could not remove old backup $($_.FullName): $($_.Exception.Message)" -ForegroundColor Yellow
+                else {
+                    Write-HostTimestamp "  Could not fully remove old backup $($_.FullName) (it may be partially deleted; a reboot can release remaining locks)." -ForegroundColor Yellow
                 }
             }
         }
@@ -1041,7 +1085,13 @@ function Invoke-LightDiskCleanup {
     # Clear the Windows Update download cache.
     $DownloadCache = Join-Path -Path $env:windir -ChildPath 'SoftwareDistribution\Download'
     if (Test-Path $DownloadCache) {
-        Get-ChildItem -Path $DownloadCache -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        # Use the robust delete: the download cache routinely nests paths past MAX_PATH, which makes a
+        # plain Remove-Item fail with "Could not find a part of the path".
+        Get-ChildItem -Path $DownloadCache -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            if (-not (Remove-FolderRobust -Path $_.FullName)) {
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
         Write-HostTimestamp '  Cleared the Windows Update download cache.'
     }
 
@@ -1530,33 +1580,73 @@ if (($Remediate -or $ForceRemediate) -and $CooldownDays -gt 0) {
 }
 
 Invoke-Task -Description 'Stopping Windows Update services before cleanup...' -ScriptBlock {
-    # These trigger-start services (and the Update Medic Service in particular) will silently
-    # restart themselves mid-cleanup and re-lock SoftwareDistribution/catroot2. To prevent that,
-    # temporarily set each one to Disabled so Windows cannot trigger-start it, THEN stop it.
-    # Step 5 (Verify and enable required services) restores every service to its healthy startup type.
+    # These trigger-start services (the Update Medic Service especially) will silently restart
+    # themselves mid-cleanup and re-lock SoftwareDistribution/catroot2. To prevent that, temporarily
+    # set each one to Disabled, CONFIRM it actually reads back as disabled, then stop it - retrying
+    # until it stays down. Step 5 (Verify and enable required services) restores every service to its
+    # healthy startup type afterward.
     $ServicesToStop = @('WaaSMedicSvc', 'UsoSvc', 'wuauserv', 'BITS', 'DoSvc', 'CryptSvc', 'msiserver')
+
+    # Confirms a service's start type actually reads back as Disabled: prefer the live CIM StartMode,
+    # falling back to the registry 'Start' value (4 = Disabled) for protected services that CIM lags on.
+    $ConfirmDisabled = {
+        param($Name)
+        $Mode = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue).StartMode
+        if ($Mode -eq 'Disabled') { return $true }
+        $RegStart = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name 'Start' -ErrorAction SilentlyContinue).Start
+        return ($RegStart -eq 4)
+    }
+
     foreach ($Svc in $ServicesToStop) {
         $Service = Get-Service -Name $Svc -ErrorAction SilentlyContinue
         if (-not $Service) { continue }
 
-        # Disable first so triggers/dependencies cannot restart it while we clean up.
-        [void](Set-ServiceStartupType -Name $Svc -StartupType 'Disabled')
+        # Disable first so triggers/dependencies cannot restart it, retrying until it is confirmed.
+        for ($Try = 1; $Try -le 3 -and -not (& $ConfirmDisabled $Svc); $Try++) {
+            [void](Set-ServiceStartupType -Name $Svc -StartupType 'Disabled')
+            Start-Sleep -Milliseconds 300
+        }
+        if (& $ConfirmDisabled $Svc) {
+            Write-Host "- Disabled $($Service.DisplayName) ($Svc)"
+        }
+        else {
+            Write-HostTimestamp "  Could not confirm '$Svc' is disabled; it may try to restart during cleanup." -ForegroundColor Yellow
+        }
 
-        if ($Service.Status -ne 'Stopped') {
-            Write-Host "- Stopping $($Service.DisplayName) ($Svc)"
+        # Stop it, retrying a few times since trigger-start services can bounce right back.
+        for ($Try = 1; $Try -le 5; $Try++) {
+            $Service.Refresh()
+            if ($Service.Status -eq 'Stopped') { break }
+            if ($Try -eq 1) { Write-Host "  Stopping $($Service.DisplayName) ($Svc)" }
             Stop-Service -Name $Svc -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
         }
     }
 
-    # Give the services a moment to fully release their handles, then confirm they stayed down.
-    # Anything that trigger-started again is force-killed at the process level so the rename can succeed.
-    Start-Sleep -Seconds 2
+    # Final verification pass: before we rename/clear any files, confirm every targeted service is both
+    # STOPPED and DISABLED. Report anything still up so a degraded outcome is never silent.
+    $StillRunning = @()
+    $NotDisabled  = @()
     foreach ($Svc in $ServicesToStop) {
         $Service = Get-Service -Name $Svc -ErrorAction SilentlyContinue
-        if ($Service -and $Service.Status -ne 'Stopped') {
-            Write-HostTimestamp "  $Svc restarted itself; force-stopping again." -ForegroundColor Yellow
+        if (-not $Service) { continue }
+        $Service.Refresh()
+        if ($Service.Status -ne 'Stopped') {
+            # One last forceful attempt before giving up on this service.
             Stop-Service -Name $Svc -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+            $Service.Refresh()
+            if ($Service.Status -ne 'Stopped') { $StillRunning += $Svc }
         }
+        if (-not (& $ConfirmDisabled $Svc)) { $NotDisabled += $Svc }
+    }
+
+    if ($StillRunning.Count -eq 0 -and $NotDisabled.Count -eq 0) {
+        Write-HostTimestamp '  All targeted services confirmed stopped and disabled.' -ForegroundColor Green
+    }
+    else {
+        if ($StillRunning.Count) { Write-HostTimestamp "  Still running after retries: $($StillRunning -join ', '). Cleanup will continue, but some files may be locked." -ForegroundColor Yellow }
+        if ($NotDisabled.Count)  { Write-HostTimestamp "  Could not confirm disabled: $($NotDisabled -join ', ')." -ForegroundColor Yellow }
     }
 }
 
@@ -1684,7 +1774,13 @@ Invoke-Task -Description 'Resetting the Windows Update cache (SoftwareDistributi
             }
             catch {
                 Write-HostTimestamp "  Could not rename $Folder (in use). Clearing its contents instead..." -ForegroundColor Yellow
-                Get-ChildItem -Path $Folder -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                # Robust delete per child so deeply nested (long) paths do not stop the cleanup with
+                # "Could not find a part of the path".
+                Get-ChildItem -Path $Folder -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    if (-not (Remove-FolderRobust -Path $_.FullName)) {
+                        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                }
             }
         }
         else {
