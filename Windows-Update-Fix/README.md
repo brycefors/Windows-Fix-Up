@@ -114,6 +114,7 @@ The script supports the following optional parameters:
 | `-SkipOnlineBuildDate` | Skips the online lookup of the current build's exact release date and KB article. By default the script queries Microsoft's public release-information page (best-effort) to report, e.g., `Build 26200.8737 released: 2026-06-23 via KB5095093`. If the online lookup times out or is unreachable, it falls back to a small **hardcoded build reference table** in the script (see [Build Date Lookup](#build-date-lookup)); if neither is available it falls back silently. |
 | `-TriggerUpdateScan` | Triggers a fresh Windows Update detection scan after the fix. Automatically enabled by `-Remediate`. |
 | `-InstallUpdates` | After the fix, searches for available updates via the WUA COM API, downloads and installs them, then reports per-update results (succeeded / failed / reboot required). See [Installing Updates](#installing-updates) for details. |
+| `-InstallViaScheduledTask` | Runs the `-InstallUpdates` step through a local scheduled task running as `NT AUTHORITY\SYSTEM`, working around the WUA access-denied (`0x80070005`) error that occurs when downloading/installing updates over a remote (WinRM / PowerShell Remoting) session. This is **applied automatically** when the script detects it is running in a remote session, so you rarely need to set it by hand. See [Installing Updates Remotely](#installing-updates-remotely). |
 | `-LogPath <path>` | Directory to write log files to. Defaults to the script folder. The directory is created automatically if it does not exist. If the path is invalid or cannot be created, the script falls back to the script folder. |
 | `-SkipInteractive` | Skips the interactive confirmation prompt while still showing output. |
 
@@ -301,14 +302,19 @@ Pass `-InstallUpdates` to have the script search, download, and install availabl
 .\Run-Windows-Update-Fix.bat -Remediate -InstallUpdates
 ```
 
-The script uses the built-in **WUA COM API** (`Microsoft.Update.Session`) — no external modules required. It excludes driver and antivirus/definition updates (same filter used by the health assessment), then reports a result for every update:
+The script uses the built-in **WUA COM API** (`Microsoft.Update.Session`) — no external modules required. It excludes driver and antivirus/definition updates (same filter used by the health assessment), then **downloads and installs each update individually** so it can report progress and results per update.
+
+Every step is wrapped in its own error handling, so hitting the update API **never aborts the run**: a search hiccup, a failed download, or a failed install for one update is caught, reported, and the script moves on to the next update (and then continues with the rest of the fix). Each update produces a download line (only if it still needs downloading) and an install result line:
 
 | Result | Meaning |
 |---|---|
-| `Succeeded` | Installed successfully. |
+| `Succeeded` | Downloaded / installed successfully. |
 | `SucceededWithErrors` | Installed but with non-fatal errors. |
-| `Failed` | Installation failed — HRESULT shown in parentheses. |
+| `Failed` | Download or installation failed — HRESULT shown in parentheses. |
 | `Aborted` | Installation was aborted. |
+| `Download Failed` | The update could not be downloaded — HRESULT shown; install is skipped for that update. |
+
+The EULA is auto-accepted per update where required, and updates Windows has already staged skip the download step. A final summary line reports the total succeeded / failed counts.
 
 If a restart is needed to complete one or more updates, the script reports this. The existing `-AutoReboot` flag will then handle the countdown and reboot. Alternatively, pass `-ScheduleReboot` to defer the restart to a quiet time — by default **2:00 AM**, or whatever you set with `-ScheduleRebootTime`:
 
@@ -324,6 +330,34 @@ If a restart is needed to complete one or more updates, the script reports this.
 
 > [!NOTE]
 > On **modern Windows 11**, cumulative updates are delivered through the **Unified Update Platform (UUP)** and are **not exposed by the WUA COM API**. If no updates are found here, use **Settings > Windows Update** or run `UsoClient.exe StartInstall` to trigger those. `-TriggerUpdateScan` (or `-Remediate`) is a better fit for fully automated modern-Windows pipelines where you just want to kick off a scan and let Windows handle the rest.
+
+### Installing Updates Remotely
+
+The Windows Update Agent **blocks `Download()` and `Install()` calls made over a remote session** (WinRM / PowerShell Remoting) by design, returning access denied (`0x80070005`). No amount of elevation fixes this — the restriction is on the *remote logon type*, not on permissions.
+
+To work around it, the script runs the update step inside a **local scheduled task executing as `NT AUTHORITY\SYSTEM`**. Because the task is a local logon, WUA allows the download/install. The script:
+
+1. Serializes its update logic into a small worker script under `C:\ProgramData\Windows-Update-Fix\`.
+2. Registers and starts a one-shot SYSTEM task (highest privileges, 3-hour limit).
+3. Streams the worker's per-update output back into the current (remote) transcript as it runs.
+4. Detects whether a restart is required and cleans up the task afterward. The worker log is kept under `C:\ProgramData\Windows-Update-Fix\` for troubleshooting.
+
+This happens **automatically** whenever the script detects a remote session, so `Invoke-Command … { … -InstallUpdates }` just works:
+
+```powershell
+Invoke-Command -ComputerName $Computers -Credential $Cred -ScriptBlock {
+    $Url  = 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Update-Fix/Windows-Update-Fix.ps1'
+    $Dest = Join-Path $env:TEMP 'Windows-Update-Fix.ps1'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+    & $Dest -InstallUpdates -Unattended
+}
+```
+
+You can also force the scheduled-task path on a local run with `-InstallViaScheduledTask` (useful for testing, or when running under a service account that hits the same restriction). Scheduled reboots (`-ScheduleReboot`) still work from a remote session because `shutdown.exe` is not subject to the WUA remote block.
+
+> [!NOTE]
+> The scheduled-task workaround requires the remote account to be a local administrator (needed to register a SYSTEM task) and the **Task Scheduler** service to be running. If the task cannot be created, the script reports the error and suggests running locally or using Settings > Windows Update.
 
 ## Logging
 

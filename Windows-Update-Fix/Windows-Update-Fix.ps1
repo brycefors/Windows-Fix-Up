@@ -36,6 +36,8 @@ param(
     [switch]$TriggerUpdateScan,
     [Parameter(HelpMessage = 'Search, download, and install available Windows updates after the fix and report per-update results (uses WUA COM API; UUP-delivered updates on modern Windows 11 are not covered)')]
     [switch]$InstallUpdates,
+    [Parameter(HelpMessage = 'Run the -InstallUpdates step through a local SYSTEM scheduled task, working around the WUA access-denied (0x80070005) block on remote/WinRM sessions. Used automatically when a remote session is detected')]
+    [switch]$InstallViaScheduledTask,
     [Parameter(HelpMessage = 'Also clear the per-user Local Group Policy store (GroupPolicyUsers)')]
     [switch]$IncludeGroupPolicyUsers,
     [Parameter(HelpMessage = 'Only run the fix if updates are stale or recent update failures exist (uses -StaleDays)')]
@@ -555,6 +557,219 @@ function New-UpdateSession {
         }
         throw
     }
+}
+
+# Searches for, downloads, and installs applicable Windows updates via the WUA COM API, reporting each
+# update's download and install result. Deliberately self-contained (relies only on built-in cmdlets and
+# an inline timestamp helper) so the exact same code can run in-process OR be serialized into a SYSTEM
+# scheduled-task worker. Creates $RebootMarkerPath if a restart is required. It never throws: every step
+# is guarded so a single failure cannot abort the run.
+function Invoke-WuaInstall {
+    param([string]$RebootMarkerPath)
+
+    $Log = {
+        param([string]$Message, [System.ConsoleColor]$Color = 'White')
+        Write-Host ('[{0}] {1}' -f (Get-Date -Format 'MM/dd/yyyy|HH:mm:ss'), $Message) -ForegroundColor $Color
+    }
+
+    try {
+        $WuSession = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop
+        try { $WuSession.ClientApplicationID = 'Windows-Update-Fix' } catch { }
+        $WuSearcher = $WuSession.CreateUpdateSearcher()
+        & $Log '  Querying Windows Update (this may take a moment)...' 'Yellow'
+
+        # The WUA client caps server round trips per scan; 0x80244010 etc. are benign "scan again" results.
+        $TransientScanCodes = @(0x80244010, 0x8024401C, 0x8024402C, 0x80244007)
+        $MaxSearchAttempts = 5
+        $SearchResult = $null
+        for ($Attempt = 1; $Attempt -le $MaxSearchAttempts; $Attempt++) {
+            try { $SearchResult = $WuSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0"); break }
+            catch {
+                $ScanHResult = $_.Exception.HResult -band 0xFFFFFFFF
+                if (($TransientScanCodes -contains $ScanHResult) -and $Attempt -lt $MaxSearchAttempts) {
+                    & $Log ("  Scan returned 0x{0:X8} (transient - server round-trip limit). Retrying ({1}/{2})..." -f $ScanHResult, $Attempt, ($MaxSearchAttempts - 1)) 'Yellow'
+                    Start-Sleep -Seconds 10
+                }
+                else { throw }
+            }
+        }
+        if ($null -eq $SearchResult) {
+            & $Log '  Windows Update scan did not complete after several retries. Try again later or use Settings > Windows Update.' 'Yellow'
+            return
+        }
+
+        # Exclude driver and definition/antivirus updates (same filter as the health assessment).
+        $PendingUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach ($Update in $SearchResult.Updates) {
+            $Excluded = $false
+            foreach ($Cat in $Update.Categories) { if ($Cat.Name -in @('Drivers', 'Definition Updates')) { $Excluded = $true; break } }
+            if (-not $Excluded -and $Update.Title -notmatch 'driver|Defender|Security Intelligence|Definition Update|Antivirus') {
+                $PendingUpdates.Add($Update) | Out-Null
+            }
+        }
+
+        if ($PendingUpdates.Count -eq 0) {
+            & $Log '  No applicable updates found via the WUA COM API. Windows appears up to date (UUP-delivered updates on modern Windows 11 are not shown here).' 'Green'
+            return
+        }
+
+        & $Log "  Found $($PendingUpdates.Count) update(s):"
+        foreach ($Update in $PendingUpdates) { Write-Host "    - $($Update.Title)" }
+
+        # Download and install each update individually so one failure never aborts the rest, and so
+        # every update gets its own download/install result line.
+        $ResultCodeMap = @{ 0 = 'NotStarted'; 1 = 'InProgress'; 2 = 'Succeeded'; 3 = 'SucceededWithErrors'; 4 = 'Failed'; 5 = 'Aborted' }
+        $Succeeded = 0; $Failed = 0; $RebootNeeded = $false
+        for ($i = 0; $i -lt $PendingUpdates.Count; $i++) {
+            $Update = $PendingUpdates.Item($i)
+            $Title  = $Update.Title
+            $Single = New-Object -ComObject Microsoft.Update.UpdateColl
+            $Single.Add($Update) | Out-Null
+            if (-not $Update.EulaAccepted) { try { $Update.AcceptEula() } catch { } }
+
+            if (-not $Update.IsDownloaded) {
+                try {
+                    & $Log "  Downloading: $Title"
+                    $Downloader = $WuSession.CreateUpdateDownloader()
+                    $Downloader.Updates = $Single
+                    $DownloadResult = $Downloader.Download()
+                    $DlCode = $DownloadResult.ResultCode
+                    if ($DlCode -notin @(2, 3)) {
+                        Write-Host "    [Download $($ResultCodeMap[$DlCode])] $Title (0x$('{0:X8}' -f ($DownloadResult.HResult -band 0xFFFFFFFF)))" -ForegroundColor Red
+                        $Failed++; continue
+                    }
+                }
+                catch {
+                    Write-Host "    [Download Failed] $Title (0x$('{0:X8}' -f ($_.Exception.HResult -band 0xFFFFFFFF))) - $($_.Exception.Message)" -ForegroundColor Red
+                    $Failed++; continue
+                }
+            }
+
+            try {
+                & $Log "  Installing: $Title"
+                $Installer = $WuSession.CreateUpdateInstaller()
+                $Installer.Updates = $Single
+                $InstallResult = $Installer.Install()
+                $UpdResult = $InstallResult.GetUpdateResult(0)
+                $Code    = $UpdResult.ResultCode
+                $HResult = $UpdResult.HResult
+                $Label   = $ResultCodeMap[$Code]
+                $Color   = if ($Code -eq 2) { 'Green' } elseif ($Code -eq 3) { 'Yellow' } else { 'Red' }
+                $HRStr   = if ($Code -ge 4) { " (0x$('{0:X8}' -f ($HResult -band 0xFFFFFFFF)))" } else { '' }
+                Write-Host "    [$Label] $Title$HRStr" -ForegroundColor $Color
+                if ($Code -in @(2, 3)) { $Succeeded++ } else { $Failed++ }
+                if ($InstallResult.RebootRequired) { $RebootNeeded = $true }
+            }
+            catch {
+                Write-Host "    [Install Failed] $Title (0x$('{0:X8}' -f ($_.Exception.HResult -band 0xFFFFFFFF))) - $($_.Exception.Message)" -ForegroundColor Red
+                $Failed++
+            }
+        }
+
+        $SummaryColor = if ($Failed -gt 0) { 'Yellow' } else { 'Green' }
+        & $Log "  Install complete: $Succeeded succeeded, $Failed failed." $SummaryColor
+        if ($RebootNeeded) {
+            & $Log '  One or more updates require a restart to complete installation.' 'Yellow'
+            if ($RebootMarkerPath) { try { New-Item -Path $RebootMarkerPath -ItemType File -Force | Out-Null } catch { } }
+        }
+    }
+    catch {
+        $HResult = $_.Exception.HResult -band 0xFFFFFFFF
+        & $Log "  Windows Update installation error: $($_.Exception.Message)" 'Red'
+        if ($HResult -eq 0x80070005) {
+            & $Log '  Access denied (0x80070005). Over a remote/WinRM session WUA blocks download/install by design - re-run with -InstallViaScheduledTask (this is applied automatically when a remote session is detected).' 'Yellow'
+        }
+        & $Log '  If updates are not showing here, they may be UUP-delivered (modern Windows 11). Use Settings > Windows Update or run: UsoClient.exe StartInstall' 'Yellow'
+    }
+}
+
+# Runs Invoke-WuaInstall inside a scheduled task executing as NT AUTHORITY\SYSTEM on the LOCAL machine.
+# This is the supported workaround for WUA's access-denied (0x80070005) block on remote (WinRM) sessions:
+# a scheduled task is a local logon, so WUA permits the download/install. Streams the worker's output back
+# into this transcript and returns $true if a restart is required. Never throws.
+function Invoke-UpdatesViaScheduledTask {
+    $WorkDir = Join-Path -Path $env:ProgramData -ChildPath 'Windows-Update-Fix'
+    try { if (-not (Test-Path $WorkDir)) { New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null } }
+    catch { $WorkDir = $env:TEMP }
+
+    $Stamp      = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $WorkerFile = Join-Path $WorkDir "wuworker_$Stamp.ps1"
+    $WorkerLog  = Join-Path $WorkDir "wuworker_$Stamp.log"
+    $MarkerFile = Join-Path $WorkDir "wuworker_$Stamp.reboot"
+    $TaskName   = "WindowsUpdateFix_Install_$Stamp"
+
+    # Embed Invoke-WuaInstall (serialized from its in-memory definition) into a standalone worker script,
+    # so the SYSTEM task runs the exact same install logic without duplicating it here.
+    $WorkerBody = ${function:Invoke-WuaInstall}.ToString()
+    $WorkerContent = @"
+`$ErrorActionPreference = 'Continue'
+try { Start-Transcript -Path '$WorkerLog' -Force | Out-Null } catch { }
+function Invoke-WuaInstall {$WorkerBody}
+Invoke-WuaInstall -RebootMarkerPath '$MarkerFile'
+try { Stop-Transcript | Out-Null } catch { }
+"@
+    try { Set-Content -Path $WorkerFile -Value $WorkerContent -Encoding UTF8 -Force -ErrorAction Stop }
+    catch {
+        Write-HostTimestamp "  Could not write the update worker script: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+
+    Write-HostTimestamp '  Running the update install through a local SYSTEM scheduled task to bypass the remote WUA access-denied block...' -ForegroundColor Cyan
+
+    $Reboot = $false
+    try {
+        $Action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$WorkerFile`""
+        $Principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $Settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 3)
+        Register-ScheduledTask -TaskName $TaskName -Action $Action -Principal $Principal -Settings $Settings -Force -ErrorAction Stop | Out-Null
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+
+        # Poll until the task finishes (or a hard cap), echoing new worker-log output as it appears.
+        $Deadline = (Get-Date).AddHours(3)
+        $LastLen  = 0
+        $State    = 'Running'
+        do {
+            Start-Sleep -Seconds 5
+            if (Test-Path $WorkerLog) {
+                try {
+                    $Content = Get-Content -Path $WorkerLog -Raw -ErrorAction SilentlyContinue
+                    if ($Content -and $Content.Length -gt $LastLen) {
+                        Write-Host ($Content.Substring($LastLen)) -NoNewline
+                        $LastLen = $Content.Length
+                    }
+                }
+                catch { }
+            }
+            $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            $State = if ($Task) { $Task.State } else { 'Ready' }
+        } while ($State -eq 'Running' -and (Get-Date) -lt $Deadline)
+
+        # Flush any remaining log tail.
+        if (Test-Path $WorkerLog) {
+            try {
+                $Content = Get-Content -Path $WorkerLog -Raw -ErrorAction SilentlyContinue
+                if ($Content -and $Content.Length -gt $LastLen) { Write-Host ($Content.Substring($LastLen)) -NoNewline }
+            }
+            catch { }
+        }
+
+        if ($State -eq 'Running') {
+            Write-HostTimestamp '  The update task is still running past the time limit; it will finish in the background. Check Settings > Windows Update later.' -ForegroundColor Yellow
+        }
+
+        $Reboot = Test-Path $MarkerFile
+    }
+    catch {
+        Write-HostTimestamp "  Could not run the update install via scheduled task: $($_.Exception.Message)" -ForegroundColor Red
+        Write-HostTimestamp '  Run the script locally (console or a SYSTEM scheduled task) or use Settings > Windows Update instead.' -ForegroundColor Yellow
+    }
+    finally {
+        try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Item -Path $WorkerFile -Force -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Item -Path $MarkerFile -Force -ErrorAction SilentlyContinue } catch { }
+        # The worker log is left under ProgramData\Windows-Update-Fix for troubleshooting.
+    }
+    return $Reboot
 }
 
 # Returns the most recent successfully installed Windows Update patch (Date and Title), excluding
@@ -1540,109 +1755,29 @@ if ($TriggerUpdateScan) {
 # Optionally search, download, and install available Windows updates via the WUA COM API
 # NOTE: On modern Windows 11, UUP-delivered cumulative updates are not exposed by this API.
 # Those will still appear (and install) through Settings > Windows Update or UsoClient.
-$UpdateRebootRequired = $false
+$script:UpdateRebootRequired = $false
 if ($InstallUpdates) {
-    Invoke-Task -Description 'Searching for available Windows updates to install...' -ScriptBlock {
-        try {
-            $WuSession  = New-UpdateSession
-            $WuSearcher = $WuSession.CreateUpdateSearcher()
-            Write-HostTimestamp '  Querying Windows Update (this may take a moment)...'
-
-            # The WUA client caps the number of server round trips per scan. Against a large catalog the
-            # search can return 0x80244010 (WU_E_PT_EXCEEDED_MAX_SERVER_TRIPS) - a benign, transient result
-            # that simply means "scan again to continue". Retry the search a few times before giving up.
-            $TransientScanCodes = @(0x80244010, 0x8024401C, 0x8024402C, 0x80244007)
-            $MaxSearchAttempts = 5
-            $SearchResult = $null
-            for ($Attempt = 1; $Attempt -le $MaxSearchAttempts; $Attempt++) {
-                try {
-                    $SearchResult = $WuSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
-                    break
-                }
-                catch {
-                    $ScanHResult = $_.Exception.HResult -band 0xFFFFFFFF
-                    if (($TransientScanCodes -contains $ScanHResult) -and $Attempt -lt $MaxSearchAttempts) {
-                        Write-HostTimestamp ("  Scan returned 0x{0:X8} (transient - server round-trip limit). Retrying ({1}/{2})..." -f $ScanHResult, $Attempt, ($MaxSearchAttempts - 1)) -ForegroundColor Yellow
-                        Start-Sleep -Seconds 10
-                    }
-                    else {
-                        throw
-                    }
-                }
-            }
-            if ($null -eq $SearchResult) {
-                Write-HostTimestamp '  Windows Update scan did not complete after several retries (server round-trip limit). Try again later or use Settings > Windows Update.' -ForegroundColor Yellow
-                return
-            }
-
-            # Exclude driver and definition/antivirus updates
-            $PendingUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
-            foreach ($Update in $SearchResult.Updates) {
-                $Excluded = $false
-                foreach ($Cat in $Update.Categories) {
-                    if ($Cat.Name -in @('Drivers', 'Definition Updates')) { $Excluded = $true; break }
-                }
-                if (-not $Excluded -and $Update.Title -notmatch 'driver|Defender|Security Intelligence|Definition Update|Antivirus') {
-                    $PendingUpdates.Add($Update) | Out-Null
-                }
-            }
-
-            if ($PendingUpdates.Count -eq 0) {
-                Write-HostTimestamp '  No applicable updates found via the WUA COM API. Windows appears up to date (UUP-delivered updates on modern Windows 11 are not shown here).' -ForegroundColor Green
-                return
-            }
-
-            Write-HostTimestamp "  Found $($PendingUpdates.Count) update(s):"
-            foreach ($Update in $PendingUpdates) {
-                Write-Host "    - $($Update.Title)"
-            }
-
-            # Download
-            Write-HostTimestamp '  Downloading updates...'
-            $Downloader         = $WuSession.CreateUpdateDownloader()
-            $Downloader.Updates = $PendingUpdates
-            $Downloader.Download() | Out-Null
-
-            # Install
-            Write-HostTimestamp '  Installing updates...'
-            $Installer         = $WuSession.CreateUpdateInstaller()
-            $Installer.Updates = $PendingUpdates
-            $InstallResult     = $Installer.Install()
-
-            # Report per-update results
-            $ResultCodeMap = @{ 0='NotStarted'; 1='InProgress'; 2='Succeeded'; 3='SucceededWithErrors'; 4='Failed'; 5='Aborted' }
-            $Succeeded = 0
-            $Failed    = 0
-            for ($i = 0; $i -lt $PendingUpdates.Count; $i++) {
-                $UpdResult = $InstallResult.GetUpdateResult($i)
-                $Code      = $UpdResult.ResultCode
-                $HResult   = $UpdResult.HResult
-                $Label     = $ResultCodeMap[$Code]
-                $Color     = if ($Code -eq 2) { 'Green' } elseif ($Code -eq 3) { 'Yellow' } else { 'Red' }
-                $HRStr     = if ($Code -ge 4) { " (0x$('{0:X8}' -f ($HResult -band 0xFFFFFFFF)))" } else { '' }
-                Write-Host "    [$Label] $($PendingUpdates.Item($i).Title)$HRStr" -ForegroundColor $Color
-                if ($Code -in @(2, 3)) { $Succeeded++ } else { $Failed++ }
-            }
-
-            $SummaryColor = if ($Failed -gt 0) { 'Yellow' } else { 'Green' }
-            Write-HostTimestamp "  Install complete: $Succeeded succeeded, $Failed failed." -ForegroundColor $SummaryColor
-            if ($InstallResult.RebootRequired) {
-                $UpdateRebootRequired = $true
-                Write-HostTimestamp '  One or more updates require a restart to complete installation.' -ForegroundColor Yellow
-            }
+    # WUA blocks Download()/Install() over a remote (WinRM) session with access-denied (0x80070005).
+    # When we detect a remote session - or the caller forces it with -InstallViaScheduledTask - run the
+    # install through a local SYSTEM scheduled task, which is a local logon and therefore allowed.
+    $IsRemote = Test-IsRemoteSession
+    if ($InstallViaScheduledTask -or $IsRemote) {
+        if ($IsRemote -and -not $InstallViaScheduledTask) {
+            Write-HostTimestamp 'Remote session detected - routing the update install through a local SYSTEM scheduled task to avoid the WUA remote access-denied (0x80070005) block.' -ForegroundColor Cyan
         }
-        catch {
-            $HResult = $_.Exception.HResult -band 0xFFFFFFFF
-            Write-HostTimestamp "  Windows Update installation error: $($_.Exception.Message)" -ForegroundColor Red
-            if ($HResult -eq 0x80070005) {
-                if (Test-IsRemoteSession) {
-                    Write-HostTimestamp '  Access denied (0x80070005) in a REMOTE session. WUA blocks remote download/install by design - run this script locally or via a scheduled task running as SYSTEM.' -ForegroundColor Yellow
-                }
-                else {
-                    Write-HostTimestamp '  Access denied (0x80070005). Confirm the script is elevated and that no policy (e.g. DisableWindowsUpdateAccess) is blocking Windows Update.' -ForegroundColor Yellow
-                }
+        Invoke-Task -Description 'Installing Windows updates via a local SYSTEM scheduled task...' -ScriptBlock {
+            if (Invoke-UpdatesViaScheduledTask) { $script:UpdateRebootRequired = $true }
+        }
+    }
+    else {
+        Invoke-Task -Description 'Searching for and installing available Windows updates...' -ScriptBlock {
+            $Marker = Join-Path -Path $env:TEMP -ChildPath "wufix_reboot_$PID.marker"
+            Remove-Item -Path $Marker -Force -ErrorAction SilentlyContinue
+            Invoke-WuaInstall -RebootMarkerPath $Marker
+            if (Test-Path $Marker) {
+                $script:UpdateRebootRequired = $true
+                Remove-Item -Path $Marker -Force -ErrorAction SilentlyContinue
             }
-            Write-HostTimestamp '  If updates are not showing here, they may be UUP-delivered (modern Windows 11). Use Settings > Windows Update or run: UsoClient.exe StartInstall' -ForegroundColor Yellow
         }
     }
 }
