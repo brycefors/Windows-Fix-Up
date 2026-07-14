@@ -1042,10 +1042,31 @@ if (($Remediate -or $ForceRemediate) -and $CooldownDays -gt 0) {
 }
 
 Invoke-Task -Description 'Stopping Windows Update services before cleanup...' -ScriptBlock {
-    foreach ($Svc in @('wuauserv', 'UsoSvc', 'BITS', 'DoSvc', 'CryptSvc', 'msiserver')) {
+    # These trigger-start services (and the Update Medic Service in particular) will silently
+    # restart themselves mid-cleanup and re-lock SoftwareDistribution/catroot2. To prevent that,
+    # temporarily set each one to Disabled so Windows cannot trigger-start it, THEN stop it.
+    # Step 5 (Verify and enable required services) restores every service to its healthy startup type.
+    $ServicesToStop = @('WaaSMedicSvc', 'UsoSvc', 'wuauserv', 'BITS', 'DoSvc', 'CryptSvc', 'msiserver')
+    foreach ($Svc in $ServicesToStop) {
+        $Service = Get-Service -Name $Svc -ErrorAction SilentlyContinue
+        if (-not $Service) { continue }
+
+        # Disable first so triggers/dependencies cannot restart it while we clean up.
+        [void](Set-ServiceStartupType -Name $Svc -StartupType 'Disabled')
+
+        if ($Service.Status -ne 'Stopped') {
+            Write-Host "- Stopping $($Service.DisplayName) ($Svc)"
+            Stop-Service -Name $Svc -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Give the services a moment to fully release their handles, then confirm they stayed down.
+    # Anything that trigger-started again is force-killed at the process level so the rename can succeed.
+    Start-Sleep -Seconds 2
+    foreach ($Svc in $ServicesToStop) {
         $Service = Get-Service -Name $Svc -ErrorAction SilentlyContinue
         if ($Service -and $Service.Status -ne 'Stopped') {
-            Write-Host "- Stopping $($Service.DisplayName) ($Svc)"
+            Write-HostTimestamp "  $Svc restarted itself; force-stopping again." -ForegroundColor Yellow
             Stop-Service -Name $Svc -Force -ErrorAction SilentlyContinue
         }
     }
