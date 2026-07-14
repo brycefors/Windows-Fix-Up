@@ -112,7 +112,7 @@ The script supports the following optional parameters:
 | `-IncludeGroupPolicyUsers` | Also clears the per-user Local Group Policy store (`C:\Windows\System32\GroupPolicyUsers`). Off by default to avoid wiping intentional per-user policy. |
 | `-RepairComponentStore` | Also runs `DISM /RestoreHealth` and `SFC /scannow` to repair the component store (slow). Automatically enabled by `-Remediate` when a system is classified as *severe*. |
 | `-SkipOnlineBuildDate` | Skips the online lookup of the current build's exact release date and KB article. By default the script queries Microsoft's public release-information page (best-effort) to report, e.g., `Build 26200.8737 released: 2026-06-23 via KB5095093`. If the online lookup times out or is unreachable, it falls back to a small **hardcoded build reference table** in the script (see [Build Date Lookup](#build-date-lookup)); if neither is available it falls back silently. |
-| `-TriggerUpdateScan` | Triggers a fresh Windows Update detection scan after the fix. Automatically enabled by `-Remediate`. |
+| `-TriggerUpdateScan` | Triggers a fresh Windows Update detection scan after the fix. Automatically enabled by `-Remediate`. When used **without** `-InstallUpdates`, it also performs a quick read-only detection and prints what the scan found, so you can confirm the scan is actually picking up updates. See [Checking What a Scan Detects](#checking-what-a-scan-detects). |
 | `-InstallUpdates` | After the fix, searches for available updates via the WUA COM API, downloads and installs them, then reports per-update results (succeeded / failed / reboot required). See [Installing Updates](#installing-updates) for details. |
 | `-InstallViaScheduledTask` | Runs the `-InstallUpdates` step through a local scheduled task running as `NT AUTHORITY\SYSTEM`, working around the WUA access-denied (`0x80070005`) error that occurs when downloading/installing updates over a remote (WinRM / PowerShell Remoting) session. This is **applied automatically** when the script detects it is running in a remote session, so you rarely need to set it by hand. See [Installing Updates Remotely](#installing-updates-remotely). |
 | `-LogPath <path>` | Directory to write log files to. Defaults to the script folder. The directory is created automatically if it does not exist. If the path is invalid or cannot be created, the script falls back to the script folder. |
@@ -292,6 +292,28 @@ When it proceeds with a repair, the script performs the following actions in seq
 
 13. **Trigger an Update Scan (Optional)**
     *   With `-TriggerUpdateScan` (or any remediation), requests a fresh detection scan via `UsoClient StartScan` (with a COM fallback for older builds).
+
+## Checking What a Scan Detects
+
+`UsoClient StartScan` is **fire-and-forget** — it kicks off a scan but returns no result, so on its own it can't tell you whether the scan actually found anything. To close that gap, when you use `-TriggerUpdateScan` **without** `-InstallUpdates`, the script follows the scan with a **read-only detection** and prints what it found:
+
+```
+Checking what the scan detects (read-only - nothing is downloaded or installed)...
+  Detection found 2 applicable update(s): 1 quality/feature, 1 driver/definition.
+    - 2026-07 Cumulative Update for Windows 11 Version 24H2 (KB50xxxxx)
+    - Intel - Display - 31.0.101.x [driver/definition]
+  Last successful detection recorded by Windows: 2026-07-13 09:00:00 (UTC).
+```
+
+Key points:
+
+- It is a **search only** — nothing is downloaded or installed. (This is why it runs even without `-InstallUpdates`.)
+- Search is **allowed over a remote session**, so this works over WinRM too (only `Download()`/`Install()` are blocked remotely — see [Installing Updates Remotely](#installing-updates-remotely)).
+- It splits results into **quality/feature** updates and **driver/definition** updates so you can see what kind of updates are pending.
+- The **last successful detection timestamp** is read from the registry (`…\WindowsUpdate\Auto Update\Results\Detect\LastSuccessTime`) to confirm a scan completed.
+- **UUP caveat:** on modern Windows 11, cumulative updates delivered via the Unified Update Platform are **not visible** to the WUA COM API, so `0 applicable updates` here does not always mean nothing is pending — confirm in **Settings > Windows Update**.
+
+When you *do* pass `-InstallUpdates`, this read-only step is skipped because the install path already enumerates and reports every update.
 
 ## Installing Updates
 

@@ -772,6 +772,78 @@ try { Stop-Transcript | Out-Null } catch { }
     return $Reboot
 }
 
+# Reads the timestamp of the last successful Windows Update detection cycle from the registry. Windows
+# writes this after a scan completes, so it is a quick way to confirm a scan actually ran. Returns the
+# raw string (stored in UTC, e.g. '2026-07-13 09:00:00') or $null if not present.
+function Get-DetectLastSuccessTime {
+    $Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\Results\Detect'
+    try {
+        $Val = (Get-ItemProperty -Path $Path -Name 'LastSuccessTime' -ErrorAction Stop).LastSuccessTime
+        if ($Val) { return $Val }
+    }
+    catch { }
+    return $null
+}
+
+# Performs a READ-ONLY Windows Update detection via the WUA COM API and reports what it finds, without
+# downloading or installing anything. This is how you can tell whether a scan is actually picking up new
+# updates even when you are not using -InstallUpdates. Search (unlike Download/Install) is permitted in a
+# remote session, so this works over WinRM too. Returns the number of applicable updates found, or -1 if
+# the detection could not complete. NOTE: UUP-delivered updates on modern Windows 11 are not visible to
+# this API, so a result of 0 here does not always mean nothing is pending - confirm in Settings.
+function Show-DetectedUpdates {
+    try {
+        $Session = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop
+        try { $Session.ClientApplicationID = 'Windows-Update-Fix' } catch { }
+        $Searcher = $Session.CreateUpdateSearcher()
+
+        # Retry the transient "server round-trip limit" results, same as the install path.
+        $TransientScanCodes = @(0x80244010, 0x8024401C, 0x8024402C, 0x80244007)
+        $Result = $null
+        for ($Attempt = 1; $Attempt -le 5; $Attempt++) {
+            try { $Result = $Searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0"); break }
+            catch {
+                $Hr = $_.Exception.HResult -band 0xFFFFFFFF
+                if (($TransientScanCodes -contains $Hr) -and $Attempt -lt 5) {
+                    Write-HostTimestamp ("  Detection returned 0x{0:X8} (transient - server round-trip limit). Retrying ({1}/4)..." -f $Hr, $Attempt) -ForegroundColor Yellow
+                    Start-Sleep -Seconds 10
+                }
+                else { throw }
+            }
+        }
+        if ($null -eq $Result) { return -1 }
+
+        # Split quality/feature updates from driver and definition updates for a clearer picture.
+        $Updates  = @($Result.Updates)
+        $Software = @()
+        $Other    = @()
+        foreach ($Update in $Updates) {
+            $Excluded = $false
+            foreach ($Cat in $Update.Categories) { if ($Cat.Name -in @('Drivers', 'Definition Updates')) { $Excluded = $true; break } }
+            if (-not $Excluded -and $Update.Title -notmatch 'driver|Defender|Security Intelligence|Definition Update|Antivirus') { $Software += $Update }
+            else { $Other += $Update }
+        }
+
+        if ($Updates.Count -eq 0) {
+            Write-HostTimestamp '  Detection found 0 applicable updates via the WUA COM API. (Modern Windows 11 UUP updates are not visible here - confirm in Settings > Windows Update.)' -ForegroundColor Green
+        }
+        else {
+            Write-HostTimestamp "  Detection found $($Updates.Count) applicable update(s): $($Software.Count) quality/feature, $($Other.Count) driver/definition." -ForegroundColor Cyan
+            foreach ($Update in $Software) { Write-Host "    - $($Update.Title)" }
+            foreach ($Update in $Other)    { Write-Host "    - $($Update.Title) [driver/definition]" -ForegroundColor DarkGray }
+        }
+        return $Updates.Count
+    }
+    catch {
+        $Hr = $_.Exception.HResult -band 0xFFFFFFFF
+        Write-HostTimestamp "  Could not enumerate detected updates: $($_.Exception.Message)" -ForegroundColor Yellow
+        if ($Hr -eq 0x80070005) {
+            Write-HostTimestamp '  Access denied (0x80070005) during detection. Detection normally works even remotely, so a policy such as DisableWindowsUpdateAccess may be blocking it.' -ForegroundColor Yellow
+        }
+        return -1
+    }
+}
+
 # Returns the most recent successfully installed Windows Update patch (Date and Title), excluding
 # driver updates and Microsoft Defender/antivirus definition updates. Returns $null if none found.
 function Get-LastUpdatePatch {
@@ -1742,12 +1814,24 @@ if ($TriggerUpdateScan) {
     Invoke-Task -Description 'Triggering a Windows Update detection scan...' -ScriptBlock {
         if (Get-Command UsoClient.exe -ErrorAction SilentlyContinue) {
             UsoClient.exe StartScan
-            Write-HostTimestamp 'Update scan requested. Check Settings > Windows Update for results.'
+            Write-HostTimestamp 'Update scan requested (USO). Windows will refresh Settings > Windows Update.'
         }
         else {
             # Fallback for older builds
             (New-Object -ComObject Microsoft.Update.AutoUpdate).DetectNow()
-            Write-HostTimestamp 'Update scan requested via COM. Check Settings > Windows Update for results.'
+            Write-HostTimestamp 'Update scan requested via COM. Windows will refresh Settings > Windows Update.'
+        }
+
+        # USO StartScan is fire-and-forget and returns no result, so when we are NOT going to install via
+        # WUA (that path already enumerates), do a quick READ-ONLY detection to show whether the scan is
+        # actually picking up updates. Nothing is downloaded or installed.
+        if (-not $InstallUpdates) {
+            Write-HostTimestamp 'Checking what the scan detects (read-only - nothing is downloaded or installed)...'
+            [void](Show-DetectedUpdates)
+            $DetectTime = Get-DetectLastSuccessTime
+            if ($DetectTime) {
+                Write-HostTimestamp "  Last successful detection recorded by Windows: $DetectTime (UTC)."
+            }
         }
     }
 }
