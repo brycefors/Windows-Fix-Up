@@ -109,7 +109,7 @@ The script supports the following optional parameters:
 | `-ResetAllPolicies` | **Aggressive.** Also removes the broader Software Policies registry hive, not just the Windows Update keys. Automatically enabled by `-Remediate` when a system is classified as *severe*. |
 | `-IncludeGroupPolicyUsers` | Also clears the per-user Local Group Policy store (`C:\Windows\System32\GroupPolicyUsers`). Off by default to avoid wiping intentional per-user policy. |
 | `-RepairComponentStore` | Also runs `DISM /RestoreHealth` and `SFC /scannow` to repair the component store (slow). Automatically enabled by `-Remediate` when a system is classified as *severe*. |
-| `-SkipOnlineBuildDate` | Skips the online lookup of the current build's exact release date and KB article. By default the script queries Microsoft's public release-information page (best-effort; falls back silently if offline or unmatched) to report, e.g., `Build 26200.8737 released: 2026-06-23 via KB5095093`. |
+| `-SkipOnlineBuildDate` | Skips the online lookup of the current build's exact release date and KB article. By default the script queries Microsoft's public release-information page (best-effort) to report, e.g., `Build 26200.8737 released: 2026-06-23 via KB5095093`. If the online lookup times out or is unreachable, it falls back to a small **hardcoded build reference table** in the script (see [Build Date Lookup](#build-date-lookup)); if neither is available it falls back silently. |
 | `-TriggerUpdateScan` | Triggers a fresh Windows Update detection scan after the fix. Automatically enabled by `-Remediate`. |
 | `-InstallUpdates` | After the fix, searches for available updates via the WUA COM API, downloads and installs them, then reports per-update results (succeeded / failed / reboot required). See [Installing Updates](#installing-updates) for details. |
 | `-LogPath <path>` | Directory to write log files to. Defaults to the script folder. The directory is created automatically if it does not exist. If the path is invalid or cannot be created, the script falls back to the script folder. |
@@ -137,7 +137,17 @@ If you want to skip the health assessment and force a specific level regardless 
 
 In every remediation case a fresh Windows Update scan is triggered afterward, and the whole process runs hands-off (no prompts). Remediation also honors the false-positive logic: a small number of unresolved failures alongside a recent successful patch are reported but ignored.
 
-Staleness is judged from **two** independent signals: the date of the last successful patch in the update history, and the Microsoft release date of the currently-installed build revision (resolved online, unless `-SkipOnlineBuildDate` is set). The build-date signal catches machines whose update history has been cleared or truncated but which are nonetheless running an old build. If the online lookup is unavailable (offline or unmatched), the script silently falls back to the update-history signal alone.
+Staleness is judged from **two** independent signals: the date of the last successful patch in the update history, and the Microsoft release date of the currently-installed build revision (resolved online, unless `-SkipOnlineBuildDate` is set). The build-date signal catches machines whose update history has been cleared or truncated but which are nonetheless running an old build. If the online lookup is unavailable (offline or timed out), the script first consults the [hardcoded build reference](#build-date-lookup) baked into the script, and only falls back to the update-history signal alone if the build is not listed there.
+
+## Build Date Lookup
+
+When reporting the current build's release date/KB (and for the build-based staleness signal), the script first tries Microsoft's public release-information page. Because that page can be slow or unreachable, the script also ships with a small **hardcoded fallback table** (`$KnownBuildReleases`) near the top of `Windows-Update-Fix.ps1`, keyed by `Build.UBR` (e.g. `26100.8737`). If the online lookup times out or fails, this table supplies the release date and KB instead; it is also used to fill in whichever single value (date or KB) the online lookup could not resolve.
+
+The table is easy to keep current. To update it:
+
+1.  Open the Microsoft release information page ([Windows 11](https://learn.microsoft.com/windows/release-health/windows11-release-information) / [Windows 10](https://learn.microsoft.com/windows/release-health/release-information)).
+2.  In the *release history* section, find the newest row for the version(s) you care about and note its **Build** (`Build.UBR`), **Availability date**, and **KB article**.
+3.  Add or replace the matching entry in `$KnownBuildReleases`, using an ISO `yyyy-MM-dd` date. Old entries are harmless — they are only ever used as a fallback — so you only need to keep the latest few builds.
 
 ## Remediation Cooldown
 
@@ -194,7 +204,7 @@ The light cleanup is non-destructive to user data. It removes:
 When it proceeds with a repair, the script performs the following actions in sequence:
 
 1.  **Stop Update Services**
-    *   Stops `wuauserv`, `UsoSvc`, `BITS`, `DoSvc`, `CryptSvc`, and `msiserver` so files and registry keys are not locked during cleanup.
+    *   Temporarily sets `WaaSMedicSvc`, `UsoSvc`, `wuauserv`, `BITS`, `DoSvc`, `CryptSvc`, and `msiserver` to **Disabled** and then stops them, so Windows cannot trigger-start them again and re-lock files or registry keys mid-cleanup. The Windows Update Medic Service (`WaaSMedicSvc`) in particular is known to silently revive the other update services during a repair. After a brief pause the script re-checks each one and force-stops anything that restarted itself. Step 7 restores every service to its healthy startup type at the end of the run.
 
 2.  **Clear the Local Group Policy Store**
     *   Removes the contents of `C:\Windows\System32\GroupPolicy` (and `GroupPolicyUsers` when `-IncludeGroupPolicyUsers` is used).

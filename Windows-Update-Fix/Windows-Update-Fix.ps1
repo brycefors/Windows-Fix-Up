@@ -186,6 +186,34 @@ function Set-ServiceStartupType {
     }
 }
 
+# =====================================================================================
+# HARDCODED BUILD REFERENCE (offline fallback) - SAFE & EASY TO UPDATE
+# -------------------------------------------------------------------------------------
+# When the online lookup of the current build's release date/KB times out or is unreachable,
+# the script falls back to this table so it can still report a release date and KB offline.
+#
+# Keyed by "<Build>.<UBR>" (e.g. '26100.8737'). Date must be ISO format 'yyyy-MM-dd'.
+#
+# TO UPDATE (recommended after each Patch Tuesday, or whenever you want a fresher fallback):
+#   1. Open the Microsoft release information page:
+#        Windows 11: https://learn.microsoft.com/windows/release-health/windows11-release-information
+#        Windows 10: https://learn.microsoft.com/windows/release-health/release-information
+#   2. In the "release history" section, find the newest row for the version(s) you care about
+#      and note its Build (Build.UBR), Availability date, and KB article.
+#   3. Add or replace the matching entry below. You only need to keep the latest few builds;
+#      old entries can stay or be trimmed - they are only used as a fallback.
+# Last verified against Microsoft release information: 2026-06-23
+# =====================================================================================
+$script:KnownBuildReleases = @{
+    # --- Windows 11 (latest known build per serviced version) ---
+    '28000.2340' = @{ Date = '2026-06-23'; KB = 'KB5095091' }  # 26H1
+    '26200.8737' = @{ Date = '2026-06-23'; KB = 'KB5095093' }  # 25H2
+    '26100.8737' = @{ Date = '2026-06-23'; KB = 'KB5095093' }  # 24H2
+    '22631.7219' = @{ Date = '2026-06-09'; KB = 'KB5093998' }  # 23H2
+    '22621.6060' = @{ Date = '2025-10-14'; KB = 'KB5066793' }  # 22H2 (end of updates)
+    '22000.3260' = @{ Date = '2024-10-08'; KB = 'KB5044280' }  # 21H2 (end of updates)
+}
+
 # Best-effort online lookup of the exact release date and KB article for a specific Windows build
 # revision (Build.UBR), using Microsoft's public release information page. Returns a PSCustomObject with
 # Date and KB (either may be $null), or $null if the build cannot be found.
@@ -257,6 +285,22 @@ function Get-CurrentBuildReleaseInfo {
         return $script:BuildReleaseInfo
     }
     $Online = Get-BuildReleaseDateOnline -BuildUbr $BuildUbr -IsWin11 $IsWin11
+
+    # If the online lookup timed out, was unreachable, or couldn't resolve this build, fall back to the
+    # hardcoded reference table above so we can still report a release date/KB. Also use it to fill in
+    # any single piece (date or KB) the online lookup couldn't determine.
+    $Fallback = $script:KnownBuildReleases[$BuildUbr]
+    if ($Fallback) {
+        if (-not $Online) {
+            Write-HostTimestamp "  Online lookup unavailable; using the hardcoded build reference for $BuildUbr." -ForegroundColor DarkGray
+            $Online = [PSCustomObject]@{ Date = $Fallback.Date; KB = $Fallback.KB }
+        }
+        else {
+            if (-not $Online.Date) { $Online.Date = $Fallback.Date }
+            if (-not $Online.KB) { $Online.KB = $Fallback.KB }
+        }
+    }
+
     $ReleaseDate = $null
     if ($Online -and $Online.Date) {
         try { $ReleaseDate = [datetime]::ParseExact($Online.Date, 'yyyy-MM-dd', $null) } catch { $ReleaseDate = $null }
