@@ -559,6 +559,28 @@ function New-UpdateSession {
     }
 }
 
+# Returns $true if Windows currently has a pending-reboot indicator set. These are the standard machine-
+# wide signals Windows Update / servicing use, so reading them back is the reliable way to know a reboot
+# is required after installing updates - especially via the SYSTEM scheduled task, where the reboot state
+# lives on the machine rather than in an in-process variable, and where WUA's per-update RebootRequired
+# flag can under-report even when the system as a whole needs restarting.
+function Test-PendingReboot {
+    $Keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootInProgress',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+    foreach ($Key in $Keys) {
+        if (Test-Path $Key) { return $true }
+    }
+    try {
+        $Pfro = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue).PendingFileRenameOperations
+        if ($Pfro) { return $true }
+    }
+    catch { }
+    return $false
+}
+
 # Searches for, downloads, and installs applicable Windows updates via the WUA COM API, reporting each
 # update's download and install result. Deliberately self-contained (relies only on built-in cmdlets and
 # an inline timestamp helper) so the exact same code can run in-process OR be serialized into a SYSTEM
@@ -757,7 +779,11 @@ try { Stop-Transcript | Out-Null } catch { }
             Write-HostTimestamp '  The update task is still running past the time limit; it will finish in the background. Check Settings > Windows Update later.' -ForegroundColor Yellow
         }
 
-        $Reboot = Test-Path $MarkerFile
+        # Determine the reboot requirement from BOTH the worker's marker (WUA said a restart is needed)
+        # AND the machine's actual pending-reboot flags. The latter is authoritative: per-update installs
+        # can leave WUA's RebootRequired flag $false even when the OS genuinely needs a restart, so we
+        # read it back from the machine to make sure the requirement reaches the main session.
+        $Reboot = (Test-Path $MarkerFile) -or (Test-PendingReboot)
     }
     catch {
         Write-HostTimestamp "  Could not run the update install via scheduled task: $($_.Exception.Message)" -ForegroundColor Red
@@ -769,7 +795,7 @@ try { Stop-Transcript | Out-Null } catch { }
         try { Remove-Item -Path $MarkerFile -Force -ErrorAction SilentlyContinue } catch { }
         # The worker log is left under ProgramData\Windows-Update-Fix for troubleshooting.
     }
-    return $Reboot
+    return [bool]$Reboot
 }
 
 # Reads the timestamp of the last successful Windows Update detection cycle from the registry. Windows
@@ -1994,10 +2020,10 @@ if ($InstallUpdates) {
             $Marker = Join-Path -Path $env:TEMP -ChildPath "wufix_reboot_$PID.marker"
             Remove-Item -Path $Marker -Force -ErrorAction SilentlyContinue
             Invoke-WuaInstall -RebootMarkerPath $Marker
-            if (Test-Path $Marker) {
-                $script:UpdateRebootRequired = $true
-                Remove-Item -Path $Marker -Force -ErrorAction SilentlyContinue
-            }
+            # The marker reflects WUA's own RebootRequired; Test-PendingReboot catches the case where the
+            # OS needs a restart even though the per-update flag did not report it.
+            if ((Test-Path $Marker) -or (Test-PendingReboot)) { $script:UpdateRebootRequired = $true }
+            Remove-Item -Path $Marker -Force -ErrorAction SilentlyContinue
         }
     }
 }

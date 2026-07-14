@@ -382,7 +382,9 @@ To work around it, the script runs the update step inside a **local scheduled ta
 1. Serializes its update logic into a small worker script under `C:\ProgramData\Windows-Update-Fix\`.
 2. Registers and starts a one-shot SYSTEM task (highest privileges, 3-hour limit).
 3. Streams the worker's per-update output back into the current (remote) transcript as it runs.
-4. Detects whether a restart is required and cleans up the task afterward. The worker log is kept under `C:\ProgramData\Windows-Update-Fix\` for troubleshooting.
+4. Detects whether a restart is required — by both the worker's signal **and** the machine's actual pending-reboot flags — and cleans up the task afterward. The worker log is kept under `C:\ProgramData\Windows-Update-Fix\` for troubleshooting.
+
+Because the install runs in a separate SYSTEM process, the "reboot required" result is read back from the **machine's pending-reboot indicators** (the CBS/WU registry flags and `PendingFileRenameOperations`), not just an in-process value. This ensures a required restart detected by the SYSTEM task is correctly passed back to the main (remote) session, so `-ScheduleReboot` / `-AutoReboot` still fire. It also catches cases where WUA's per-update `RebootRequired` flag under-reports even though the OS genuinely needs a restart.
 
 This happens **automatically** whenever the script detects a remote session, so `Invoke-Command … { … -InstallUpdates }` just works:
 
