@@ -844,6 +844,46 @@ function Show-DetectedUpdates {
     }
 }
 
+# Broadcasts a formatted notice to every logged-on user warning that the computer will restart for
+# Windows updates at the given time. Uses msg.exe (present on Windows Pro/Enterprise; not on Home
+# editions). Best-effort: any failure is reported quietly and never stops the scheduled reboot.
+function Send-RebootNotice {
+    param([datetime]$RebootTime)
+
+    # e.g. "Monday, July 13, 2026 at 2:00 AM"
+    $Friendly = $RebootTime.ToString('dddd, MMMM d, yyyy \a\t h:mm tt')
+    $Notice = @(
+        '============================================================',
+        '            SCHEDULED WINDOWS UPDATE RESTART',
+        '============================================================',
+        '',
+        '  This computer will automatically RESTART to finish',
+        '  installing Windows updates at:',
+        '',
+        "      $Friendly",
+        '',
+        '  Please SAVE YOUR WORK and close your applications before',
+        '  then so you do not lose anything.',
+        '',
+        '============================================================'
+    ) -join "`r`n"
+
+    if (-not (Get-Command msg.exe -ErrorAction SilentlyContinue)) {
+        Write-HostTimestamp '  msg.exe is not available on this Windows edition; relying on the built-in shutdown warning to notify users.' -ForegroundColor DarkGray
+        return
+    }
+
+    try {
+        # Target every session (*) and read the multi-line message from stdin. /TIME keeps the box up
+        # for a while; no /W so the script does not block waiting for users to acknowledge.
+        $Notice | msg.exe * /TIME:3600 2>$null
+        Write-HostTimestamp '  Sent an on-screen restart notice to all logged-on users.' -ForegroundColor DarkGray
+    }
+    catch {
+        Write-HostTimestamp "  Could not broadcast the restart notice to users: $($_.Exception.Message)" -ForegroundColor DarkGray
+    }
+}
+
 # Returns the most recent successfully installed Windows Update patch (Date and Title), excluding
 # driver updates and Microsoft Defender/antivirus definition updates. Returns $null if none found.
 function Get-LastUpdatePatch {
@@ -1878,9 +1918,11 @@ if ($ScheduleReboot -and $UpdateRebootRequired) {
     $Target = if ($TargetToday -le $Now) { $TargetToday.AddDays(1) } else { $TargetToday }
     $DelaySeconds = [int][math]::Ceiling(($Target - $Now).TotalSeconds)
 
-    shutdown.exe /r /t $DelaySeconds /c 'Scheduled restart to finish installing Windows updates.'
+    shutdown.exe /r /t $DelaySeconds /c "This computer will restart to finish installing Windows updates at $($Target.ToString('h:mm tt')). Please save your work."
     if ($LASTEXITCODE -eq 0) {
         Write-HostTimestamp "Reboot scheduled for $($Target.ToString('yyyy-MM-dd HH:mm')) to finish installing updates. Cancel it any time with: shutdown /a" -ForegroundColor Cyan
+        # Let every logged-on user know, with the scheduled time, so no one is caught off guard.
+        Send-RebootNotice -RebootTime $Target
     }
     else {
         Write-HostTimestamp "Could not schedule the reboot (shutdown.exe exit code $LASTEXITCODE). Please restart manually to finish installing updates." -ForegroundColor Yellow

@@ -99,7 +99,7 @@ The script supports the following optional parameters:
 |---|---|
 | `-Unattended` | Runs the script without any user prompts. It will not ask for confirmation to start. |
 | `-AutoReboot` | Restarts the computer after a 60-second countdown once the fix completes. **The script only reboots when this flag is set** — without it, the fix finishes and just reminds you to restart manually. During an interactive run the countdown can be cancelled by pressing any key. |
-| `-ScheduleReboot` | Only takes effect together with `-InstallUpdates`. If the installed updates require a restart to finish, the script **schedules** a reboot for the next occurrence of `-ScheduleRebootTime` (default **2:00 AM**) instead of rebooting immediately. It takes precedence over `-AutoReboot` when an update-required restart is pending. The scheduled reboot can be cancelled any time with `shutdown /a`. Does nothing if no update actually requires a restart. |
+| `-ScheduleReboot` | Only takes effect together with `-InstallUpdates`. If the installed updates require a restart to finish, the script **schedules** a reboot for the next occurrence of `-ScheduleRebootTime` (default **2:00 AM**) instead of rebooting immediately, and **broadcasts an on-screen notice to every logged-on user** telling them the exact date/time. It takes precedence over `-AutoReboot` when an update-required restart is pending. The scheduled reboot can be cancelled any time with `shutdown /a`. Does nothing if no update actually requires a restart. |
 | `-ScheduleRebootTime <HH:mm>` | Local time of day (24-hour `HH:mm`) for the reboot scheduled by `-ScheduleReboot`. Defaults to `02:00`. If the time has already passed today, the reboot is scheduled for the same time tomorrow. |
 | `-Remediate` | **Adaptive mode.** Assesses Windows Update health from the update history and automatically scales the repair to how broken things are (see [Adaptive Remediation](#adaptive-remediation-recommended) below). Runs hands-off with no prompts. |
 | `-ForceRemediate <Mild\|Severe>` | **Forced mode.** Skips the health assessment entirely and applies the specified repair level directly. `Mild` runs the baseline repair; `Severe` additionally enables `-ResetAllPolicies` and `-RepairComponentStore`. Also runs hands-off with no prompts and triggers an update scan. Useful when the update history is empty or unreliable. Ignored if `-Remediate` is also passed. |
@@ -349,6 +349,26 @@ If a restart is needed to complete one or more updates, the script reports this.
 ```
 
 `-ScheduleReboot` only acts when the installed updates actually require a restart, and it takes precedence over `-AutoReboot` in that case. The scheduled reboot can be cancelled at any time before it fires with `shutdown /a`.
+
+When the reboot is scheduled, the script **notifies everyone who is signed in** so no one is caught off guard. It broadcasts a formatted message box to all sessions with `msg.exe *`, for example:
+
+```
+============================================================
+            SCHEDULED WINDOWS UPDATE RESTART
+============================================================
+
+  This computer will automatically RESTART to finish
+  installing Windows updates at:
+
+      Monday, July 13, 2026 at 2:00 AM
+
+  Please SAVE YOUR WORK and close your applications before
+  then so you do not lose anything.
+
+============================================================
+```
+
+The scheduled time is also included in the native Windows shutdown warning. `msg.exe` ships with Windows **Pro/Enterprise/Education** editions but not **Home**; on Home editions the broadcast is skipped and users still get the built-in shutdown warning.
 
 > [!NOTE]
 > On **modern Windows 11**, cumulative updates are delivered through the **Unified Update Platform (UUP)** and are **not exposed by the WUA COM API**. If no updates are found here, use **Settings > Windows Update** or run `UsoClient.exe StartInstall` to trigger those. `-TriggerUpdateScan` (or `-Remediate`) is a better fit for fully automated modern-Windows pipelines where you just want to kick off a scan and let Windows handle the rest.
