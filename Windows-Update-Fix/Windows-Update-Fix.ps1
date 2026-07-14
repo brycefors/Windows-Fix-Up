@@ -323,15 +323,16 @@ function Get-LatestKnownBuildForLine {
 }
 
 # =====================================================================================
-# KNOWN WINDOWS FEATURE UPDATE SUPPORT DATES (end-of-servicing / "end of life" check)
+# KNOWN WINDOWS FEATURE UPDATES (single source for GA release date + support lifecycle)
 # -------------------------------------------------------------------------------------
-# Used ONLY to print an informational note about the installed feature update's support lifecycle:
-#   * a warning if it has already reached end of servicing (no more security updates), or
-#   * a heads-up if end of servicing is within the next 6 months.
-# It NEVER triggers remediation.
+# One entry per feature update, used for:
+#   * the "first released" line and the end-of-life warning in Show-WindowsBuildInfo, and
+#   * the end-of-life staleness signal - an EOL feature update forces -Remediate / -FixIfStale to treat
+#     the machine as stale (it can never be patched current).
 #
 #   Build         = the base OS build number for that feature update (no UBR).
 #   Version       = the marketing / DisplayVersion string (e.g. '24H2').
+#   Released      = general-availability date (yyyy-MM-dd) - when the feature update first shipped.
 #   EndHomePro    = end-of-servicing date (yyyy-MM-dd) for Home, Pro, Pro Education, Pro Workstation.
 #   EndEnterprise = end-of-servicing date (yyyy-MM-dd) for Enterprise, Education, IoT Enterprise
 #                   (these editions get a longer servicing window).
@@ -343,21 +344,22 @@ function Get-LatestKnownBuildForLine {
 # =====================================================================================
 $script:KnownFeatureUpdates = @{
     Windows11 = @(
-        [PSCustomObject]@{ Build = 28000; Version = '26H1'; EndHomePro = '2028-03-14'; EndEnterprise = '2029-03-13' }
-        [PSCustomObject]@{ Build = 26200; Version = '25H2'; EndHomePro = '2027-10-12'; EndEnterprise = '2028-10-10' }
-        [PSCustomObject]@{ Build = 26100; Version = '24H2'; EndHomePro = '2026-10-13'; EndEnterprise = '2027-10-12' }
-        [PSCustomObject]@{ Build = 22631; Version = '23H2'; EndHomePro = '2025-11-11'; EndEnterprise = '2026-11-10' }
-        [PSCustomObject]@{ Build = 22621; Version = '22H2'; EndHomePro = '2024-10-08'; EndEnterprise = '2025-10-14' }
-        [PSCustomObject]@{ Build = 22000; Version = '21H2'; EndHomePro = '2023-10-10'; EndEnterprise = '2024-10-08' }
+        [PSCustomObject]@{ Build = 28000; Version = '26H1'; Released = '2026-02-10'; EndHomePro = '2028-03-14'; EndEnterprise = '2029-03-13' }
+        [PSCustomObject]@{ Build = 26200; Version = '25H2'; Released = '2025-09-30'; EndHomePro = '2027-10-12'; EndEnterprise = '2028-10-10' }
+        [PSCustomObject]@{ Build = 26100; Version = '24H2'; Released = '2024-10-01'; EndHomePro = '2026-10-13'; EndEnterprise = '2027-10-12' }
+        [PSCustomObject]@{ Build = 22631; Version = '23H2'; Released = '2023-10-31'; EndHomePro = '2025-11-11'; EndEnterprise = '2026-11-10' }
+        [PSCustomObject]@{ Build = 22621; Version = '22H2'; Released = '2022-09-20'; EndHomePro = '2024-10-08'; EndEnterprise = '2025-10-14' }
+        [PSCustomObject]@{ Build = 22000; Version = '21H2'; Released = '2021-10-04'; EndHomePro = '2023-10-10'; EndEnterprise = '2024-10-08' }
     )
     Windows10 = @(
-        [PSCustomObject]@{ Build = 19045; Version = '22H2'; EndHomePro = '2025-10-14'; EndEnterprise = '2025-10-14' }
+        [PSCustomObject]@{ Build = 19045; Version = '22H2'; Released = '2022-10-18'; EndHomePro = '2025-10-14'; EndEnterprise = '2025-10-14' }
     )
 }
 
-# Resolves the end-of-servicing (end-of-life) date for the installed feature update, choosing the date
-# that matches the edition (Enterprise/Education editions get a longer window). Returns a PSCustomObject
-# with Version, EndDate ([datetime]) and Channel, or $null if the build/date is not listed.
+# Resolves the end-of-servicing (end-of-life) date and GA release date for the installed feature update,
+# choosing the end date that matches the edition (Enterprise/Education editions get a longer window).
+# Returns a PSCustomObject with Version, Released, EndDate ([datetime] or $null) and Channel, or $null if
+# the feature update is not listed.
 function Get-FeatureUpdateSupport {
     param(
         [bool]$IsWin11,
@@ -374,11 +376,11 @@ function Get-FeatureUpdateSupport {
     $EndStr = if ($IsEnterprise) { $Entry.EndEnterprise } else { $Entry.EndHomePro }
     $EndDate = $null
     if ($EndStr) { try { $EndDate = [datetime]::ParseExact($EndStr, 'yyyy-MM-dd', $null) } catch { $EndDate = $null } }
-    if (-not $EndDate) { return $null }
     [PSCustomObject]@{
-        Version = $Entry.Version
-        EndDate = $EndDate
-        Channel = if ($IsEnterprise) { 'Enterprise/Education' } else { 'Home/Pro' }
+        Version  = $Entry.Version
+        Released = $Entry.Released
+        EndDate  = $EndDate
+        Channel  = if ($IsEnterprise) { 'Enterprise/Education' } else { 'Home/Pro' }
     }
 }
 
@@ -393,7 +395,7 @@ function Get-InstalledFeatureUpdateSupport {
     $IsWin11 = ($Build -ge 22000)
     $Support = Get-FeatureUpdateSupport -IsWin11 $IsWin11 -Build $Build -EditionId $Reg.EditionID
     if (-not $Support) { return $null }
-    Add-Member -InputObject $Support -NotePropertyName 'IsEndOfLife' -NotePropertyValue ($Support.EndDate -lt (Get-Date)) -Force
+    Add-Member -InputObject $Support -NotePropertyName 'IsEndOfLife' -NotePropertyValue ($Support.EndDate -and $Support.EndDate -lt (Get-Date)) -Force
     return $Support
 }
 
@@ -475,7 +477,7 @@ function Get-CurrentBuildReleaseInfo {
     # release date is not needed (staleness is forced separately). So never query Microsoft for them -
     # otherwise the "unknown build line" branch below would send every EOL machine online for nothing.
     $Support = Get-FeatureUpdateSupport -IsWin11 $IsWin11 -Build ([int]$Build) -EditionId $Reg.EditionID
-    $IsEol = ($Support -and $Support.EndDate -lt (Get-Date))
+    $IsEol = ($Support -and $Support.EndDate -and $Support.EndDate -lt (Get-Date))
 
     # Only query Microsoft online when the table cannot already answer: the build line is unknown to the
     # table, or the installed revision is newer than the newest build recorded for that line. Never query
@@ -537,39 +539,22 @@ function Show-WindowsBuildInfo {
     $Edition = if ($Reg) { $Reg.EditionID } else { $null }
     $DisplayVersion = if ($Reg -and $Reg.DisplayVersion) { $Reg.DisplayVersion } elseif ($Reg) { $Reg.ReleaseId } else { $null }
 
-    # Approximate general-availability dates for each Windows feature update (DisplayVersion),
-    # keyed by "<11|10>-<DisplayVersion>". This only reflects when the feature update first shipped,
-    # not the exact release date of the current monthly (UBR) patch, which cannot be determined offline.
-    $ReleaseDates = @{
-        '11-21H2' = 'October 4, 2021'
-        '11-22H2' = 'September 20, 2022'
-        '11-23H2' = 'October 31, 2023'
-        '11-24H2' = 'October 1, 2024'
-        '11-25H2' = 'September 2025'
-        '10-1507' = 'July 29, 2015'
-        '10-1511' = 'November 10, 2015'
-        '10-1607' = 'August 2, 2016'
-        '10-1703' = 'April 5, 2017'
-        '10-1709' = 'October 17, 2017'
-        '10-1803' = 'April 30, 2018'
-        '10-1809' = 'November 13, 2018'
-        '10-1903' = 'May 21, 2019'
-        '10-1909' = 'November 12, 2019'
-        '10-2004' = 'May 27, 2020'
-        '10-20H2' = 'October 20, 2020'
-        '10-21H1' = 'May 18, 2021'
-        '10-21H2' = 'November 16, 2021'
-        '10-22H2' = 'October 18, 2022'
+    # Feature-update metadata (GA release date + support lifecycle) comes from the single
+    # $KnownFeatureUpdates table, so there is no duplicated list of release dates. Resolved once here and
+    # reused for both the "first released" line and the end-of-life warning below.
+    $Support = Get-FeatureUpdateSupport -IsWin11 $IsWin11 -Build ([int]$Build) -EditionId $Edition
+    $GaDisplay = $null
+    if ($Support -and $Support.Released) {
+        try { $GaDisplay = ([datetime]::ParseExact($Support.Released, 'yyyy-MM-dd', $null)).ToString('MMMM d, yyyy') }
+        catch { $GaDisplay = $Support.Released }
     }
-    $ReleaseKey = ('{0}-{1}' -f $(if ($IsWin11) { '11' } else { '10' }), $DisplayVersion)
-    $ReleaseDate = $ReleaseDates[$ReleaseKey]
 
     Write-Host $LineBreak
     Write-HostTimestamp "Operating System: $ProductName$(if ($Edition) { " (Edition: $Edition)" })" -ForegroundColor Cyan
     Write-Host "  Feature update : $DisplayVersion"
     Write-Host "  Full version   : $FullVersion"
-    if ($ReleaseDate) {
-        Write-Host "  $DisplayVersion first released: $ReleaseDate (feature update general availability)"
+    if ($GaDisplay) {
+        Write-Host "  $DisplayVersion first released: $GaDisplay (feature update general availability)"
     }
     else {
         Write-Host "  Release date   : not available in local reference for '$DisplayVersion'"
@@ -606,9 +591,8 @@ function Show-WindowsBuildInfo {
             }
         }
     }
-    # Informational only: report the installed feature update's end-of-servicing (end-of-life) status.
-    # Warns if it is already end of life, or if end of servicing falls within the next 6 months.
-    $Support = Get-FeatureUpdateSupport -IsWin11 $IsWin11 -Build ([int]$Build) -EditionId $Edition
+    # Informational only: report the installed feature update's end-of-servicing (end-of-life) status,
+    # reusing the $Support resolved above. Warns if it is already end of life, or within the next 6 months.
     if ($Support -and $Support.EndDate) {
         $Now = Get-Date
         $EndDisplay = $Support.EndDate.ToString('yyyy-MM-dd')
