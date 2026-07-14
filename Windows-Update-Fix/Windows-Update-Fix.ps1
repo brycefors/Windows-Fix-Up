@@ -25,6 +25,11 @@ param(
     [switch]$Unattended, # Runs the script without any user prompts. It will not ask for confirmation to start
     [Parameter(HelpMessage = 'Automatically restart upon completion')]
     [switch]$AutoReboot,
+    [Parameter(HelpMessage = 'If -InstallUpdates installs updates that require a restart, schedule a reboot (default 2:00 AM) instead of rebooting immediately or leaving it to the user')]
+    [switch]$ScheduleReboot,
+    [Parameter(HelpMessage = 'Local time of day (HH:mm, 24-hour) for the reboot scheduled by -ScheduleReboot when updates require a restart (default 02:00)')]
+    [ValidatePattern('^([01]\d|2[0-3]):[0-5]\d$')]
+    [string]$ScheduleRebootTime = '02:00',
     [Parameter(HelpMessage = 'Also remove the broader Software Policies registry hive (aggressive)')]
     [switch]$ResetAllPolicies,
     [Parameter(HelpMessage = 'Trigger a Windows Update detection scan after the fix')]
@@ -214,6 +219,87 @@ $script:KnownBuildReleases = @{
     '22000.3260' = @{ Date = '2024-10-08'; KB = 'KB5044280' }  # 21H2 (end of updates)
 }
 
+# Returns the latest build revision this script knows about for the SAME build line (major build
+# number) as the supplied Build.UBR, drawn from $KnownBuildReleases. This lets the script tell whether
+# the machine is behind the newest build it is aware of for its version, without any date math.
+# Returns a PSCustomObject with BuildUbr, Ubr ([int]), Date and KB, or $null if the line is not listed.
+function Get-LatestKnownBuildForLine {
+    param([string]$BuildUbr)
+    if (-not $BuildUbr -or $BuildUbr -notmatch '^\d+\.\d+$') { return $null }
+    $Major = ($BuildUbr -split '\.')[0]
+    $Best = $null
+    foreach ($Key in $script:KnownBuildReleases.Keys) {
+        $Parts = $Key -split '\.'
+        if ($Parts.Count -ne 2 -or $Parts[0] -ne $Major) { continue }
+        $Ubr = [int]$Parts[1]
+        if (-not $Best -or $Ubr -gt $Best.Ubr) {
+            $Entry = $script:KnownBuildReleases[$Key]
+            $Best = [PSCustomObject]@{ BuildUbr = $Key; Ubr = $Ubr; Date = $Entry.Date; KB = $Entry.KB }
+        }
+    }
+    return $Best
+}
+
+# =====================================================================================
+# KNOWN WINDOWS FEATURE UPDATE SUPPORT DATES (end-of-servicing / "end of life" check)
+# -------------------------------------------------------------------------------------
+# Used ONLY to print an informational note about the installed feature update's support lifecycle:
+#   * a warning if it has already reached end of servicing (no more security updates), or
+#   * a heads-up if end of servicing is within the next 6 months.
+# It NEVER triggers remediation.
+#
+#   Build         = the base OS build number for that feature update (no UBR).
+#   Version       = the marketing / DisplayVersion string (e.g. '24H2').
+#   EndHomePro    = end-of-servicing date (yyyy-MM-dd) for Home, Pro, Pro Education, Pro Workstation.
+#   EndEnterprise = end-of-servicing date (yyyy-MM-dd) for Enterprise, Education, IoT Enterprise
+#                   (these editions get a longer servicing window).
+#
+# TO UPDATE: dates come from the "servicing channels" table on the Microsoft release information page
+#   (https://learn.microsoft.com/windows/release-health/windows11-release-information). Add a new entry
+#   when a feature update ships, and correct any date Microsoft revises.
+# Last verified against Microsoft release information: 2026-06-23
+# =====================================================================================
+$script:KnownFeatureUpdates = @{
+    Windows11 = @(
+        [PSCustomObject]@{ Build = 28000; Version = '26H1'; EndHomePro = '2028-03-14'; EndEnterprise = '2029-03-13' }
+        [PSCustomObject]@{ Build = 26200; Version = '25H2'; EndHomePro = '2027-10-12'; EndEnterprise = '2028-10-10' }
+        [PSCustomObject]@{ Build = 26100; Version = '24H2'; EndHomePro = '2026-10-13'; EndEnterprise = '2027-10-12' }
+        [PSCustomObject]@{ Build = 22631; Version = '23H2'; EndHomePro = '2025-11-11'; EndEnterprise = '2026-11-10' }
+        [PSCustomObject]@{ Build = 22621; Version = '22H2'; EndHomePro = '2024-10-08'; EndEnterprise = '2025-10-14' }
+        [PSCustomObject]@{ Build = 22000; Version = '21H2'; EndHomePro = '2023-10-10'; EndEnterprise = '2024-10-08' }
+    )
+    Windows10 = @(
+        [PSCustomObject]@{ Build = 19045; Version = '22H2'; EndHomePro = '2025-10-14'; EndEnterprise = '2025-10-14' }
+    )
+}
+
+# Resolves the end-of-servicing (end-of-life) date for the installed feature update, choosing the date
+# that matches the edition (Enterprise/Education editions get a longer window). Returns a PSCustomObject
+# with Version, EndDate ([datetime]) and Channel, or $null if the build/date is not listed.
+function Get-FeatureUpdateSupport {
+    param(
+        [bool]$IsWin11,
+        [int]$Build,
+        [string]$EditionId
+    )
+    $Product = if ($IsWin11) { 'Windows11' } else { 'Windows10' }
+    $List = $script:KnownFeatureUpdates[$Product]
+    if (-not $List) { return $null }
+    $Entry = $List | Where-Object { $_.Build -eq $Build } | Select-Object -First 1
+    if (-not $Entry) { return $null }
+    # Enterprise, Education, and IoT Enterprise editions receive the longer servicing window.
+    $IsEnterprise = ($EditionId -match 'Enterprise|Education')
+    $EndStr = if ($IsEnterprise) { $Entry.EndEnterprise } else { $Entry.EndHomePro }
+    $EndDate = $null
+    if ($EndStr) { try { $EndDate = [datetime]::ParseExact($EndStr, 'yyyy-MM-dd', $null) } catch { $EndDate = $null } }
+    if (-not $EndDate) { return $null }
+    [PSCustomObject]@{
+        Version = $Entry.Version
+        EndDate = $EndDate
+        Channel = if ($IsEnterprise) { 'Enterprise/Education' } else { 'Home/Pro' }
+    }
+}
+
 # Best-effort online lookup of the exact release date and KB article for a specific Windows build
 # revision (Build.UBR), using Microsoft's public release information page. Returns a PSCustomObject with
 # Date and KB (either may be $null), or $null if the build cannot be found.
@@ -385,6 +471,37 @@ function Show-WindowsBuildInfo {
         }
         else {
             Write-Host "  Exact build release could not be determined online." -ForegroundColor Yellow
+        }
+    }
+    # Compare against the newest build the script knows about for this version line (from the hardcoded
+    # reference table). This is a date-independent way to see whether a newer build is already available.
+    if ($null -ne $Ubr) {
+        $LatestKnown = Get-LatestKnownBuildForLine -BuildUbr "$Build.$Ubr"
+        if ($LatestKnown) {
+            if ([int]$Ubr -lt $LatestKnown.Ubr) {
+                $KnownKb = if ($LatestKnown.KB) { " ($($LatestKnown.KB))" } else { '' }
+                Write-Host "  Newer build available: $($LatestKnown.BuildUbr)$KnownKb released $($LatestKnown.Date) - this PC is behind the latest known build." -ForegroundColor Yellow
+            }
+            elseif ([int]$Ubr -eq $LatestKnown.Ubr) {
+                Write-Host "  Up to date with the latest build known to this script ($($LatestKnown.BuildUbr), as of the reference table)."
+            }
+            else {
+                Write-Host "  This PC ($Build.$Ubr) is newer than the latest build in the reference table ($($LatestKnown.BuildUbr)) - update the table to refresh it."
+            }
+        }
+    }
+    # Informational only: report the installed feature update's end-of-servicing (end-of-life) status.
+    # Warns if it is already end of life, or if end of servicing falls within the next 6 months.
+    $Support = Get-FeatureUpdateSupport -IsWin11 $IsWin11 -Build ([int]$Build) -EditionId $Edition
+    if ($Support -and $Support.EndDate) {
+        $Now = Get-Date
+        $EndDisplay = $Support.EndDate.ToString('yyyy-MM-dd')
+        if ($Now -ge $Support.EndDate) {
+            Write-Host "  END OF LIFE: $($Support.Version) reached end of servicing on $EndDisplay ($($Support.Channel)) - it no longer receives security updates. Upgrade to a supported feature update." -ForegroundColor Red
+        }
+        elseif ($Support.EndDate -le $Now.AddMonths(6)) {
+            $DaysLeft = [math]::Round(($Support.EndDate - $Now).TotalDays)
+            Write-Host "  END OF LIFE APPROACHING: $($Support.Version) reaches end of servicing on $EndDisplay ($($Support.Channel)) - about $DaysLeft day(s) left. Plan to update before then." -ForegroundColor Yellow
         }
     }
     if ($Os -and $Os.InstallDate) {
@@ -1423,6 +1540,7 @@ if ($TriggerUpdateScan) {
 # Optionally search, download, and install available Windows updates via the WUA COM API
 # NOTE: On modern Windows 11, UUP-delivered cumulative updates are not exposed by this API.
 # Those will still appear (and install) through Settings > Windows Update or UsoClient.
+$UpdateRebootRequired = $false
 if ($InstallUpdates) {
     Invoke-Task -Description 'Searching for available Windows updates to install...' -ScriptBlock {
         try {
@@ -1509,6 +1627,7 @@ if ($InstallUpdates) {
             $SummaryColor = if ($Failed -gt 0) { 'Yellow' } else { 'Green' }
             Write-HostTimestamp "  Install complete: $Succeeded succeeded, $Failed failed." -ForegroundColor $SummaryColor
             if ($InstallResult.RebootRequired) {
+                $UpdateRebootRequired = $true
                 Write-HostTimestamp '  One or more updates require a restart to complete installation.' -ForegroundColor Yellow
             }
         }
@@ -1531,7 +1650,24 @@ if ($InstallUpdates) {
 # Done, restart when necessary
 Write-HostTimestamp 'Windows Update Fix completed!' -Foreground Green
 Write-Host 'A restart is recommended to fully apply the Group Policy and service changes.'
-if ($AutoReboot) {
+if ($ScheduleReboot -and $UpdateRebootRequired) {
+    # Updates that need a restart were installed and -ScheduleReboot was requested: schedule the reboot
+    # for the next occurrence of -ScheduleRebootTime (default 02:00) rather than rebooting immediately.
+    $TimeParts = $ScheduleRebootTime -split ':'
+    $Now = Get-Date
+    $TargetToday = $Now.Date.AddHours([int]$TimeParts[0]).AddMinutes([int]$TimeParts[1])
+    $Target = if ($TargetToday -le $Now) { $TargetToday.AddDays(1) } else { $TargetToday }
+    $DelaySeconds = [int][math]::Ceiling(($Target - $Now).TotalSeconds)
+
+    shutdown.exe /r /t $DelaySeconds /c 'Scheduled restart to finish installing Windows updates.'
+    if ($LASTEXITCODE -eq 0) {
+        Write-HostTimestamp "Reboot scheduled for $($Target.ToString('yyyy-MM-dd HH:mm')) to finish installing updates. Cancel it any time with: shutdown /a" -ForegroundColor Cyan
+    }
+    else {
+        Write-HostTimestamp "Could not schedule the reboot (shutdown.exe exit code $LASTEXITCODE). Please restart manually to finish installing updates." -ForegroundColor Yellow
+    }
+}
+elseif ($AutoReboot) {
     # An interactive user (not an unattended/automated run) can abort the pending reboot with a keypress.
     $CanCancel = $false
     try { $CanCancel = ([Environment]::UserInteractive -and -not $Unattended) } catch { $CanCancel = $false }

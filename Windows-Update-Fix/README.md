@@ -99,6 +99,8 @@ The script supports the following optional parameters:
 |---|---|
 | `-Unattended` | Runs the script without any user prompts. It will not ask for confirmation to start. |
 | `-AutoReboot` | Restarts the computer after a 60-second countdown once the fix completes. **The script only reboots when this flag is set** — without it, the fix finishes and just reminds you to restart manually. During an interactive run the countdown can be cancelled by pressing any key. |
+| `-ScheduleReboot` | Only takes effect together with `-InstallUpdates`. If the installed updates require a restart to finish, the script **schedules** a reboot for the next occurrence of `-ScheduleRebootTime` (default **2:00 AM**) instead of rebooting immediately. It takes precedence over `-AutoReboot` when an update-required restart is pending. The scheduled reboot can be cancelled any time with `shutdown /a`. Does nothing if no update actually requires a restart. |
+| `-ScheduleRebootTime <HH:mm>` | Local time of day (24-hour `HH:mm`) for the reboot scheduled by `-ScheduleReboot`. Defaults to `02:00`. If the time has already passed today, the reboot is scheduled for the same time tomorrow. |
 | `-Remediate` | **Adaptive mode.** Assesses Windows Update health from the update history and automatically scales the repair to how broken things are (see [Adaptive Remediation](#adaptive-remediation-recommended) below). Runs hands-off with no prompts. |
 | `-ForceRemediate <Mild\|Severe>` | **Forced mode.** Skips the health assessment entirely and applies the specified repair level directly. `Mild` runs the baseline repair; `Severe` additionally enables `-ResetAllPolicies` and `-RepairComponentStore`. Also runs hands-off with no prompts and triggers an update scan. Useful when the update history is empty or unreliable. Ignored if `-Remediate` is also passed. |
 | `-CooldownDays <n>` | Minimum number of days that must pass before `-Remediate` or `-ForceRemediate` can run again on the same machine. The timestamp is stored in a `.last_remediation` file alongside the script. Default is `7`. Set to `0` to disable. Stamps older than `2 × CooldownDays` are automatically removed. |
@@ -148,6 +150,35 @@ The table is easy to keep current. To update it:
 1.  Open the Microsoft release information page ([Windows 11](https://learn.microsoft.com/windows/release-health/windows11-release-information) / [Windows 10](https://learn.microsoft.com/windows/release-health/release-information)).
 2.  In the *release history* section, find the newest row for the version(s) you care about and note its **Build** (`Build.UBR`), **Availability date**, and **KB article**.
 3.  Add or replace the matching entry in `$KnownBuildReleases`, using an ISO `yyyy-MM-dd` date. Old entries are harmless — they are only ever used as a fallback — so you only need to keep the latest few builds.
+
+### "Am I on an old build?" comparison
+
+Because the table lists the **latest known build per version line** (e.g. `26100.8737` for 24H2), the script also uses it as a date-independent way to tell whether a newer build already exists. When it prints the build banner, it compares the installed `Build.UBR` against the newest entry in the table for the **same major build number**:
+
+- **Installed UBR is lower** → reports `Newer build available … this PC is behind the latest known build.`
+- **Installed UBR matches** → reports it is up to date with the latest build the script knows about.
+- **Installed UBR is higher** → the machine is newer than the table (a reminder to refresh the table).
+
+This comparison is **informational** and does not by itself trigger remediation — that decision still comes from the date-based staleness signals described under [Adaptive Remediation](#adaptive-remediation-recommended). Because it only ever reports "behind" when the installed build is genuinely lower than a build Microsoft has already shipped, a stale table can never produce a false "behind" result (only a missed one), so it is safe to rely on. Keeping the table current simply makes the comparison more accurate.
+
+### Feature update end-of-life note
+
+Separately from the monthly-build comparison above, the script reports the installed **feature update's support lifecycle** (end of servicing, a.k.a. end of life). This uses a small `$KnownFeatureUpdates` table (also near the top of the script) that lists each feature update's end-of-servicing date, per product and edition:
+
+- The check is **strictly per product** — a Windows 11 machine uses only the Windows 11 dates, a Windows 10 machine only the Windows 10 dates.
+- The date is chosen by **edition**: Enterprise, Education, and IoT Enterprise editions get the longer servicing window; all others use the Home/Pro date.
+- Nothing is printed while the feature update is comfortably in support (more than 6 months of servicing left).
+
+It prints one of two lines when relevant:
+
+```
+END OF LIFE: 22H2 reached end of servicing on 2024-10-08 (Home/Pro) - it no longer receives security updates. Upgrade to a supported feature update.
+```
+```
+END OF LIFE APPROACHING: 24H2 reaches end of servicing on 2026-10-13 (Home/Pro) - about 92 day(s) left. Plan to update before then.
+```
+
+This is **informational only** — the script never downloads, installs, or remediates based on it. To keep it accurate, update the end-of-servicing dates in `$KnownFeatureUpdates` from the *servicing channels* table on the Microsoft release information page whenever a feature update ships or Microsoft revises a date.
 
 ## Remediation Cooldown
 
@@ -279,7 +310,17 @@ The script uses the built-in **WUA COM API** (`Microsoft.Update.Session`) — no
 | `Failed` | Installation failed — HRESULT shown in parentheses. |
 | `Aborted` | Installation was aborted. |
 
-If a restart is needed to complete one or more updates, the script reports this. The existing `-AutoReboot` flag will then handle the countdown and reboot.
+If a restart is needed to complete one or more updates, the script reports this. The existing `-AutoReboot` flag will then handle the countdown and reboot. Alternatively, pass `-ScheduleReboot` to defer the restart to a quiet time — by default **2:00 AM**, or whatever you set with `-ScheduleRebootTime`:
+
+```shell
+# Install updates, then schedule the required restart for 2:00 AM (default)
+.\Run-Windows-Update-Fix.bat -InstallUpdates -ScheduleReboot
+
+# Install updates, then schedule the required restart for 3:30 AM
+.\Run-Windows-Update-Fix.bat -InstallUpdates -ScheduleReboot -ScheduleRebootTime 03:30
+```
+
+`-ScheduleReboot` only acts when the installed updates actually require a restart, and it takes precedence over `-AutoReboot` in that case. The scheduled reboot can be cancelled at any time before it fires with `shutdown /a`.
 
 > [!NOTE]
 > On **modern Windows 11**, cumulative updates are delivered through the **Unified Update Platform (UUP)** and are **not exposed by the WUA COM API**. If no updates are found here, use **Settings > Windows Update** or run `UsoClient.exe StartInstall` to trigger those. `-TriggerUpdateScan` (or `-Remediate`) is a better fit for fully automated modern-Windows pipelines where you just want to kick off a scan and let Windows handle the rest.
