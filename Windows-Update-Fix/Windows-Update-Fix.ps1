@@ -471,12 +471,19 @@ function Get-CurrentBuildReleaseInfo {
     # The hardcoded table is the primary source. An exact match is authoritative and served offline.
     $Exact = $script:KnownBuildReleases[$BuildUbr]
 
+    # End-of-life feature updates are deliberately kept OUT of $KnownBuildReleases, and their exact
+    # release date is not needed (staleness is forced separately). So never query Microsoft for them -
+    # otherwise the "unknown build line" branch below would send every EOL machine online for nothing.
+    $Support = Get-FeatureUpdateSupport -IsWin11 $IsWin11 -Build ([int]$Build) -EditionId $Reg.EditionID
+    $IsEol = ($Support -and $Support.EndDate -lt (Get-Date))
+
     # Only query Microsoft online when the table cannot already answer: the build line is unknown to the
     # table, or the installed revision is newer than the newest build recorded for that line. Never query
-    # when we already have an exact match, and honor -SkipOnlineBuildDate.
+    # when we already have an exact match, for an end-of-life version, or when -SkipOnlineBuildDate is set.
     $LatestKnown = Get-LatestKnownBuildForLine -BuildUbr $BuildUbr
     $ShouldQueryOnline = (
         (-not $Exact) -and
+        (-not $IsEol) -and
         (-not $SkipOnlineBuildDate) -and
         ((-not $LatestKnown) -or ([int]$Ubr -gt $LatestKnown.Ubr))
     )
