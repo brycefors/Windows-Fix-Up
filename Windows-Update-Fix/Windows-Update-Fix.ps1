@@ -970,26 +970,25 @@ function Show-DetectedUpdates {
 
 # Broadcasts a formatted notice to every logged-on user warning that the computer will restart for
 # Windows updates at the given time. Uses msg.exe (present on Windows Pro/Enterprise; not on Home
-# editions). Best-effort: any failure is reported quietly and never stops the scheduled reboot.
+# editions). NOTE: msg.exe generates its own window title ("Message from <user> ...") that cannot be
+# customized - that is a Windows limitation - so the wording is kept plain and professional to look like
+# a legitimate IT notice. The native Windows shutdown warning (from the shutdown /c comment) is the more
+# trusted channel and fires on its own. Best-effort: any failure is reported quietly and never stops the
+# scheduled reboot.
 function Send-RebootNotice {
     param([datetime]$RebootTime)
 
     # e.g. "Monday, July 13, 2026 at 2:00 AM"
     $Friendly = $RebootTime.ToString('dddd, MMMM d, yyyy \a\t h:mm tt')
     $Notice = @(
-        '============================================================',
-        '            SCHEDULED WINDOWS UPDATE RESTART',
-        '============================================================',
+        'Scheduled maintenance notice',
         '',
-        '  This computer will automatically RESTART to finish',
-        '  installing Windows updates at:',
+        'Windows Update maintenance has been performed on this computer',
+        'to repair updates. To finish, it will restart automatically on:',
         '',
-        "      $Friendly",
+        "    $Friendly",
         '',
-        '  Please SAVE YOUR WORK and close your applications before',
-        '  then so you do not lose anything.',
-        '',
-        '============================================================'
+        'Please save your work and close your apps before then.'
     ) -join "`r`n"
 
     if (-not (Get-Command msg.exe -ErrorAction SilentlyContinue)) {
