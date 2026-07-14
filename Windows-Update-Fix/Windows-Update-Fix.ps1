@@ -199,26 +199,30 @@ function Set-ServiceStartupType {
 # When the online lookup of the current build's release date/KB times out or is unreachable,
 # the script falls back to this table so it can still report a release date and KB offline.
 #
-# Keyed by "<Build>.<UBR>" (e.g. '26100.8737'). Date must be ISO format 'yyyy-MM-dd'.
+# Keyed by "<Build>.<UBR>" (e.g. '26100.8655'). Date must be ISO format 'yyyy-MM-dd'. Each entry is
+# the newest NON-PREVIEW cumulative update for that version (the optional C/D-week previews are omitted).
 #
-# TO UPDATE (recommended after each Patch Tuesday, or whenever you want a fresher fallback):
+# TO UPDATE: run Tools\Update-BuildReferenceTable.ps1 to regenerate this block from Microsoft's release
+# information (it excludes preview releases automatically), then paste the result here. Or edit by hand:
 #   1. Open the Microsoft release information page:
 #        Windows 11: https://learn.microsoft.com/windows/release-health/windows11-release-information
 #        Windows 10: https://learn.microsoft.com/windows/release-health/release-information
-#   2. In the "release history" section, find the newest row for the version(s) you care about
-#      and note its Build (Build.UBR), Availability date, and KB article.
-#   3. Add or replace the matching entry below. You only need to keep the latest few builds;
-#      old entries can stay or be trimmed - they are only used as a fallback.
-# Last verified against Microsoft release information: 2026-06-23
+#   2. In the "release history" section, find the newest non-preview (B/OOB) row for the version(s) you
+#      care about and note its Build (Build.UBR), Availability date, and KB article.
+#   3. Add or replace the matching entry below. Old entries can stay or be trimmed - they are only used
+#      as a fallback.
+# Last verified against Microsoft release information: 2026-07-13
 # =====================================================================================
 $script:KnownBuildReleases = @{
-    # --- Windows 11 (latest known build per serviced version) ---
-    '28000.2340' = @{ Date = '2026-06-23'; KB = 'KB5095091' }  # 26H1
-    '26200.8737' = @{ Date = '2026-06-23'; KB = 'KB5095093' }  # 25H2
-    '26100.8737' = @{ Date = '2026-06-23'; KB = 'KB5095093' }  # 24H2
+    # --- Windows 11 (latest non-preview build per serviced version) ---
+    '28000.2269' = @{ Date = '2026-06-09'; KB = 'KB5095051' }  # 26H1
+    '26200.8655' = @{ Date = '2026-06-09'; KB = 'KB5094126' }  # 25H2
+    '26100.8655' = @{ Date = '2026-06-09'; KB = 'KB5094126' }  # 24H2
     '22631.7219' = @{ Date = '2026-06-09'; KB = 'KB5093998' }  # 23H2
     '22621.6060' = @{ Date = '2025-10-14'; KB = 'KB5066793' }  # 22H2 (end of updates)
     '22000.3260' = @{ Date = '2024-10-08'; KB = 'KB5044280' }  # 21H2 (end of updates)
+    # --- Windows 10 ---
+    '19045.7417' = @{ Date = '2026-06-09'; KB = 'KB5094127' }  # 22H2
 }
 
 # Returns the latest build revision this script knows about for the SAME build line (major build
@@ -352,9 +356,13 @@ function Get-BuildReleaseDateOnline {
     return [PSCustomObject]@{ Date = $FallbackDate; KB = $null }
 }
 
-# Resolves the currently-installed build revision (from the registry) and, unless online lookup is
-# disabled, its exact release date and KB from Microsoft's release information. Returns a PSCustomObject
-# with BuildUbr, ReleaseDate ([datetime] or $null) and KB, or $null if the build revision is unavailable.
+# Resolves the currently-installed build revision (from the registry) and its release date and KB.
+# The hardcoded $KnownBuildReleases table is the PRIMARY source; Microsoft is queried online ONLY when
+# the table cannot already answer - that is, when the installed build line is unknown to the table, or
+# the installed revision is NEWER than the newest build recorded for that line (and -SkipOnlineBuildDate
+# is not set). Anything the table already covers (an exact match, or an older/equal revision on a known
+# line) is served entirely offline. Returns a PSCustomObject with BuildUbr, ReleaseDate ([datetime] or
+# $null) and KB, or $null if the build revision is unavailable.
 function Get-CurrentBuildReleaseInfo {
     if ($script:BuildReleaseInfoResolved) { return $script:BuildReleaseInfo }
     $script:BuildReleaseInfoResolved = $true
@@ -368,35 +376,41 @@ function Get-CurrentBuildReleaseInfo {
     $Ubr = $Reg.UBR
     $IsWin11 = ([int]$Build -ge 22000)
     $BuildUbr = "$Build.$Ubr"
-    if ($SkipOnlineBuildDate) {
-        $script:BuildReleaseInfo = [PSCustomObject]@{ BuildUbr = $BuildUbr; ReleaseDate = $null; KB = $null }
-        return $script:BuildReleaseInfo
-    }
-    $Online = Get-BuildReleaseDateOnline -BuildUbr $BuildUbr -IsWin11 $IsWin11
 
-    # If the online lookup timed out, was unreachable, or couldn't resolve this build, fall back to the
-    # hardcoded reference table above so we can still report a release date/KB. Also use it to fill in
-    # any single piece (date or KB) the online lookup couldn't determine.
-    $Fallback = $script:KnownBuildReleases[$BuildUbr]
-    if ($Fallback) {
-        if (-not $Online) {
-            Write-HostTimestamp "  Online lookup unavailable; using the hardcoded build reference for $BuildUbr." -ForegroundColor DarkGray
-            $Online = [PSCustomObject]@{ Date = $Fallback.Date; KB = $Fallback.KB }
-        }
-        else {
-            if (-not $Online.Date) { $Online.Date = $Fallback.Date }
-            if (-not $Online.KB) { $Online.KB = $Fallback.KB }
-        }
+    # The hardcoded table is the primary source. An exact match is authoritative and served offline.
+    $Exact = $script:KnownBuildReleases[$BuildUbr]
+
+    # Only query Microsoft online when the table cannot already answer: the build line is unknown to the
+    # table, or the installed revision is newer than the newest build recorded for that line. Never query
+    # when we already have an exact match, and honor -SkipOnlineBuildDate.
+    $LatestKnown = Get-LatestKnownBuildForLine -BuildUbr $BuildUbr
+    $ShouldQueryOnline = (
+        (-not $Exact) -and
+        (-not $SkipOnlineBuildDate) -and
+        ((-not $LatestKnown) -or ([int]$Ubr -gt $LatestKnown.Ubr))
+    )
+
+    $Online = $null
+    if ($ShouldQueryOnline) {
+        $Online = Get-BuildReleaseDateOnline -BuildUbr $BuildUbr -IsWin11 $IsWin11
+    }
+
+    # Prefer the online result; fill any missing piece (or the whole thing) from the exact table entry.
+    $Date = if ($Online) { $Online.Date } else { $null }
+    $Kb   = if ($Online) { $Online.KB }   else { $null }
+    if ($Exact) {
+        if (-not $Date) { $Date = $Exact.Date }
+        if (-not $Kb)   { $Kb   = $Exact.KB }
     }
 
     $ReleaseDate = $null
-    if ($Online -and $Online.Date) {
-        try { $ReleaseDate = [datetime]::ParseExact($Online.Date, 'yyyy-MM-dd', $null) } catch { $ReleaseDate = $null }
+    if ($Date) {
+        try { $ReleaseDate = [datetime]::ParseExact($Date, 'yyyy-MM-dd', $null) } catch { $ReleaseDate = $null }
     }
     $script:BuildReleaseInfo = [PSCustomObject]@{
         BuildUbr    = $BuildUbr
         ReleaseDate = $ReleaseDate
-        KB          = if ($Online) { $Online.KB } else { $null }
+        KB          = $Kb
     }
     return $script:BuildReleaseInfo
 }
@@ -462,9 +476,11 @@ function Show-WindowsBuildInfo {
     else {
         Write-Host "  Release date   : not available in local reference for '$DisplayVersion'"
     }
-    # By default, look up the exact release date and KB of this specific build revision online.
+    # Resolve the exact release date and KB of this specific build revision. This uses the hardcoded
+    # reference table first and only queries Microsoft online when the table cannot answer (unknown build
+    # line, or a revision newer than the table knows).
     if (-not $SkipOnlineBuildDate -and $null -ne $Ubr) {
-        Write-Host "  Looking up the exact release for build $Build.$Ubr online..."
+        Write-Host "  Resolving the release date/KB for build $Build.$Ubr..."
         $BuildRelease = Get-CurrentBuildReleaseInfo
         if ($BuildRelease -and ($BuildRelease.ReleaseDate -or $BuildRelease.KB)) {
             $ReleasedOn = if ($BuildRelease.ReleaseDate) { $BuildRelease.ReleaseDate.ToString('yyyy-MM-dd') } else { 'unknown date' }
@@ -472,7 +488,7 @@ function Show-WindowsBuildInfo {
             Write-Host "  Build $Build.$Ubr released: $ReleasedOn$ViaKb (per Microsoft release information)"
         }
         else {
-            Write-Host "  Exact build release could not be determined online." -ForegroundColor Yellow
+            Write-Host "  Exact build release could not be determined." -ForegroundColor Yellow
         }
     }
     # Compare against the newest build the script knows about for this version line (from the hardcoded
