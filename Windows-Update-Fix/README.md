@@ -144,7 +144,7 @@ Staleness is judged from **two** independent signals: the date of the last succe
 
 ## Build Date Lookup
 
-When reporting the current build's release date/KB (and for the build-based staleness signal), the script uses the hardcoded `$KnownBuildReleases` table (near the top of `Windows-Update-Fix.ps1`, keyed by `Build.UBR` e.g. `26100.8655`) as the **primary source**. It **only queries Microsoft's release-information page online when the table cannot answer** — that is, when the installed build line is unknown to the table, or the installed revision is *newer* than the newest build the table records for that line. Anything the table already covers (an exact match, or an older/equal revision on a known line) is resolved entirely offline, so a machine on a known build never waits on (or is blocked by) the online lookup.
+When reporting the current build's release date/KB (and for the build-based staleness signal), the script uses the hardcoded `$KnownBuildReleases` table (near the top of `Windows-Update-Fix.ps1`, keyed by `Build.UBR` e.g. `26100.8655`) as the **primary source**. To keep it lean, the table contains every non-preview monthly build for roughly the last two years **for the currently-supported Windows feature updates only** — end-of-life versions are intentionally omitted (the script flags those as stale on its own; see [End-of-life feature updates](#end-of-life-feature-updates)). It **only queries Microsoft's release-information page online when the table cannot answer** — that is, when the installed build line is unknown to the table, or the installed revision is *newer* than the newest build the table records for that line. Anything the table already covers (an exact match, or an older/equal revision on a known supported line) is resolved entirely offline, so a machine on a known build never waits on (or is blocked by) the online lookup.
 
 The table is easy to keep current. To update it:
 
@@ -153,7 +153,7 @@ The table is easy to keep current. To update it:
 3.  Add or replace the matching entry in `$KnownBuildReleases`, using an ISO `yyyy-MM-dd` date. Old entries are harmless — they are only ever used as a fallback — so you only need to keep the latest few builds.
 
 > [!TIP]
-> Instead of doing this by hand, run [`Tools/Update-BuildReferenceTable.ps1`](Tools/Update-BuildReferenceTable.ps1). It scrapes the Microsoft release-health pages and prints a ready-to-paste `$KnownBuildReleases` block, automatically selecting each version's newest **non-preview** cumulative update (the optional C/D-week previews are excluded). Use `-OutFile` to save it, `-SkipWindows10` for Windows 11 only, or `-MaxAgeYears` to control how far back the included build lines go.
+> Instead of doing this by hand, run [`Tools/Update-BuildReferenceTable.ps1`](Tools/Update-BuildReferenceTable.ps1). It scrapes the Microsoft release-health pages and prints a ready-to-paste `$KnownBuildReleases` block, automatically selecting each version's newest **non-preview** cumulative update (the optional C/D-week previews are excluded) and **omitting end-of-life feature updates** (pass `-IncludeEndOfLife` to keep them). Use `-OutFile` to save it, `-SkipWindows10` for Windows 11 only, or `-MaxAgeYears` to control how far back the included builds go. Add **`-AllReleases`** to hardcode *every* non-preview monthly build for the past `-MaxAgeYears` (default 2) years — so a machine on any recent supported build resolves its exact release date/KB entirely offline and never has to query Microsoft. The live table is generated with `-AllReleases -SkipWindows10`.
 
 ### "Am I on an old build?" comparison
 
@@ -183,6 +183,16 @@ END OF LIFE APPROACHING: 24H2 reaches end of servicing on 2026-10-13 (Home/Pro) 
 ```
 
 This is **informational only** — the script never downloads, installs, or remediates based on it. To keep it accurate, update the end-of-servicing dates in `$KnownFeatureUpdates` from the *servicing channels* table on the Microsoft release information page whenever a feature update ships or Microsoft revises a date.
+
+### End-of-life feature updates
+
+An end-of-life feature update will **never** receive further security updates, so no amount of patching can make it current. Because of that, the automated modes treat an EOL feature update as **stale no matter what** — regardless of build date or patch history:
+
+- Under `-Remediate` and `-FixIfStale`, if the installed feature update is past its end-of-servicing date (for its edition), the run is forced to **stale** and will not report "healthy". `-Remediate` classifies it as **severe** (since it can never be patched current) and prints a clear reason, e.g. *"the installed feature update (22H2) is end-of-life"*.
+- The build banner also prints an `END OF LIFE` warning (see above).
+- Note: the repair itself resets policy/cache/services — it **cannot upgrade the feature update**. The EOL flag exists so the machine is never silently reported as healthy; the actual fix is a feature-update upgrade.
+
+The EOL dates live in the `$KnownFeatureUpdates` table (which retains every version, including EOL ones, precisely so this detection keeps working) — separate from the lean `$KnownBuildReleases` build table.
 
 ## Remediation Cooldown
 

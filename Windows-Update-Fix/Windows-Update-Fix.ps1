@@ -199,11 +199,16 @@ function Set-ServiceStartupType {
 # When the online lookup of the current build's release date/KB times out or is unreachable,
 # the script falls back to this table so it can still report a release date and KB offline.
 #
-# Keyed by "<Build>.<UBR>" (e.g. '26100.8655'). Date must be ISO format 'yyyy-MM-dd'. Each entry is
-# the newest NON-PREVIEW cumulative update for that version (the optional C/D-week previews are omitted).
+# Keyed by "<Build>.<UBR>" (e.g. '26100.8655'). Date must be ISO 'yyyy-MM-dd'. This table lists every
+# NON-PREVIEW (Patch Tuesday "B" / out-of-band) monthly cumulative update for roughly the last two years,
+# for the currently-SUPPORTED Windows feature updates only (end-of-life versions are intentionally left
+# out - the script flags those as stale on its own; see below). A machine on any recent supported build
+# resolves its release date/KB entirely offline - Microsoft is only queried for a build newer than
+# everything here. The optional C/D-week previews are omitted.
 #
-# TO UPDATE: run Tools\Update-BuildReferenceTable.ps1 to regenerate this block from Microsoft's release
-# information (it excludes preview releases automatically), then paste the result here. Or edit by hand:
+# TO UPDATE: run Tools\Update-BuildReferenceTable.ps1 -AllReleases -SkipWindows10 to regenerate this
+# block from Microsoft's release information (previews and EOL feature updates are excluded
+# automatically), then paste the result here. Or edit by hand:
 #   1. Open the Microsoft release information page:
 #        Windows 11: https://learn.microsoft.com/windows/release-health/windows11-release-information
 #        Windows 10: https://learn.microsoft.com/windows/release-health/release-information
@@ -214,15 +219,86 @@ function Set-ServiceStartupType {
 # Last verified against Microsoft release information: 2026-07-13
 # =====================================================================================
 $script:KnownBuildReleases = @{
-    # --- Windows 11 (latest non-preview build per serviced version) ---
-    '28000.2269' = @{ Date = '2026-06-09'; KB = 'KB5095051' }  # 26H1
-    '26200.8655' = @{ Date = '2026-06-09'; KB = 'KB5094126' }  # 25H2
-    '26100.8655' = @{ Date = '2026-06-09'; KB = 'KB5094126' }  # 24H2
-    '22631.7219' = @{ Date = '2026-06-09'; KB = 'KB5093998' }  # 23H2
-    '22621.6060' = @{ Date = '2025-10-14'; KB = 'KB5066793' }  # 22H2 (end of updates)
-    '22000.3260' = @{ Date = '2024-10-08'; KB = 'KB5044280' }  # 21H2 (end of updates)
-    # --- Windows 10 ---
-    '19045.7417' = @{ Date = '2026-06-09'; KB = 'KB5094127' }  # 22H2
+    # --- Windows 11 (every non-preview build, past ~2 years) ---
+    '28000.2269'  = @{ Date = '2026-06-09'; KB = 'KB5095051' }  # 26H1
+    '28000.2113'  = @{ Date = '2026-05-12'; KB = 'KB5089548' }  # 26H1
+    '28000.1836'  = @{ Date = '2026-04-14'; KB = 'KB5083768' }  # 26H1
+    '28000.1719'  = @{ Date = '2026-03-10'; KB = 'KB5079466' }  # 26H1
+    '28000.1575'  = @{ Date = '2026-02-10'; KB = 'KB5077179' }  # 26H1
+    '26200.8655'  = @{ Date = '2026-06-09'; KB = 'KB5094126' }  # 25H2
+    '26200.8457'  = @{ Date = '2026-05-12'; KB = 'KB5089549' }  # 25H2
+    '26200.8246'  = @{ Date = '2026-04-14'; KB = 'KB5083769' }  # 25H2
+    '26200.8117'  = @{ Date = '2026-03-31'; KB = 'KB5086672' }  # 25H2
+    '26200.8039'  = @{ Date = '2026-03-21'; KB = 'KB5085516' }  # 25H2
+    '26200.8037'  = @{ Date = '2026-03-10'; KB = 'KB5079473' }  # 25H2
+    '26200.7840'  = @{ Date = '2026-02-10'; KB = 'KB5077181' }  # 25H2
+    '26200.7628'  = @{ Date = '2026-01-24'; KB = 'KB5078127' }  # 25H2
+    '26200.7627'  = @{ Date = '2026-01-17'; KB = 'KB5077744' }  # 25H2
+    '26200.7623'  = @{ Date = '2026-01-13'; KB = 'KB5074109' }  # 25H2
+    '26200.7462'  = @{ Date = '2025-12-09'; KB = 'KB5072033' }  # 25H2
+    '26200.7171'  = @{ Date = '2025-11-11'; KB = 'KB5068861' }  # 25H2
+    '26200.6901'  = @{ Date = '2025-10-20'; KB = 'KB5070773' }  # 25H2
+    '26200.6899'  = @{ Date = '2025-10-14'; KB = 'KB5066835' }  # 25H2
+    '26100.8655'  = @{ Date = '2026-06-09'; KB = 'KB5094126' }  # 24H2
+    '26100.8457'  = @{ Date = '2026-05-12'; KB = 'KB5089549' }  # 24H2
+    '26100.8246'  = @{ Date = '2026-04-14'; KB = 'KB5083769' }  # 24H2
+    '26100.8117'  = @{ Date = '2026-03-31'; KB = 'KB5086672' }  # 24H2
+    '26100.8039'  = @{ Date = '2026-03-21'; KB = 'KB5085516' }  # 24H2
+    '26100.8037'  = @{ Date = '2026-03-10'; KB = 'KB5079473' }  # 24H2
+    '26100.7840'  = @{ Date = '2026-02-10'; KB = 'KB5077181' }  # 24H2
+    '26100.7628'  = @{ Date = '2026-01-24'; KB = 'KB5078127' }  # 24H2
+    '26100.7627'  = @{ Date = '2026-01-17'; KB = 'KB5077744' }  # 24H2
+    '26100.7623'  = @{ Date = '2026-01-13'; KB = 'KB5074109' }  # 24H2
+    '26100.7462'  = @{ Date = '2025-12-09'; KB = 'KB5072033' }  # 24H2
+    '26100.7178'  = @{ Date = '2025-11-18'; KB = 'KB5072359' }  # 24H2
+    '26100.7171'  = @{ Date = '2025-11-11'; KB = 'KB5068861' }  # 24H2
+    '26100.6905'  = @{ Date = '2025-10-23'; KB = 'KB5070881' }  # 24H2
+    '26100.6901'  = @{ Date = '2025-10-20'; KB = 'KB5070773' }  # 24H2
+    '26100.6899'  = @{ Date = '2025-10-14'; KB = 'KB5066835' }  # 24H2
+    '26100.6588'  = @{ Date = '2025-09-22'; KB = 'KB5068221' }  # 24H2
+    '26100.6584'  = @{ Date = '2025-09-09'; KB = 'KB5065426' }  # 24H2
+    '26100.4946'  = @{ Date = '2025-08-12'; KB = 'KB5063878' }  # 24H2
+    '26100.4656'  = @{ Date = '2025-07-13'; KB = 'KB5064489' }  # 24H2
+    '26100.4652'  = @{ Date = '2025-07-08'; KB = 'KB5062553' }  # 24H2
+    '26100.4351'  = @{ Date = '2025-06-11'; KB = 'KB5063060' }  # 24H2
+    '26100.4349'  = @{ Date = '2025-06-10'; KB = 'KB5060842' }  # 24H2
+    '26100.4066'  = @{ Date = '2025-05-27'; KB = 'KB5061977' }  # 24H2
+    '26100.4061'  = @{ Date = '2025-05-13'; KB = 'KB5058411' }  # 24H2
+    '26100.3775'  = @{ Date = '2025-04-08'; KB = 'KB5055523' }  # 24H2
+    '26100.3476'  = @{ Date = '2025-03-11'; KB = 'KB5053598' }  # 24H2
+    '26100.3194'  = @{ Date = '2025-02-11'; KB = 'KB5051987' }  # 24H2
+    '26100.2894'  = @{ Date = '2025-01-14'; KB = 'KB5050009' }  # 24H2
+    '26100.2605'  = @{ Date = '2024-12-10'; KB = 'KB5048667' }  # 24H2
+    '26100.2314'  = @{ Date = '2024-11-12'; KB = 'KB5046617' }  # 24H2
+    '26100.2033'  = @{ Date = '2024-10-08'; KB = 'KB5044284' }  # 24H2
+    '22631.7219'  = @{ Date = '2026-06-09'; KB = 'KB5093998' }  # 23H2
+    '22631.7079'  = @{ Date = '2026-05-12'; KB = 'KB5087420' }  # 23H2
+    '22631.6936'  = @{ Date = '2026-04-14'; KB = 'KB5082052' }  # 23H2
+    '22631.6783'  = @{ Date = '2026-03-10'; KB = 'KB5078883' }  # 23H2
+    '22631.6649'  = @{ Date = '2026-02-10'; KB = 'KB5075941' }  # 23H2
+    '22631.6495'  = @{ Date = '2026-01-24'; KB = 'KB5078132' }  # 23H2
+    '22631.6494'  = @{ Date = '2026-01-17'; KB = 'KB5077797' }  # 23H2
+    '22631.6491'  = @{ Date = '2026-01-13'; KB = 'KB5073455' }  # 23H2
+    '22631.6345'  = @{ Date = '2025-12-09'; KB = 'KB5071417' }  # 23H2
+    '22631.6199'  = @{ Date = '2025-11-11'; KB = 'KB5068865' }  # 23H2
+    '22631.6060'  = @{ Date = '2025-10-14'; KB = 'KB5066793' }  # 23H2
+    '22631.5909'  = @{ Date = '2025-09-09'; KB = 'KB5065431' }  # 23H2
+    '22631.5771'  = @{ Date = '2025-08-19'; KB = 'KB5066189' }  # 23H2
+    '22631.5768'  = @{ Date = '2025-08-12'; KB = 'KB5063875' }  # 23H2
+    '22631.5624'  = @{ Date = '2025-07-08'; KB = 'KB5062552' }  # 23H2
+    '22631.5472'  = @{ Date = '2025-06-10'; KB = 'KB5060999' }  # 23H2
+    '22631.5415'  = @{ Date = '2025-05-31'; KB = 'KB5062170' }  # 23H2
+    '22631.5335'  = @{ Date = '2025-05-13'; KB = 'KB5058405' }  # 23H2
+    '22631.5192'  = @{ Date = '2025-04-11'; KB = 'KB5058919' }  # 23H2
+    '22631.5189'  = @{ Date = '2025-04-08'; KB = 'KB5055528' }  # 23H2
+    '22631.5039'  = @{ Date = '2025-03-11'; KB = 'KB5053602' }  # 23H2
+    '22631.4890'  = @{ Date = '2025-02-11'; KB = 'KB5051989' }  # 23H2
+    '22631.4751'  = @{ Date = '2025-01-14'; KB = 'KB5050021' }  # 23H2
+    '22631.4602'  = @{ Date = '2024-12-10'; KB = 'KB5048685' }  # 23H2
+    '22631.4460'  = @{ Date = '2024-11-12'; KB = 'KB5046633' }  # 23H2
+    '22631.4317'  = @{ Date = '2024-10-08'; KB = 'KB5044285' }  # 23H2
+    '22631.4169'  = @{ Date = '2024-09-10'; KB = 'KB5043076' }  # 23H2
+    '22631.4037'  = @{ Date = '2024-08-13'; KB = 'KB5041585' }  # 23H2
 }
 
 # Returns the latest build revision this script knows about for the SAME build line (major build
@@ -304,6 +380,21 @@ function Get-FeatureUpdateSupport {
         EndDate = $EndDate
         Channel = if ($IsEnterprise) { 'Enterprise/Education' } else { 'Home/Pro' }
     }
+}
+
+# Convenience wrapper: resolves this PC's feature-update support info from the registry (build number and
+# edition) and reports whether it is end-of-life. Returns a PSCustomObject with Version, EndDate, Channel
+# and IsEndOfLife, or $null if the feature update is not in the support table.
+function Get-InstalledFeatureUpdateSupport {
+    $Reg = $null
+    try { $Reg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop } catch { }
+    if (-not $Reg -or -not $Reg.CurrentBuildNumber) { return $null }
+    $Build = [int]$Reg.CurrentBuildNumber
+    $IsWin11 = ($Build -ge 22000)
+    $Support = Get-FeatureUpdateSupport -IsWin11 $IsWin11 -Build $Build -EditionId $Reg.EditionID
+    if (-not $Support) { return $null }
+    Add-Member -InputObject $Support -NotePropertyName 'IsEndOfLife' -NotePropertyValue ($Support.EndDate -lt (Get-Date)) -Force
+    return $Support
 }
 
 # Best-effort online lookup of the exact release date and KB article for a specific Windows build
@@ -1305,6 +1396,14 @@ if ($Remediate) {
         Write-HostTimestamp "Installed build $($BuildInfo.BuildUbr)$KbNote was released $($BuildInfo.ReleaseDate.ToString('yyyy-MM-dd')) ($BuildAgeDays days ago)."
     }
 
+    # End-of-life feature update: an EOL version will NEVER receive further updates, so it is treated as
+    # stale no matter what the build date or patch history say.
+    $FeatureSupport = Get-InstalledFeatureUpdateSupport
+    $FeatureEol = ($FeatureSupport -and $FeatureSupport.IsEndOfLife)
+    if ($FeatureEol) {
+        Write-HostTimestamp "Feature update $($FeatureSupport.Version) reached end of servicing on $($FeatureSupport.EndDate.ToString('yyyy-MM-dd')) ($($FeatureSupport.Channel)) - it will never receive further updates, so it is STALE no matter what. A feature-update upgrade is required to become current." -ForegroundColor Red
+    }
+
     # Classify severity.
     # The legacy update history is often empty on modern Windows 11 (updates installed via the Unified
     # Update Platform do not populate it), so an absent history is only treated as stale when the
@@ -1319,8 +1418,9 @@ if ($Remediate) {
     # An empty/absent history counts as stale only when a recent build does not rescue it.
     $UnknownStale = ($NeverPatched -and -not $BuildRecent)
     $UnknownVeryStale = ($NeverPatched -and -not $BuildVeryRecent)
-    $IsStale = ($PatchStale -or $BuildStale -or $UnknownStale)
-    $IsVeryStale = ($PatchVeryStale -or $BuildVeryStale -or $UnknownVeryStale)
+    # An end-of-life feature update is always stale (and always very stale - it can never be patched current).
+    $IsStale = ($PatchStale -or $BuildStale -or $UnknownStale -or $FeatureEol)
+    $IsVeryStale = ($PatchVeryStale -or $BuildVeryStale -or $UnknownVeryStale -or $FeatureEol)
     $ManyFailures = ($UnresolvedCount -gt $FailureFixThreshold)
     # A few unresolved failures alongside a recent successful patch are treated as likely false positives.
     $FailuresRequireFix = ($UnresolvedCount -gt 0 -and $IsStale) -or $ManyFailures
@@ -1344,7 +1444,8 @@ if ($Remediate) {
     $TriggerUpdateScan = $true
 
     if ($Severe) {
-        $Reason = if ($UnknownVeryStale) { 'no patch in history and the installed build is not recent' }
+        $Reason = if ($FeatureEol) { "the installed feature update ($($FeatureSupport.Version)) is end-of-life" }
+                  elseif ($UnknownVeryStale) { 'no patch in history and the installed build is not recent' }
                   elseif ($PatchVeryStale) { "no patch within the last $([int](2 * $StaleDays)) days" }
                   elseif ($BuildVeryStale) { "the installed build was released more than $([int](2 * $StaleDays)) days ago" }
                   else { "more than $FailureFixThreshold unresolved update failures" }
@@ -1560,7 +1661,13 @@ if ($FixIfStale -and -not $Remediate) {
     # The legacy update history is often empty on modern Windows 11, so treat an absent history as stale
     # only when a recent build does not rescue it; a recorded patch that is old (or an old build) is stale.
     $PatchStale = if (-not $LastPatch) { -not $BuildRecent } else { $LastPatch.Date -lt $Cutoff }
-    $IsStale = ($PatchStale -or $BuildStale)
+    # An end-of-life feature update will never receive further updates, so it is stale no matter what.
+    $FeatureSupport = Get-InstalledFeatureUpdateSupport
+    $FeatureEol = ($FeatureSupport -and $FeatureSupport.IsEndOfLife)
+    if ($FeatureEol) {
+        Write-HostTimestamp "Feature update $($FeatureSupport.Version) reached end of servicing on $($FeatureSupport.EndDate.ToString('yyyy-MM-dd')) ($($FeatureSupport.Channel)) - it will never receive further updates, so it is STALE no matter what." -ForegroundColor Red
+    }
+    $IsStale = ($PatchStale -or $BuildStale -or $FeatureEol)
     $UnresolvedCount = $UnresolvedFailures.Count
     # Failures force a repair when there is no recent successful patch, or when they exceed the tolerated count.
     $FailuresRequireFix = ($UnresolvedCount -gt 0 -and $IsStale) -or ($UnresolvedCount -gt $FailureFixThreshold)
@@ -1579,7 +1686,8 @@ if ($FixIfStale -and -not $Remediate) {
         exit 0
     }
     else {
-        $Reason = if ($IsStale -and $FailuresRequireFix) { "no recent patch and unresolved update failures" }
+        $Reason = if ($FeatureEol) { "the installed feature update ($($FeatureSupport.Version)) is end-of-life" }
+                  elseif ($IsStale -and $FailuresRequireFix) { "no recent patch and unresolved update failures" }
                   elseif ($PatchStale) { "no patch within the last $StaleDays days" }
                   elseif ($BuildStale) { "the installed build was released more than $StaleDays days ago" }
                   else { "more than $FailureFixThreshold unresolved update failures" }
