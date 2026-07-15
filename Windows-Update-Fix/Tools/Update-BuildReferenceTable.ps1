@@ -10,15 +10,15 @@
 # fixes are kept.
 #
 # USAGE:
-#   .\Update-BuildReferenceTable.ps1                       # every non-preview build per month, past 2 years (default)
-#   .\Update-BuildReferenceTable.ps1 -AllReleases:$false   # newest build per version line only
-#   .\Update-BuildReferenceTable.ps1 -OutFile x.txt        # also write it to a file
-#   .\Update-BuildReferenceTable.ps1 -MaxAgeYears 3        # widen/narrow the time window (default 2 years)
-#   .\Update-BuildReferenceTable.ps1 -SkipWindows10:$false  # include Windows 10
+#   .\Update-BuildReferenceTable.ps1                  # every non-preview build per month, past 2 years (default)
+#   .\Update-BuildReferenceTable.ps1 -NewestOnly      # newest build per version line only
+#   .\Update-BuildReferenceTable.ps1 -OutFile x.txt   # also write it to a file
+#   .\Update-BuildReferenceTable.ps1 -MaxAgeYears 3   # widen/narrow the time window (default 2 years)
+#   .\Update-BuildReferenceTable.ps1 -IncludeWindows10  # also include Windows 10 (Windows 11 only by default)
 #
-# -AllReleases is ON by default: every month's build for the past -MaxAgeYears (default 2) years is
-# included, so machines on any recent build get an exact offline release date/KB without the script
-# ever querying Microsoft. Pass -AllReleases:$false to get only the newest build per version line.
+# By default every month's build for the past -MaxAgeYears (default 2) years is included, so machines on
+# any recent build get an exact offline release date/KB without the script ever querying Microsoft.
+# Pass -NewestOnly to get only the newest build per version line.
 #
 # Copy the generated block over the existing $script:KnownBuildReleases table in
 # Windows-Update-Fix.ps1 and update the "Last verified" date in that table's comment.
@@ -28,13 +28,12 @@
 param(
     # Only include builds released within this many years (keeps the table focused on recent releases).
     [double]$MaxAgeYears = 2,
-    # Emit EVERY non-preview build in the window (one entry per month), not just the newest per line.
-    # Defaults to $true so every run captures all 24 months of builds; pass -AllReleases:$false for newest-only.
-    [switch]$AllReleases = $true,
+    # Emit only the newest non-preview build per version line instead of every non-preview build per month.
+    [switch]$NewestOnly,
     # Include feature updates that have already reached end of servicing (off by default keeps it lean).
     [switch]$IncludeEndOfLife,
-    # Skip the Windows 10 page (Windows 11 only, default).
-    [switch]$SkipWindows10 = $true,
+    # Also include the Windows 10 page (Windows 11 only by default).
+    [switch]$IncludeWindows10,
     # Optional path to also write the generated block to.
     [string]$OutFile,
     [int]$TimeoutSec = 30
@@ -160,10 +159,10 @@ function Format-BuildEntries {
     return $Lines
 }
 
-$Win11 = Get-BuildTableFromPage -Url 'https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information' -TimeoutSec $TimeoutSec -AllReleases:$AllReleases -IncludeEndOfLife:$IncludeEndOfLife
+$Win11 = Get-BuildTableFromPage -Url 'https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information' -TimeoutSec $TimeoutSec -AllReleases:(-not $NewestOnly) -IncludeEndOfLife:$IncludeEndOfLife
 $Win10 = @()
-if (-not $SkipWindows10) {
-    $Win10 = Get-BuildTableFromPage -Url 'https://learn.microsoft.com/en-us/windows/release-health/release-information' -TimeoutSec $TimeoutSec -AllReleases:$AllReleases -IncludeEndOfLife:$IncludeEndOfLife
+if ($IncludeWindows10) {
+    $Win10 = Get-BuildTableFromPage -Url 'https://learn.microsoft.com/en-us/windows/release-health/release-information' -TimeoutSec $TimeoutSec -AllReleases:(-not $NewestOnly) -IncludeEndOfLife:$IncludeEndOfLife
 }
 
 if (-not $Win11 -and -not $Win10) {
@@ -174,7 +173,7 @@ if (-not $Win11 -and -not $Win10) {
 $Block = @()
 $Block += "# Last verified against Microsoft release information: $(Get-Date -Format 'yyyy-MM-dd')"
 $Block += '$script:KnownBuildReleases = @{'
-$Scope = if ($AllReleases) { "every non-preview build, past $MaxAgeYears year(s)" } else { 'latest non-preview build per serviced version' }
+$Scope = if (-not $NewestOnly) { "every non-preview build, past $MaxAgeYears year(s)" } else { 'latest non-preview build per serviced version' }
 if ($Win11) {
     $Block += "    # --- Windows 11 ($Scope) ---"
     $Block += (Format-BuildEntries -Entries $Win11)

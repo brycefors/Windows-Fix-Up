@@ -59,6 +59,8 @@ param(
     [int]$FailureFixThreshold = 5,
     [Parameter(HelpMessage = 'Also run DISM /RestoreHealth and SFC to repair the component store (slow)')]
     [switch]$RepairComponentStore,
+    [Parameter(HelpMessage = 'EXPERIMENTAL: Delete stale CLFS transaction log files (.txr, .blf, .regtrans-ms) from the SMI store and registry TxR directories. Can resolve persistent component-store or settings corruption but may cause data loss if a transaction is genuinely in progress. Only use when standard repair steps have failed.')]
+    [switch]$CleanTransactionLogs,
     [Parameter(HelpMessage = 'Skip the online lookup of the current build''s exact release date/KB (Microsoft release information)')]
     [switch]$SkipOnlineBuildDate,
     [Parameter(HelpMessage = 'Directory to write log files to (defaults to the script folder)')]
@@ -1511,6 +1513,9 @@ if (-not $Unattended -and -not $SkipInteractive) {
     if ($RepairComponentStore) {
         Write-Host "  - Repair the component store with DISM /RestoreHealth and SFC (slow)"
     }
+    if ($CleanTransactionLogs) {
+        Write-Host "  - [EXPERIMENTAL] Delete stale CLFS transaction log files (.txr/.blf) from the SMI store and registry TxR directories" -ForegroundColor Yellow
+    }
     if ($TriggerUpdateScan) {
         Write-Host "  - Trigger a fresh Windows Update detection scan"
     }
@@ -1934,6 +1939,68 @@ Invoke-Task -Description 'Resetting the Windows Update cache (SoftwareDistributi
     }
 }
 
+# 3b. EXPERIMENTAL: Delete stale CLFS transaction log files
+# The SMI store (System32\SMI\Store\Machine) and registry TxR directory (System32\config\TxR) hold
+# CLFS transaction log files (.txr, .blf, .regtrans-ms). When these become orphaned or corrupted they
+# can cause persistent "0x80070003 / element not found" component-store errors and block servicing.
+# Deleting them forces Windows to rebuild the logs from scratch on next boot.
+#
+# WARNING: This is EXPERIMENTAL. Deleting an in-progress transaction could corrupt the SMI store or
+# registry hive. Only enable with -CleanTransactionLogs when standard repair steps have failed and
+# you are prepared to run DISM /RestoreHealth (or restore from backup) afterward if needed.
+if ($CleanTransactionLogs) {
+    Invoke-Task -Description '[EXPERIMENTAL] Deleting stale CLFS transaction log files (.txr/.blf)...' -ScriptBlock {
+        $TxLocations = @(
+            # Software Management Infrastructure (SMI) store - most commonly tied to WU servicing errors.
+            @{ Path = Join-Path $System32Path 'SMI\Store\Machine'; Patterns = @('*.txr', '*.blf') },
+            # Registry transaction logs - orphaned entries here can block component-store operations.
+            @{ Path = Join-Path $System32Path 'config\TxR';        Patterns = @('*.txr', '*.blf', '*.regtrans-ms') }
+        )
+        $Removed = 0
+        $Failed  = 0
+        foreach ($Location in $TxLocations) {
+            if (-not (Test-Path $Location.Path)) {
+                Write-HostTimestamp "  $($Location.Path) does not exist. Skipping." -ForegroundColor Yellow
+                continue
+            }
+            foreach ($Pattern in $Location.Patterns) {
+                Get-ChildItem -Path $Location.Path -Filter $Pattern -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    try {
+                        # Strip system/hidden/read-only attributes before deleting; TxR files are often
+                        # flagged this way and Remove-Item -Force can still fail without this step.
+                        $_.Attributes = 'Normal'
+                        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+                        Write-Host "  Removed: $($_.FullName)"
+                        $Removed++
+                    }
+                    catch {
+                        Write-HostTimestamp "  Could not remove $($_.FullName): $($_.Exception.Message)" -ForegroundColor Yellow
+                        $Failed++
+                    }
+                }
+            }
+        }
+        if ($Removed -eq 0 -and $Failed -eq 0) {
+            Write-HostTimestamp '  No stale transaction log files found.'
+        }
+        else {
+            Write-HostTimestamp "  Removed $Removed file(s)$(if ($Failed) { ", $Failed could not be removed (may be in use - reboot and retry)" })."
+            if ($Removed -gt 0) {
+                # Tell the NTFS Transactional Resource Manager to auto-reset on next boot so it
+                # cleanly rebuilds its state from scratch rather than trying to replay missing logs.
+                try {
+                    & fsutil.exe resource setautoreset true "$env:SystemDrive\" 2>$null
+                    Write-HostTimestamp "  Set NTFS TRM auto-reset on $env:SystemDrive so it rebuilds cleanly on next boot."
+                }
+                catch {
+                    Write-HostTimestamp "  Could not set TRM auto-reset (fsutil): $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+                Write-HostTimestamp '  A restart is required for Windows to rebuild the transaction logs.' -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
 # 4. Re-register the Windows Update components (DLLs)
 Invoke-Task -Description 'Re-registering Windows Update components (DLLs)...' -ScriptBlock {
     $Dlls = @(
@@ -2074,6 +2141,23 @@ Invoke-Task -Description 'Checking hosts file for blocked Windows Update domains
 
 # Optionally repair the component store, a common underlying cause of update failures
 if ($RepairComponentStore) {
+    Invoke-Task -Description 'Cleaning up the component store with DISM /StartComponentCleanup /ResetBase...' -ScriptBlock {
+        # /StartComponentCleanup /ResetBase removes superseded component versions and collapses the
+        # servicing stack down to the current baseline. This shrinks the component store, eliminates
+        # stale or orphaned payloads that /RestoreHealth can trip over, and significantly reduces the
+        # work /RestoreHealth has to do - making the subsequent repair faster and more reliable.
+        # Note: once run, previously-installed updates cannot be uninstalled (the superseded files
+        # are gone), so this is intentionally placed only inside -RepairComponentStore.
+        try {
+            DISM.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+                Write-HostTimestamp "DISM /StartComponentCleanup returned exit code $LASTEXITCODE." -ForegroundColor Yellow
+            }
+        }
+        catch {
+            Write-HostTimestamp "DISM error: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
     Invoke-Task -Description 'Repairing the component store with DISM /RestoreHealth (this can take a while)...' -ScriptBlock {
         try {
             DISM.exe /Online /Cleanup-Image /RestoreHealth

@@ -1,7 +1,7 @@
 # =====================================================================================
 # Sync-BuildReferenceTable.ps1
 # -------------------------------------------------------------------------------------
-# Runs Update-BuildReferenceTable.ps1 -AllReleases -MaxAgeYears 2 and automatically
+# Runs Update-BuildReferenceTable.ps1 -MaxAgeYears 2 and automatically
 # patches the $script:KnownBuildReleases block inside Windows-Update-Fix.ps1 with the
 # result, giving every month's build and KB article for the past 2 years.
 #
@@ -107,7 +107,7 @@ if ($Register) {
         Write-Host "  Schedule: day $DayOfMonth of every month at $RunTime" -ForegroundColor Cyan
         Write-Host "  Script  : $ThisScript" -ForegroundColor Cyan
         Write-Host ''
-        Write-Host 'Each run fetches every non-preview build and KB for the past 2 years (-AllReleases -MaxAgeYears 2).' -ForegroundColor Cyan
+        Write-Host 'Each run fetches every non-preview build and KB for the past 2 years (-MaxAgeYears 2).' -ForegroundColor Cyan
     }
     return
 }
@@ -122,9 +122,9 @@ foreach ($Required in $MainScript, $Updater) {
 
 Write-Host "Fetching every non-preview build and KB for the past $MaxAgeYears year(s) from Microsoft..." -ForegroundColor Cyan
 
-# -AllReleases: emit every non-preview monthly build (not just the newest per version line).
-# -MaxAgeYears: controls how far back to reach (default 2 years).
-$NewBlock = & $Updater -AllReleases -MaxAgeYears $MaxAgeYears -TimeoutSec $TimeoutSec 2>&1
+# Update-BuildReferenceTable.ps1 emits every non-preview monthly build by default (not just the newest
+# per version line). -MaxAgeYears controls how far back to reach (default 2 years).
+$NewBlock = & $Updater -MaxAgeYears $MaxAgeYears -TimeoutSec $TimeoutSec 2>&1
 
 $NewBlock = $NewBlock | ForEach-Object {
     if ($_ -is [System.Management.Automation.ErrorRecord])   { Write-Error   $_; $null }
