@@ -5,6 +5,28 @@
 
 This PowerShell script repairs Windows Update by clearing the Local Group Policy store, removing the Windows Update policy registry keys that "tattoo" the system, resetting the update cache, re-registering the update components, and verifying that all required services are healthy. It can also inspect the update history and **automatically decide whether — and how aggressively — to act**.
 
+## Table of Contents
+
+- [How to Run This Script](#how-to-run-this-script)
+  - [Recommended Method: Using the Batch File](#recommended-method-using-the-batch-file)
+  - [Running with Parameters (from Command Line)](#running-with-parameters-from-command-line)
+  - [Remote / One-Line Deployment](#remote--one-line-deployment)
+  - [Running Across Machines with Invoke-Command](#running-across-machines-with-invoke-command)
+- [Command-Line Parameters](#command-line-parameters)
+- [Adaptive Remediation (Recommended)](#adaptive-remediation-recommended)
+- [Build Date Lookup](#build-date-lookup)
+  - ["Am I on an old build?" comparison](#am-i-on-an-old-build-comparison)
+  - [Feature update end-of-life note](#feature-update-end-of-life-note)
+  - [End-of-life feature updates](#end-of-life-feature-updates)
+- [Remediation Cooldown](#remediation-cooldown)
+- [Disk Space Check](#disk-space-check)
+- [What the Script Does](#what-the-script-does)
+- [Checking What a Scan Detects](#checking-what-a-scan-detects)
+- [Installing Updates](#installing-updates)
+  - [Installing Updates Remotely](#installing-updates-remotely)
+- [Logging](#logging)
+- [Important Notes](#important-notes)
+
 ## How to Run This Script
 
 The easiest and recommended way to run this script is by using the `Run-Windows-Update-Fix.bat` file. It automatically handles administrator elevation and PowerShell execution policies, and will even download the latest `Windows-Update-Fix.ps1` from GitHub if it is missing.
@@ -101,6 +123,7 @@ The script supports the following optional parameters:
 | `-AutoReboot` | Restarts the computer after a 60-second countdown once the fix completes. **The script only reboots when this flag is set** — without it, the fix finishes and just reminds you to restart manually. During an interactive run the countdown can be cancelled by pressing any key. |
 | `-ScheduleReboot` | Only takes effect together with `-InstallUpdates`. If the installed updates require a restart to finish, the script **schedules** a reboot for the next occurrence of `-ScheduleRebootTime` (default **2:00 AM**) instead of rebooting immediately, and **broadcasts an on-screen notice to every logged-on user** telling them the exact date/time. It takes precedence over `-AutoReboot` when an update-required restart is pending. The scheduled reboot can be cancelled any time with `shutdown /a`. Does nothing if no update actually requires a restart. |
 | `-ScheduleRebootTime <HH:mm>` | Local time of day (24-hour `HH:mm`) for the reboot scheduled by `-ScheduleReboot`. Defaults to `02:00`. If the time has already passed today, the reboot is scheduled for the same time tomorrow. |
+| `-SkipRebootNotice` | Suppresses the `msg.exe` on-screen popup that is normally sent to every logged-on user when `-ScheduleReboot` schedules a reboot. Useful in headless or unattended environments where interactive user popups are undesirable. |
 | `-Remediate` | **Adaptive mode.** Assesses Windows Update health from the update history and automatically scales the repair to how broken things are (see [Adaptive Remediation](#adaptive-remediation-recommended) below). Runs hands-off with no prompts. |
 | `-ForceRemediate <Mild\|Severe>` | **Forced mode.** Skips the health assessment entirely and applies the specified repair level directly. `Mild` runs the baseline repair; `Severe` additionally enables `-ResetAllPolicies` and `-RepairComponentStore`. Also runs hands-off with no prompts and triggers an update scan. Useful when the update history is empty or unreliable. Ignored if `-Remediate` is also passed. |
 | `-CooldownDays <n>` | Minimum number of days that must pass before `-Remediate` or `-ForceRemediate` can run again on the same machine. The timestamp is stored in a `.last_remediation` file alongside the script. Default is `7`. Set to `0` to disable. Stamps older than `2 × CooldownDays` are automatically removed. |
@@ -363,22 +386,17 @@ If a restart is needed to complete one or more updates, the script reports this.
 
 `-ScheduleReboot` only acts when the installed updates actually require a restart, and it takes precedence over `-AutoReboot` in that case. The scheduled reboot can be cancelled at any time before it fires with `shutdown /a`.
 
-When the reboot is scheduled, the script **notifies everyone who is signed in** so no one is caught off guard. It broadcasts a formatted message box to all sessions with `msg.exe *`, for example:
+When the reboot is scheduled, the script **notifies everyone who is signed in** so no one is caught off guard. It broadcasts a formatted message box to all sessions with `msg.exe *`:
 
 ```
-============================================================
-            SCHEDULED WINDOWS UPDATE RESTART
-============================================================
+Scheduled maintenance notice
 
-  This computer will automatically RESTART to finish
-  installing Windows updates at:
+Windows Update maintenance has been performed on this computer
+to repair updates. To finish, it will restart automatically on:
 
-      Monday, July 13, 2026 at 2:00 AM
+    Monday, July 13, 2026 at 2:00 AM
 
-  Please SAVE YOUR WORK and close your applications before
-  then so you do not lose anything.
-
-============================================================
+Please save your work and close your apps before then.
 ```
 
 The scheduled time is also included in the native Windows shutdown warning. `msg.exe` ships with Windows **Pro/Enterprise/Education** editions but not **Home**; on Home editions the broadcast is skipped and users still get the built-in shutdown warning.

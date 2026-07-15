@@ -10,28 +10,31 @@
 # fixes are kept.
 #
 # USAGE:
-#   .\Update-BuildReferenceTable.ps1                 # newest non-preview build per version line
-#   .\Update-BuildReferenceTable.ps1 -AllReleases     # EVERY non-preview monthly build in the window
-#   .\Update-BuildReferenceTable.ps1 -OutFile x.txt   # also write it to a file
-#   .\Update-BuildReferenceTable.ps1 -MaxAgeYears 3   # widen/narrow the time window (default 2 years)
-#   .\Update-BuildReferenceTable.ps1 -SkipWindows10   # Windows 11 only
+#   .\Update-BuildReferenceTable.ps1                       # every non-preview build per month, past 2 years (default)
+#   .\Update-BuildReferenceTable.ps1 -AllReleases:$false   # newest build per version line only
+#   .\Update-BuildReferenceTable.ps1 -OutFile x.txt        # also write it to a file
+#   .\Update-BuildReferenceTable.ps1 -MaxAgeYears 3        # widen/narrow the time window (default 2 years)
+#   .\Update-BuildReferenceTable.ps1 -SkipWindows10:$false  # include Windows 10
 #
-# -AllReleases hardcodes every month's build for the past -MaxAgeYears (default 2) years, so machines on
-# any recent build get an exact offline release date/KB without the script ever querying Microsoft.
+# -AllReleases is ON by default: every month's build for the past -MaxAgeYears (default 2) years is
+# included, so machines on any recent build get an exact offline release date/KB without the script
+# ever querying Microsoft. Pass -AllReleases:$false to get only the newest build per version line.
 #
 # Copy the generated block over the existing $script:KnownBuildReleases table in
 # Windows-Update-Fix.ps1 and update the "Last verified" date in that table's comment.
+# To patch Windows-Update-Fix.ps1 automatically, use Sync-BuildReferenceTable.ps1 instead.
 # =====================================================================================
 [CmdletBinding()]
 param(
     # Only include builds released within this many years (keeps the table focused on recent releases).
     [double]$MaxAgeYears = 2,
     # Emit EVERY non-preview build in the window (one entry per month), not just the newest per line.
-    [switch]$AllReleases,
+    # Defaults to $true so every run captures all 24 months of builds; pass -AllReleases:$false for newest-only.
+    [switch]$AllReleases = $true,
     # Include feature updates that have already reached end of servicing (off by default keeps it lean).
     [switch]$IncludeEndOfLife,
-    # Skip the Windows 10 page (Windows 11 only).
-    [switch]$SkipWindows10,
+    # Skip the Windows 10 page (Windows 11 only, default).
+    [switch]$SkipWindows10 = $true,
     # Optional path to also write the generated block to.
     [string]$OutFile,
     [int]$TimeoutSec = 30

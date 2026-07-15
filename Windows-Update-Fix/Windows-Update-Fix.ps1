@@ -1,4 +1,4 @@
-# --- SCRIPT OVERVIEW ---
+﻿# --- SCRIPT OVERVIEW ---
 # This script is a specialized "fix-it" tool focused solely on repairing a broken Windows Update experience that is
 # commonly caused by leftover or misconfigured Local Group Policy. It performs several targeted actions:
 #   1. Clears the Local Group Policy store (C:\Windows\System32\GroupPolicy, and GroupPolicyUsers when opted in).
@@ -30,6 +30,8 @@ param(
     [Parameter(HelpMessage = 'Local time of day (HH:mm, 24-hour) for the reboot scheduled by -ScheduleReboot when updates require a restart (default 02:00)')]
     [ValidatePattern('^([01]\d|2[0-3]):[0-5]\d$')]
     [string]$ScheduleRebootTime = '02:00',
+    [Parameter(HelpMessage = 'Suppress the msg.exe on-screen restart notice sent to logged-on users when -ScheduleReboot schedules a reboot')]
+    [switch]$SkipRebootNotice,
     [Parameter(HelpMessage = 'Also remove the broader Software Policies registry hive (aggressive)')]
     [switch]$ResetAllPolicies,
     [Parameter(HelpMessage = 'Trigger a Windows Update detection scan after the fix')]
@@ -206,9 +208,9 @@ function Set-ServiceStartupType {
 # resolves its release date/KB entirely offline - Microsoft is only queried for a build newer than
 # everything here. The optional C/D-week previews are omitted.
 #
-# TO UPDATE: run Tools\Update-BuildReferenceTable.ps1 -AllReleases -SkipWindows10 to regenerate this
-# block from Microsoft's release information (previews and EOL feature updates are excluded
-# automatically), then paste the result here. Or edit by hand:
+# TO UPDATE: run Tools\Sync-BuildReferenceTable.ps1 to automatically regenerate and patch this block
+# (fetches every non-preview build and KB for the past 2 years). To schedule monthly updates, run
+# Tools\Sync-BuildReferenceTable.ps1 -Register (requires admin). Or edit by hand:
 #   1. Open the Microsoft release information page:
 #        Windows 11: https://learn.microsoft.com/windows/release-health/windows11-release-information
 #        Windows 10: https://learn.microsoft.com/windows/release-health/release-information
@@ -216,15 +218,16 @@ function Set-ServiceStartupType {
 #      care about and note its Build (Build.UBR), Availability date, and KB article.
 #   3. Add or replace the matching entry below. Old entries can stay or be trimmed - they are only used
 #      as a fallback.
-# Last verified against Microsoft release information: 2026-07-13
-# =====================================================================================
+# Last verified against Microsoft release information: 2026-07-14
 $script:KnownBuildReleases = @{
-    # --- Windows 11 (every non-preview build, past ~2 years) ---
+    # --- Windows 11 (every non-preview build, past 2 year(s)) ---
+    '28000.2525'  = @{ Date = '2026-07-14'; KB = 'KB5101649' }  # 26H1
     '28000.2269'  = @{ Date = '2026-06-09'; KB = 'KB5095051' }  # 26H1
     '28000.2113'  = @{ Date = '2026-05-12'; KB = 'KB5089548' }  # 26H1
     '28000.1836'  = @{ Date = '2026-04-14'; KB = 'KB5083768' }  # 26H1
     '28000.1719'  = @{ Date = '2026-03-10'; KB = 'KB5079466' }  # 26H1
     '28000.1575'  = @{ Date = '2026-02-10'; KB = 'KB5077179' }  # 26H1
+    '26200.8875'  = @{ Date = '2026-07-14'; KB = 'KB5101650' }  # 25H2
     '26200.8655'  = @{ Date = '2026-06-09'; KB = 'KB5094126' }  # 25H2
     '26200.8457'  = @{ Date = '2026-05-12'; KB = 'KB5089549' }  # 25H2
     '26200.8246'  = @{ Date = '2026-04-14'; KB = 'KB5083769' }  # 25H2
@@ -239,6 +242,7 @@ $script:KnownBuildReleases = @{
     '26200.7171'  = @{ Date = '2025-11-11'; KB = 'KB5068861' }  # 25H2
     '26200.6901'  = @{ Date = '2025-10-20'; KB = 'KB5070773' }  # 25H2
     '26200.6899'  = @{ Date = '2025-10-14'; KB = 'KB5066835' }  # 25H2
+    '26100.8875'  = @{ Date = '2026-07-14'; KB = 'KB5101650' }  # 24H2
     '26100.8655'  = @{ Date = '2026-06-09'; KB = 'KB5094126' }  # 24H2
     '26100.8457'  = @{ Date = '2026-05-12'; KB = 'KB5089549' }  # 24H2
     '26100.8246'  = @{ Date = '2026-04-14'; KB = 'KB5083769' }  # 24H2
@@ -271,6 +275,7 @@ $script:KnownBuildReleases = @{
     '26100.2605'  = @{ Date = '2024-12-10'; KB = 'KB5048667' }  # 24H2
     '26100.2314'  = @{ Date = '2024-11-12'; KB = 'KB5046617' }  # 24H2
     '26100.2033'  = @{ Date = '2024-10-08'; KB = 'KB5044284' }  # 24H2
+    '22631.7376'  = @{ Date = '2026-07-14'; KB = 'KB5099414' }  # 23H2
     '22631.7219'  = @{ Date = '2026-06-09'; KB = 'KB5093998' }  # 23H2
     '22631.7079'  = @{ Date = '2026-05-12'; KB = 'KB5087420' }  # 23H2
     '22631.6936'  = @{ Date = '2026-04-14'; KB = 'KB5082052' }  # 23H2
@@ -2158,7 +2163,7 @@ if ($ScheduleReboot -and $UpdateRebootRequired) {
     if ($LASTEXITCODE -eq 0) {
         Write-HostTimestamp "Reboot scheduled for $($Target.ToString('yyyy-MM-dd HH:mm')) to finish installing updates. Cancel it any time with: shutdown /a" -ForegroundColor Cyan
         # Let every logged-on user know, with the scheduled time, so no one is caught off guard.
-        Send-RebootNotice -RebootTime $Target
+        if (-not $SkipRebootNotice) { Send-RebootNotice -RebootTime $Target }
     }
     else {
         Write-HostTimestamp "Could not schedule the reboot (shutdown.exe exit code $LASTEXITCODE). Please restart manually to finish installing updates." -ForegroundColor Yellow
