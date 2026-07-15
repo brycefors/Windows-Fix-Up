@@ -59,8 +59,8 @@ param(
     [int]$FailureFixThreshold = 5,
     [Parameter(HelpMessage = 'Also run DISM /RestoreHealth and SFC to repair the component store (slow)')]
     [switch]$RepairComponentStore,
-    [Parameter(HelpMessage = 'EXPERIMENTAL: Delete stale CLFS transaction log files (.txr, .blf, .regtrans-ms) from the SMI store and registry TxR directories. Can resolve persistent component-store or settings corruption but may cause data loss if a transaction is genuinely in progress. Only use when standard repair steps have failed.')]
-    [switch]$CleanTransactionLogs,
+    [Parameter(HelpMessage = 'EXPERIMENTAL: Flag the NTFS Transactional Resource Manager to auto-reset on the next boot. When the TRM is in a dirty or failed state from a previous crash or incomplete servicing operation it can silently block Windows Update staging and component-store operations. Safe to run - does not delete files; takes effect after a restart.')]
+    [switch]$ResetTransactionManager,
     [Parameter(HelpMessage = 'Skip the online lookup of the current build''s exact release date/KB (Microsoft release information)')]
     [switch]$SkipOnlineBuildDate,
     [Parameter(HelpMessage = 'Directory to write log files to (defaults to the script folder)')]
@@ -1513,8 +1513,8 @@ if (-not $Unattended -and -not $SkipInteractive) {
     if ($RepairComponentStore) {
         Write-Host "  - Repair the component store with DISM /RestoreHealth and SFC (slow)"
     }
-    if ($CleanTransactionLogs) {
-        Write-Host "  - [EXPERIMENTAL] Delete stale CLFS transaction log files (.txr/.blf) from the SMI store and registry TxR directories" -ForegroundColor Yellow
+    if ($ResetTransactionManager) {
+        Write-Host "  - [EXPERIMENTAL] Flag NTFS Transactional Resource Manager to auto-reset on next boot (fsutil)" -ForegroundColor Yellow
     }
     if ($TriggerUpdateScan) {
         Write-Host "  - Trigger a fresh Windows Update detection scan"
@@ -1939,68 +1939,6 @@ Invoke-Task -Description 'Resetting the Windows Update cache (SoftwareDistributi
     }
 }
 
-# 3b. EXPERIMENTAL: Delete stale CLFS transaction log files
-# The SMI store (System32\SMI\Store\Machine) and registry TxR directory (System32\config\TxR) hold
-# CLFS transaction log files (.txr, .blf, .regtrans-ms). When these become orphaned or corrupted they
-# can cause persistent "0x80070003 / element not found" component-store errors and block servicing.
-# Deleting them forces Windows to rebuild the logs from scratch on next boot.
-#
-# WARNING: This is EXPERIMENTAL. Deleting an in-progress transaction could corrupt the SMI store or
-# registry hive. Only enable with -CleanTransactionLogs when standard repair steps have failed and
-# you are prepared to run DISM /RestoreHealth (or restore from backup) afterward if needed.
-if ($CleanTransactionLogs) {
-    Invoke-Task -Description '[EXPERIMENTAL] Deleting stale CLFS transaction log files (.txr/.blf)...' -ScriptBlock {
-        $TxLocations = @(
-            # Software Management Infrastructure (SMI) store - most commonly tied to WU servicing errors.
-            @{ Path = Join-Path $System32Path 'SMI\Store\Machine'; Patterns = @('*.txr', '*.blf') },
-            # Registry transaction logs - orphaned entries here can block component-store operations.
-            @{ Path = Join-Path $System32Path 'config\TxR';        Patterns = @('*.txr', '*.blf', '*.regtrans-ms') }
-        )
-        $Removed = 0
-        $Failed  = 0
-        foreach ($Location in $TxLocations) {
-            if (-not (Test-Path $Location.Path)) {
-                Write-HostTimestamp "  $($Location.Path) does not exist. Skipping." -ForegroundColor Yellow
-                continue
-            }
-            foreach ($Pattern in $Location.Patterns) {
-                Get-ChildItem -Path $Location.Path -Filter $Pattern -Force -ErrorAction SilentlyContinue | ForEach-Object {
-                    try {
-                        # Strip system/hidden/read-only attributes before deleting; TxR files are often
-                        # flagged this way and Remove-Item -Force can still fail without this step.
-                        $_.Attributes = 'Normal'
-                        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
-                        Write-Host "  Removed: $($_.FullName)"
-                        $Removed++
-                    }
-                    catch {
-                        Write-HostTimestamp "  Could not remove $($_.FullName): $($_.Exception.Message)" -ForegroundColor Yellow
-                        $Failed++
-                    }
-                }
-            }
-        }
-        if ($Removed -eq 0 -and $Failed -eq 0) {
-            Write-HostTimestamp '  No stale transaction log files found.'
-        }
-        else {
-            Write-HostTimestamp "  Removed $Removed file(s)$(if ($Failed) { ", $Failed could not be removed (may be in use - reboot and retry)" })."
-            if ($Removed -gt 0) {
-                # Tell the NTFS Transactional Resource Manager to auto-reset on next boot so it
-                # cleanly rebuilds its state from scratch rather than trying to replay missing logs.
-                try {
-                    & fsutil.exe resource setautoreset true "$env:SystemDrive\" 2>$null
-                    Write-HostTimestamp "  Set NTFS TRM auto-reset on $env:SystemDrive so it rebuilds cleanly on next boot."
-                }
-                catch {
-                    Write-HostTimestamp "  Could not set TRM auto-reset (fsutil): $($_.Exception.Message)" -ForegroundColor Yellow
-                }
-                Write-HostTimestamp '  A restart is required for Windows to rebuild the transaction logs.' -ForegroundColor Yellow
-            }
-        }
-    }
-}
-
 # 4. Re-register the Windows Update components (DLLs)
 Invoke-Task -Description 'Re-registering Windows Update components (DLLs)...' -ScriptBlock {
     $Dlls = @(
@@ -2136,6 +2074,28 @@ Invoke-Task -Description 'Checking hosts file for blocked Windows Update domains
     }
     else {
         Write-HostTimestamp '  No Windows Update domains are blocked in the hosts file.'
+    }
+}
+
+# Optionally flag the NTFS Transactional Resource Manager to auto-reset on next boot (experimental).
+# When the TRM is in a dirty or failed state from a previous crash, power loss, or incomplete
+# servicing operation, it can silently prevent Windows Update from staging files and block
+# component-store operations with cryptic errors (e.g. 0x800700b7, 0x80070570). Running
+# 'fsutil resource setautoreset true' tells the TRM to discard any incomplete transactions and
+# recover cleanly the next time Windows boots, rather than replaying potentially corrupt logs.
+# Unlike deleting transaction log files, this only sets a flag - it never touches files directly
+# and is safe to run from a live OS. The effect is deferred: a restart is required to take effect.
+if ($ResetTransactionManager) {
+    Invoke-Task -Description '[EXPERIMENTAL] Flagging NTFS Transactional Resource Manager to auto-reset on next boot...' -ScriptBlock {
+        try {
+            $null = & fsutil.exe resource setautoreset true "$env:SystemDrive\" 2>&1
+            Write-HostTimestamp "  NTFS TRM auto-reset enabled on $env:SystemDrive." -ForegroundColor Green
+            Write-HostTimestamp '  On the next boot the TRM will discard any incomplete transactions and start clean.' -ForegroundColor Cyan
+            Write-HostTimestamp '  A restart is required for this to take effect.' -ForegroundColor Yellow
+        }
+        catch {
+            Write-HostTimestamp "  Could not set TRM auto-reset (fsutil): $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 }
 

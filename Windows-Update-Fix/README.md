@@ -146,7 +146,7 @@ The script supports the following optional parameters:
 | `-ResetAllPolicies` | **Aggressive.** Also removes the broader Software Policies registry hive, not just the Windows Update keys. Automatically enabled by `-Remediate` when a system is classified as *severe*. |
 | `-IncludeGroupPolicyUsers` | Also clears the per-user Local Group Policy store (`C:\Windows\System32\GroupPolicyUsers`). Off by default to avoid wiping intentional per-user policy. |
 | `-RepairComponentStore` | Runs three steps to repair the component store (slow): first `DISM /StartComponentCleanup /ResetBase` to strip superseded components and collapse the store to the current baseline, then `DISM /RestoreHealth` to fix any corruption, then `SFC /scannow`. Automatically enabled by `-Remediate` when a system is classified as *severe*. |
-| `-CleanTransactionLogs` | **Experimental.** Deletes stale CLFS transaction log files (`.txr`, `.blf`, `.regtrans-ms`) from the SMI store (`System32\SMI\Store\Machine`) and registry TxR directory (`System32\config\TxR`). Orphaned transaction logs can cause persistent `0x80070003` component-store errors that block servicing. Only use this when standard repair steps have failed — deleting an in-progress transaction could corrupt the SMI store or registry hive. A restart is required afterward for Windows to rebuild the logs. |
+| `-ResetTransactionManager` | **Experimental.** Runs `fsutil resource setautoreset true C:\` to flag the NTFS Transactional Resource Manager (TRM) to auto-reset on the next boot. When the TRM is in a dirty or failed state from a previous crash or incomplete servicing operation, it can silently prevent Windows Update from staging files and block component-store operations. This flag tells the TRM to discard any incomplete transactions and recover cleanly on the next boot rather than replaying potentially corrupt logs. Unlike deleting transaction log files, this only sets a flag — it is safe to run from a live OS and does not touch any files. Requires a restart to take effect. |
 | `-SkipOnlineBuildDate` | Skips the online lookup of the current build's exact release date and KB article. The script resolves the build's release date/KB from the hardcoded `$KnownBuildReleases` table first and **only queries Microsoft online when the table cannot answer** (an unknown build line, or a revision newer than the table knows). This flag disables that online query entirely, leaving the offline table as the sole source. See [Build Date Lookup](#build-date-lookup). |
 | `-TriggerUpdateScan` | Triggers a fresh Windows Update detection scan after the fix. Automatically enabled by `-Remediate`. When used **without** `-InstallUpdates`, it also performs a quick read-only detection and prints what the scan found, so you can confirm the scan is actually picking up updates. See [Checking What a Scan Detects](#checking-what-a-scan-detects). |
 | `-InstallUpdates` | After the fix, searches for available updates via the WUA COM API, downloads and installs them, then reports per-update results (succeeded / failed / reboot required). See [Installing Updates](#installing-updates) for details. |
@@ -172,9 +172,6 @@ When it proceeds with a repair, the script performs the following actions in seq
 
 5.  **Reset the Windows Update Cache**
     *   Removes any leftover `.old_*` backups from previous runs, then clears the BITS transfer queue (`qmgr*.dat`) and renames `SoftwareDistribution` and `catroot2` to timestamped `.old_*` backups so Windows rebuilds them cleanly (falling back to clearing their contents if a rename is blocked).
-
-5b. **Delete Stale Transaction Log Files (Experimental, `-CleanTransactionLogs`)**
-    *   Deletes CLFS transaction log files (`.txr`, `.blf`, `.regtrans-ms`) from two locations: the SMI store (`System32\SMI\Store\Machine`) and the registry TxR directory (`System32\config\TxR`). Orphaned entries in these directories can produce persistent `0x80070003 / element not found` errors that block component-store servicing. **Only runs when `-CleanTransactionLogs` is explicitly passed** — this is an experimental step that could cause data loss if a transaction is genuinely in progress, so it is never run automatically.
 
 6.  **Re-register Windows Update Components**
     *   Re-registers the set of DLLs Windows Update depends on via `regsvr32 /s`.
@@ -213,13 +210,16 @@ When it proceeds with a repair, the script performs the following actions in seq
 11. **Check Hosts File for Blocked Windows Update Domains**
     *   Scans `C:\Windows\System32\drivers\etc\hosts` for entries matching Windows Update domains (`windowsupdate.com`, `update.microsoft.com`, `download.microsoft.com`, etc.). Some "privacy" tools and malware redirect these to `0.0.0.0` or `127.0.0.1`, silently preventing updates. The script reports any matches in red with instructions to remove them manually.
 
-12. **Repair the Component Store (Optional)**
+12. **Reset NTFS Transactional Resource Manager (Experimental, Optional)**
+    *   With `-ResetTransactionManager`, runs `fsutil resource setautoreset true C:\` to flag the NTFS TRM to auto-reset on the next boot. The TRM tracks file system transactions used by Windows servicing and the component store. If it is in a dirty state from a previous crash, power loss, or incomplete update, it can silently block Windows Update staging and produce cryptic errors like `0x800700b7` or `0x80070570`. Setting auto-reset causes the TRM to discard any incomplete transactions and start clean on the next boot rather than trying to replay corrupt logs. This is much safer than deleting transaction log files directly — it only sets a flag, does not modify any files, and is safe to run from a live OS. **Requires a restart to take effect.**
+
+13. **Repair the Component Store (Optional)**
     *   With `-RepairComponentStore` (or *severe* remediation), runs three steps in sequence:
         1. `DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase` — removes all superseded component versions and collapses the component store down to the current baseline. This eliminates stale or orphaned payloads that can cause `/RestoreHealth` to fail or take much longer, and it frees significant disk space. **Note:** this permanently removes the ability to uninstall previously-installed updates, so it only runs as part of the explicit component-store repair.
         2. `DISM /Online /Cleanup-Image /RestoreHealth` — repairs any corruption detected in the component store, downloading replacement files from Windows Update if needed.
         3. `SFC /scannow` — scans and repairs protected system files using the now-healthy component store as a source.
 
-13. **Trigger an Update Scan (Optional)**
+14. **Trigger an Update Scan (Optional)**
     *   With `-TriggerUpdateScan` (or any remediation), requests a fresh detection scan via `UsoClient StartScan` (with a COM fallback for older builds).
 
 ## Adaptive Remediation (Recommended)
