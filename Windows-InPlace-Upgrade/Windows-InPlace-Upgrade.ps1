@@ -720,6 +720,7 @@ $MountedImage = $null
 $SetupExitCode = $null
 $SetupStarted = $false
 $SetupOutcome = $null
+$CleanupScheduled = $false
 try {
     Invoke-Task -Description "Mounting the ISO: $ResolvedIso ..." -ScriptBlock {
         $script:MountedImage = Mount-DiskImage -ImagePath $ResolvedIso -PassThru -ErrorAction Stop
@@ -765,10 +766,25 @@ try {
         Write-HostTimestamp "  Running: $SetupExe $($SetupArguments -join ' ')"
         Write-HostTimestamp '  Setup runs directly from the mounted ISO and copies what it needs into $WINDOWS.~BT.' -ForegroundColor Yellow
         Write-HostTimestamp '  The ISO stays mounted while Setup runs. It takes 20-90 minutes and restarts the machine several times.' -ForegroundColor Yellow
+        Write-HostTimestamp '  Once Setup restarts the machine, any remaining steps in this script will not run - that is expected.' -ForegroundColor DarkGray
 
         # Launch Setup without blocking so we can actively monitor its progress in both modes.
         $Process = Start-Process -FilePath $SetupExe -ArgumentList $SetupArguments -PassThru -ErrorAction Stop
         Start-Sleep -Seconds 5
+
+        # IMPORTANT: from here on Setup can restart the machine at any time (unless -NoReboot), which can
+        # kill this script. Schedule the ISO cleanup NOW - before the monitoring loop that the reboot
+        # interrupts - so it is guaranteed to be registered even though later steps may never run.
+        if ($IsoWasDownloaded -and $ResolvedIso) {
+            try {
+                Register-IsoCleanupTask -IsoPath $ResolvedIso
+                $script:CleanupScheduled = $true
+                Write-HostTimestamp "  Scheduled a one-time task to delete the downloaded ISO after the upgrade completes: $ResolvedIso" -ForegroundColor Cyan
+            }
+            catch {
+                Write-HostTimestamp "  Could not schedule the ISO cleanup task: $($_.Exception.Message). Delete it manually later: $ResolvedIso" -ForegroundColor Yellow
+            }
+        }
 
         # Block here watching the Setup process until it completes (or the machine restarts). This does
         # not return until Setup is done, so the script never exits while the upgrade is still running.
@@ -782,6 +798,7 @@ try {
     $SetupExitCode = $script:SetupExitCode
     $SetupStarted = [bool]$script:SetupStarted
     $SetupOutcome = $script:SetupOutcome
+    if ($script:CleanupScheduled) { $CleanupScheduled = $true }
 }
 catch {
     Write-HostTimestamp "The in-place upgrade could not be started: $($_.Exception.Message)" -ForegroundColor Red
@@ -822,9 +839,10 @@ if ($SetupStarted) {
     Write-HostTimestamp 'NOTE: Windows Setup runs as its own process - closing this window will NOT stop the upgrade.' -ForegroundColor Cyan
 }
 
-# Schedule cleanup of the ISO - but ONLY when this run downloaded it (never an -IsoPath ISO or one that
-# was already sitting in the download folder). The task runs after the next boot, once Setup is done.
-if ($SetupStarted -and $IsoWasDownloaded -and $ResolvedIso) {
+# The ISO cleanup task is normally scheduled right after Setup launches (above), so it survives Setup's
+# automatic reboot. This is only a fallback for the rare case where we got here without it being
+# scheduled (e.g. -NoReboot and Setup exited before the launch block reached that point).
+if ($SetupStarted -and $IsoWasDownloaded -and $ResolvedIso -and -not $CleanupScheduled) {
     try {
         Register-IsoCleanupTask -IsoPath $ResolvedIso
         Write-HostTimestamp "Scheduled a one-time cleanup task to delete the downloaded ISO ($ResolvedIso) after the upgrade completes." -ForegroundColor Cyan
