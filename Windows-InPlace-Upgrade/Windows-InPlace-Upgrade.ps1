@@ -317,6 +317,176 @@ function Get-SetupArguments {
     return $SetupArgs
 }
 
+# Confirms the mounted drive really is Windows installation media before we launch Setup from it, so we
+# never hand a random/corrupt ISO to setup.exe. A valid Windows ISO has setup.exe at the root AND an OS
+# image at sources\install.wim (or install.esd). When DISM can read the image, its metadata is also used
+# to confirm it is a Windows image, to surface the editions inside, and to flag an architecture mismatch.
+# Returns a PSCustomObject: IsValid, ImagePath, Architecture, Editions, Reason.
+function Test-WindowsInstallMedia {
+    param(
+        [Parameter(Mandatory)][string]$DriveLetter,
+        [string]$ExpectedArchitecture
+    )
+
+    $Root = "$DriveLetter`:\"
+    $Result = [PSCustomObject]@{ IsValid = $false; ImagePath = $null; Architecture = $null; Editions = @(); Reason = $null }
+
+    if (-not (Test-Path -LiteralPath (Join-Path $Root 'setup.exe'))) {
+        $Result.Reason = 'setup.exe was not found at the root of the image.'
+        return $Result
+    }
+
+    $Wim = Join-Path $Root 'sources\install.wim'
+    $Esd = Join-Path $Root 'sources\install.esd'
+    $ImagePath = if (Test-Path -LiteralPath $Wim) { $Wim } elseif (Test-Path -LiteralPath $Esd) { $Esd } else { $null }
+    if (-not $ImagePath) {
+        $Result.Reason = 'No Windows OS image (sources\install.wim or sources\install.esd) was found - this is not a Windows installation ISO.'
+        return $Result
+    }
+    $Result.ImagePath = $ImagePath
+
+    # Best-effort metadata read. If DISM cannot parse it we still accept the media (setup.exe + install
+    # image are present), but a successful read lets us confirm the architecture and list editions.
+    try {
+        $Images = Get-WindowsImage -ImagePath $ImagePath -ErrorAction Stop
+        if ($Images) {
+            $Result.Editions = @($Images | ForEach-Object { $_.ImageName } | Where-Object { $_ })
+            $ArchCode = ($Images | Select-Object -First 1).Architecture
+            $Result.Architecture = switch ($ArchCode) {
+                0       { 'x86' }
+                9       { 'x64' }
+                12      { 'arm64' }
+                default { "code $ArchCode" }
+            }
+        }
+    }
+    catch {
+        $Result.Reason = "Could not read image metadata via DISM ($($_.Exception.Message)); proceeding on the presence of setup.exe and the install image."
+    }
+
+    $Result.IsValid = $true
+    return $Result
+}
+
+# Returns $true if any Windows Setup process is currently running. Setup.exe is only a small launcher
+# that spawns the real long-running workers, so we watch for the whole family, not just setup.exe.
+function Test-SetupRunning {
+    $Names = @('setup', 'SetupHost', 'SetupPrep', 'SetupPlatform', 'Windows10UpgraderApp')
+    return [bool](Get-Process -Name $Names -ErrorAction SilentlyContinue)
+}
+
+# Returns $true if Windows currently has a pending-reboot indicator set. Setup sets these once the
+# down-level (pre-restart) phase finishes and it is ready to reboot to continue the upgrade.
+function Test-PendingReboot {
+    $Keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootInProgress',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+    foreach ($Key in $Keys) { if (Test-Path $Key) { return $true } }
+    try {
+        $Pfro = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue).PendingFileRenameOperations
+        if ($Pfro) { return $true }
+    }
+    catch { }
+    return $false
+}
+
+# Watches the Windows Setup process family and does NOT return until Setup has finished running (the
+# whole family has exited) or the safety timeout is reached. Along the way it parses the live
+# setupact.log and reports the overall percentage. Because Setup restarts the machine automatically at
+# the end of the down-level phase (unless -NoReboot), this call typically blocks until that restart
+# terminates the session; with -NoReboot it blocks until Setup exits so the script never quits early.
+# Returns a PSCustomObject: Progressed, RebootPending, LastProgress. Never throws.
+function Watch-SetupProgress {
+    param(
+        [int]$TimeoutMinutes = 180,
+        [int]$StartupGraceMinutes = 5
+    )
+
+    $PantherDirs = @(
+        (Join-Path -Path $env:SystemDrive -ChildPath '$WINDOWS.~BT\Sources\Panther'),
+        (Join-Path -Path $env:windir -ChildPath 'Panther')
+    )
+    $Deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    $StartupDeadline = (Get-Date).AddMinutes($StartupGraceMinutes)
+    $LastProgress = -1
+    $Progressed = $false
+    $RebootPending = $false
+    $SawSetup = $false
+    $LogFile = $null
+
+    $ReadProgress = {
+        # Resolve/refresh the active setupact.log (newest one Setup is writing to) and print any new %.
+        if (-not $LogFile -or -not (Test-Path -LiteralPath $LogFile)) {
+            foreach ($Dir in $PantherDirs) {
+                if (Test-Path $Dir) {
+                    $Found = Get-ChildItem -Path $Dir -Filter 'setupact.log' -File -ErrorAction SilentlyContinue |
+                        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                    if ($Found) { $script:_WatchLogFile = $Found.FullName; break }
+                }
+            }
+            if ($script:_WatchLogFile) { $LogFile = $script:_WatchLogFile }
+        }
+        if ($LogFile -and (Test-Path -LiteralPath $LogFile)) {
+            try {
+                $Content = Get-Content -LiteralPath $LogFile -Raw -ErrorAction SilentlyContinue
+                if ($Content) {
+                    $ProgressMatches = [regex]::Matches($Content, 'Overall progress:\s*\[(\d+)%\]')
+                    if ($ProgressMatches.Count -gt 0) {
+                        $Pct = [int]$ProgressMatches[$ProgressMatches.Count - 1].Groups[1].Value
+                        if ($Pct -ne $script:_WatchLastProgress) {
+                            $script:_WatchLastProgress = $Pct
+                            Write-HostTimestamp "    Setup progress: $Pct%"
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+    $script:_WatchLastProgress = -1
+    $script:_WatchLogFile = $null
+
+    Write-HostTimestamp '  Monitoring the Setup process - this window will not exit until Setup completes...' -ForegroundColor Cyan
+
+    # Phase 1: wait for a Setup process to appear (Setup.exe extracts and spawns its workers first).
+    while (-not (Test-SetupRunning) -and (Get-Date) -lt $StartupDeadline) {
+        & $ReadProgress
+        if ($script:_WatchLastProgress -ge 0) { break }  # progress already means Setup is underway
+        Start-Sleep -Seconds 5
+    }
+    if (Test-SetupRunning) { $SawSetup = $true }
+
+    # Phase 2: keep watching until the Setup process family has fully exited (Setup completed), reporting
+    # progress as it advances. Do NOT stop on the first pending-reboot signal - stay until Setup is gone.
+    while ((Get-Date) -lt $Deadline) {
+        & $ReadProgress
+        if (Test-SetupRunning) {
+            $SawSetup = $true
+        }
+        elseif ($SawSetup) {
+            # Setup was running and is now gone -> it has finished (or triggered the restart).
+            break
+        }
+        elseif ($script:_WatchLastProgress -lt 0 -and (Get-Date) -ge $StartupDeadline) {
+            # Setup never appeared and no progress within the grace window -> it did not start.
+            break
+        }
+        if (Test-PendingReboot) { $RebootPending = $true }
+        Start-Sleep -Seconds 15
+    }
+
+    $LastProgress = $script:_WatchLastProgress
+    $Progressed = ($SawSetup -or $LastProgress -ge 0)
+    if (-not $RebootPending) { $RebootPending = (Test-PendingReboot) }
+
+    if ($SawSetup) {
+        Write-HostTimestamp "  Setup has finished running$(if ($LastProgress -ge 0) { " (last reported progress: $LastProgress%)" })." -ForegroundColor Green
+    }
+    return [PSCustomObject]@{ Progressed = $Progressed; RebootPending = $RebootPending; LastProgress = $LastProgress }
+}
+
 Write-Host $LineBreak
 Write-HostTimestamp "Windows In-Place Upgrade (repair install) on $($env:ComputerName)" -ForegroundColor Cyan
 Write-Host $LineBreak
@@ -340,15 +510,27 @@ if ($null -eq $FreeGB) {
 }
 else {
     Write-HostTimestamp "Free space on $env:SystemDrive : $FreeGB GB"
+
+    # A leftover $WINDOWS.~BT folder from a previous/pending upgrade already holds the staged OS payload.
+    # Windows Setup reuses/replaces it, so the space it occupies is effectively available to this upgrade.
+    # Make a conservative judgement call that it is worth at least 10 GB and credit that toward free space.
+    $EffectiveFreeGB = $FreeGB
+    $BtFolder = Join-Path -Path $env:SystemDrive -ChildPath '$WINDOWS.~BT'
+    if (-not $DownloadOnly -and (Test-Path -LiteralPath $BtFolder)) {
+        $BtCreditGB = 10
+        $EffectiveFreeGB = [math]::Round($FreeGB + $BtCreditGB, 2)
+        Write-HostTimestamp "  Found an existing $BtFolder folder from a prior upgrade; Setup will reuse it. Crediting ~$BtCreditGB GB toward the space requirement (effective free: $EffectiveFreeGB GB)." -ForegroundColor DarkGray
+    }
+
     # Only the ISO is needed when we are just downloading; the full upgrade needs much more headroom.
     $RequiredGB = if ($DownloadOnly -or $IsoPath) { 8 } else { 20 }
-    if ($FreeGB -lt $RequiredGB) {
-        Write-HostTimestamp "CRITICAL: Less than $RequiredGB GB of free disk space ($FreeGB GB). An in-place upgrade cannot complete reliably. Free up space and try again." -ForegroundColor Red
+    if ($EffectiveFreeGB -lt $RequiredGB) {
+        Write-HostTimestamp "CRITICAL: Less than $RequiredGB GB of free disk space ($EffectiveFreeGB GB effective). An in-place upgrade cannot complete reliably. Free up space and try again." -ForegroundColor Red
         Stop-Transcript | Out-Null
         exit 1
     }
-    elseif (-not $DownloadOnly -and $FreeGB -lt 25) {
-        Write-HostTimestamp "WARNING: Free disk space is a little tight ($FreeGB GB). The upgrade should still work, but 25 GB+ is recommended." -ForegroundColor Yellow
+    elseif (-not $DownloadOnly -and $EffectiveFreeGB -lt 25) {
+        Write-HostTimestamp "WARNING: Free disk space is a little tight ($EffectiveFreeGB GB effective). The upgrade should still work, but 25 GB+ is recommended." -ForegroundColor Yellow
     }
 }
 Write-Host $LineBreak
@@ -475,6 +657,8 @@ if ($DownloadOnly) {
 # --- Mount the ISO and launch Setup ---
 $MountedImage = $null
 $SetupExitCode = $null
+$SetupStarted = $false
+$SetupOutcome = $null
 try {
     Invoke-Task -Description "Mounting the ISO: $ResolvedIso ..." -ScriptBlock {
         $script:MountedImage = Mount-DiskImage -ImagePath $ResolvedIso -PassThru -ErrorAction Stop
@@ -491,52 +675,86 @@ try {
     if (-not $DriveLetter) {
         throw "Could not determine the drive letter of the mounted ISO."
     }
-    $SetupExe = "$($DriveLetter):\setup.exe"
     Write-HostTimestamp "  ISO mounted at $($DriveLetter):\" -ForegroundColor Green
 
-    if (-not (Test-Path -LiteralPath $SetupExe)) {
-        throw "setup.exe was not found on the mounted ISO ($SetupExe). The ISO may be corrupt or not a Windows installation image."
+    # Verify this really is Windows installation media before handing it to Setup.
+    Invoke-Task -Description 'Verifying the ISO is valid Windows installation media...' -ScriptBlock {
+        $script:Media = Test-WindowsInstallMedia -DriveLetter $DriveLetter -ExpectedArchitecture $WinInfo.Architecture
+        if (-not $script:Media.IsValid) {
+            throw "The mounted image is not a valid Windows ISO: $($script:Media.Reason)"
+        }
+        Write-HostTimestamp "  Verified: found setup.exe and $(Split-Path -Leaf $script:Media.ImagePath)." -ForegroundColor Green
+        if ($script:Media.Architecture) {
+            Write-HostTimestamp "  Image architecture: $($script:Media.Architecture)"
+            if ($script:Media.Architecture -notmatch '^code ' -and $script:Media.Architecture -ne $WinInfo.Architecture) {
+                Write-HostTimestamp "  WARNING: the ISO architecture ($($script:Media.Architecture)) does not match this PC ($($WinInfo.Architecture)). An in-place upgrade requires a matching architecture and will likely be refused." -ForegroundColor Yellow
+            }
+        }
+        if ($script:Media.Editions.Count -gt 0) {
+            Write-HostTimestamp "  Editions in image: $($script:Media.Editions -join ', ')"
+        }
+        if ($script:Media.Reason) {
+            Write-HostTimestamp "  Note: $($script:Media.Reason)" -ForegroundColor DarkGray
+        }
     }
 
+    $SetupExe = "$($DriveLetter):\setup.exe"
     $SetupArguments = Get-SetupArguments
     Invoke-Task -Description 'Launching Windows Setup for the in-place upgrade...' -ScriptBlock {
         Write-HostTimestamp "  Running: $SetupExe $($SetupArguments -join ' ')"
-        Write-HostTimestamp '  Setup will now take over. It runs for 20-90 minutes and restarts the machine several times.' -ForegroundColor Yellow
-        if ($Unattended) {
-            # Silent/automated: wait for the setup launcher to hand off, then report its initial exit code.
-            $Process = Start-Process -FilePath $SetupExe -ArgumentList $SetupArguments -PassThru -Wait -ErrorAction Stop
-            $script:SetupExitCode = $Process.ExitCode
-        }
-        else {
-            # Interactive: launch Setup and let it drive its own UI/restarts; do not block this window.
-            Start-Process -FilePath $SetupExe -ArgumentList $SetupArguments -ErrorAction Stop
-            $script:SetupExitCode = 0
-        }
+        Write-HostTimestamp '  Setup runs directly from the mounted ISO and copies what it needs into $WINDOWS.~BT.' -ForegroundColor Yellow
+        Write-HostTimestamp '  The ISO stays mounted while Setup runs. It takes 20-90 minutes and restarts the machine several times.' -ForegroundColor Yellow
+
+        # Launch Setup without blocking so we can actively monitor its progress in both modes.
+        $Process = Start-Process -FilePath $SetupExe -ArgumentList $SetupArguments -PassThru -ErrorAction Stop
+        Start-Sleep -Seconds 5
+
+        # Block here watching the Setup process until it completes (or the machine restarts). This does
+        # not return until Setup is done, so the script never exits while the upgrade is still running.
+        $Outcome = Watch-SetupProgress
+        $script:SetupOutcome = $Outcome
+        $script:SetupExitCode = try { if ($Process.HasExited) { $Process.ExitCode } else { $null } } catch { $null }
+
+        # Setup is considered started if it ever ran / made progress / left a pending reboot.
+        $script:SetupStarted = ($Outcome.Progressed -or $Outcome.RebootPending -or (Test-SetupRunning))
     }
     $SetupExitCode = $script:SetupExitCode
+    $SetupStarted = [bool]$script:SetupStarted
+    $SetupOutcome = $script:SetupOutcome
 }
 catch {
     Write-HostTimestamp "The in-place upgrade could not be started: $($_.Exception.Message)" -ForegroundColor Red
+    $SetupStarted = $false
 }
 finally {
-    # If Setup did not take over (error, or -NoReboot/quiet returned), dismount the ISO so it is not left
-    # mounted. When Setup runs interactively and continues in the background, we intentionally leave the
-    # ISO mounted until the machine restarts.
-    if ($MountedImage -and ($Unattended -or $SetupExitCode -ne 0 -or -not $SetupExitCode)) {
+    # Only dismount if Setup did NOT start. When Setup is running it copies everything it needs from the
+    # mounted ISO into $WINDOWS.~BT, so the ISO MUST stay mounted for the upgrade to complete - do not
+    # dismount it here on success. Windows releases the mount automatically on the next restart.
+    if ($MountedImage -and -not $SetupStarted) {
         try {
             Dismount-DiskImage -ImagePath $ResolvedIso -ErrorAction SilentlyContinue | Out-Null
-            Write-HostTimestamp 'Dismounted the ISO.'
+            Write-HostTimestamp 'Setup did not start - dismounted the ISO.' -ForegroundColor Yellow
         }
         catch { }
     }
 }
 
-if ($null -ne $SetupExitCode -and $SetupExitCode -ne 0) {
-    Write-HostTimestamp "Windows Setup returned exit code $SetupExitCode. The upgrade may not have started successfully - check C:\`$WINDOWS.~BT\Sources\Panther\setupact.log for details." -ForegroundColor Yellow
+if (-not $SetupStarted) {
+    $ExitNote = if ($null -ne $SetupExitCode) { " (exit code $SetupExitCode)" } else { '' }
+    Write-HostTimestamp "Windows Setup did not start or did not make progress$ExitNote. Check C:\`$WINDOWS.~BT\Sources\Panther\setupact.log for details." -ForegroundColor Yellow
+}
+elseif ($SetupOutcome -and $SetupOutcome.RebootPending) {
+    Write-HostTimestamp 'Windows Setup finished its down-level phase and a restart is required to continue the upgrade.' -ForegroundColor Green
+    if ($NoReboot) {
+        Write-Host 'Restart the computer when ready to let Setup finish the upgrade.'
+    }
+    else {
+        Write-Host 'The computer will restart automatically to continue. Do not power it off during the upgrade.'
+    }
 }
 else {
-    Write-HostTimestamp 'Windows Setup has started the in-place upgrade.' -ForegroundColor Green
-    Write-Host 'The computer will restart several times. Do not power it off during the upgrade.'
+    Write-HostTimestamp 'Windows Setup has finished running.' -ForegroundColor Green
+    Write-Host 'If the upgrade did not complete, check C:\$WINDOWS.~BT\Sources\Panther\setupact.log.'
 }
 
 Write-HostTimestamp 'Windows In-Place Upgrade script finished.' -ForegroundColor Green
