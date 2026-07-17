@@ -62,6 +62,9 @@ param(
     [Parameter(HelpMessage = 'Show the Windows Setup GUI. By default Setup runs with its GUI hidden (/quiet)')]
     [switch]$ShowUI,
 
+    [Parameter(HelpMessage = 'Bypass the Windows 11 hardware compatibility checks (TPM/CPU/RAM) on incompatible machines using Setup''s /product server switch')]
+    [switch]$BypassCompatChecks,
+
     [Parameter(HelpMessage = 'Override the URL used to fetch the Fido download helper')]
     [string]$FidoUrl = 'https://github.com/pbatard/Fido/raw/master/Fido.ps1',
 
@@ -307,6 +310,10 @@ function Get-SetupArguments {
         'KeepAll'     { }  # /auto upgrade already keeps apps + data
         'KeepNothing' { $SetupArgs = @('/auto', 'clean', '/eula', 'accept', '/compat', 'ignorewarning', '/showoobe', 'none') }
     }
+
+    # /product server makes Setup run as the Server SKU installer, which skips the Windows 11 hardware
+    # compatibility checks (TPM 2.0, Secure Boot, supported CPU, RAM) so incompatible PCs can upgrade.
+    if ($BypassCompatChecks) { $SetupArgs += @('/product', 'server') }
 
     if ($DynamicUpdate) { $SetupArgs += @('/dynamicupdate', 'enable') }
     else                { $SetupArgs += @('/dynamicupdate', 'disable') }
@@ -557,6 +564,7 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $DownloadOnly) {
         'KeepNothing' { Write-Host "      -> CLEAN install: apps, settings, and files are NOT kept" -ForegroundColor Red }
     }
     if ($DynamicUpdate) { Write-Host "  - Let Setup pull the latest fixes online first (Dynamic Update)" }
+    if ($BypassCompatChecks) { Write-Host "  - Bypass the Windows 11 hardware compatibility checks (/product server) - for incompatible PCs" -ForegroundColor Yellow }
     Write-Host ""
     Write-Host "The upgrade takes 20-90 minutes and WILL RESTART the computer several times." -ForegroundColor Yellow
     Write-Host "Close your apps and save your work before continuing." -ForegroundColor Yellow

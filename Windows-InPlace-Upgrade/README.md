@@ -115,6 +115,7 @@ powershell -ExecutionPolicy Bypass -File $d -DownloadPath 'C:\ISO'
 | `-NoReboot` | Prevents Setup from restarting automatically at the end (`/noreboot`). |
 | `-DynamicUpdate` | Enables Dynamic Update so Setup pulls the latest fixes online before upgrading (disabled by default). |
 | `-ShowUI` | Shows the Windows Setup GUI. By default Setup runs with its GUI hidden (`/quiet`). |
+| `-BypassCompatChecks` | Bypasses the Windows 11 hardware compatibility checks (TPM 2.0, Secure Boot, supported CPU, RAM) on incompatible machines using Setup's `/product server` switch. |
 | `-FidoUrl` | Override the URL used to fetch the Fido download helper. |
 | `-LogPath` | Directory to write log files to (defaults to the script folder). |
 | `-SkipInteractive` | Skips the interactive confirmation prompt (still shows output). |
