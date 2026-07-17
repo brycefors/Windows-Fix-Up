@@ -56,6 +56,12 @@ param(
     [Parameter(HelpMessage = 'Which edition inside install.wim to service: "All" (default) or an edition name like "Windows 11 Pro"')]
     [string]$Edition = 'All',
 
+    [Parameter(HelpMessage = 'Editions to KEEP in the final ISO, removing the rest to slim it down. Accepts edition names like "Windows 11 Pro" (partial matches allowed) or index numbers, comma-separated. Defaults to keeping all editions')]
+    [string[]]$KeepEditions,
+
+    [Parameter(HelpMessage = 'Only list the editions/indexes inside the ISO''s install.wim and exit (does not download updates or build anything). Useful for choosing -Edition/-KeepEditions values')]
+    [switch]$ListEditions,
+
     [Parameter(HelpMessage = 'Folder containing your own .msu/.cab update packages to integrate instead of fetching from the Microsoft Update Catalog')]
     [string]$UpdatePath,
 
@@ -362,44 +368,51 @@ function Search-UpdateCatalog {
     $Html = $Response.Content
     $Results = New-Object System.Collections.Generic.List[object]
 
-    # Each result row exposes a hidden anchor with id "<GUID>_link" whose text is the update title. The
-    # surrounding <tr id="<GUID>"> row contains cells for the last-updated date and size.
-    $RowMatches = [regex]::Matches($Html, '(?s)<tr[^>]*id="([0-9a-fA-F-]{36})"[^>]*>(.*?)</tr>')
-    foreach ($Row in $RowMatches) {
-        $Guid = $Row.Groups[1].Value
-        $RowHtml = $Row.Groups[2].Value
+    # The catalog renders each result as an anchor  <a id='<GUID>_link' ...>Title</a>  (note the SINGLE
+    # quotes), and its column values live in separate cells whose ids follow the pattern
+    # "<GUID>_C<col>_R<row>" - C1=Title, C3=Classification, C4=Last Updated, C6=Size. We find every result
+    # by its "_link" anchor, then read that GUID's date/size/classification cells by id.
+    $LinkMatches = [regex]::Matches($Html, "(?s)id=['`"]([0-9a-fA-F-]{36})_link['`"][^>]*>(.*?)</a>")
+    foreach ($Link in $LinkMatches) {
+        $Guid = $Link.Groups[1].Value
+        $Title = [System.Net.WebUtility]::HtmlDecode((([regex]::Replace($Link.Groups[2].Value, '<[^>]+>', ' ')).Trim() -replace '\s+', ' '))
+        $EscGuid = [regex]::Escape($Guid)
 
-        $TitleMatch = [regex]::Match($RowHtml, '(?s)id="[0-9a-fA-F-]{36}_link"[^>]*>(.*?)</a>')
-        if (-not $TitleMatch.Success) { continue }
-        $Title = ([regex]::Replace($TitleMatch.Groups[1].Value, '<[^>]+>', '')).Trim()
-        $Title = [System.Net.WebUtility]::HtmlDecode($Title)
-
-        # Pull the plain-text values out of the row's cells for date and size.
-        $Cells = [regex]::Matches($RowHtml, '(?s)<td[^>]*>(.*?)</td>') | ForEach-Object {
-            [System.Net.WebUtility]::HtmlDecode(([regex]::Replace($_.Groups[1].Value, '<[^>]+>', '')).Trim())
+        # Helper to read the visible text of a specific column cell for this GUID.
+        $GetCell = {
+            param([int]$Col)
+            $M = [regex]::Match($Html, "(?s)id=`"${EscGuid}_C${Col}_R\d+`"[^>]*>(.*?)</td>")
+            if ($M.Success) {
+                return [System.Net.WebUtility]::HtmlDecode((([regex]::Replace($M.Groups[1].Value, '<[^>]+>', ' ')).Trim() -replace '\s+', ' '))
+            }
+            return $null
         }
 
+        $Classification = & $GetCell 3
+        $DateText = & $GetCell 4
+        $SizeText = & $GetCell 6
+
         $LastUpdated = $null
+        if ($DateText -and $DateText -match '(\d{1,2}/\d{1,2}/\d{4})') {
+            try { $LastUpdated = [datetime]::Parse($Matches[1]) } catch { }
+        }
+
         $SizeMB = $null
-        foreach ($Cell in $Cells) {
-            if ($null -eq $LastUpdated -and $Cell -match '^\d{1,2}/\d{1,2}/\d{4}$') {
-                try { $LastUpdated = [datetime]::Parse($Cell) } catch { }
-            }
-            if ($null -eq $SizeMB -and $Cell -match '([\d.,]+)\s*(KB|MB|GB)') {
-                $Value = [double]($Matches[1] -replace ',', '')
-                $SizeMB = switch ($Matches[2]) {
-                    'KB' { [math]::Round($Value / 1024, 2) }
-                    'MB' { $Value }
-                    'GB' { [math]::Round($Value * 1024, 2) }
-                }
+        if ($SizeText -and $SizeText -match '([\d.,]+)\s*(KB|MB|GB)') {
+            $Value = [double]($Matches[1] -replace ',', '')
+            $SizeMB = switch ($Matches[2]) {
+                'KB' { [math]::Round($Value / 1024, 2) }
+                'MB' { $Value }
+                'GB' { [math]::Round($Value * 1024, 2) }
             }
         }
 
         $Results.Add([PSCustomObject]@{
-            Guid        = $Guid
-            Title       = $Title
-            LastUpdated = $LastUpdated
-            SizeMB      = $SizeMB
+            Guid           = $Guid
+            Title          = $Title
+            Classification = $Classification
+            LastUpdated    = $LastUpdated
+            SizeMB         = $SizeMB
         })
     }
 
@@ -437,6 +450,8 @@ function Get-LatestCatalogPackage {
     param(
         [Parameter(Mandatory)][string]$Query,
         [Parameter(Mandatory)][string]$DownloadDir,
+        [string]$TitleInclude,   # regex the title MUST match (e.g. cumulative update wording)
+        [string]$TitleExclude,   # regex the title must NOT match (e.g. ".net", "dynamic")
         [switch]$AllowPreview
     )
 
@@ -446,12 +461,17 @@ function Get-LatestCatalogPackage {
         Write-HostTimestamp '  No catalog results were returned for that query.' -ForegroundColor Yellow
         return $null
     }
+    Write-HostTimestamp "  Found $($Results.Count) catalog result(s); selecting the best match..."
 
-    # Exclude Dynamic Update and (unless asked) Preview packages, then take the newest by date.
-    $Filtered = $Results |
-        Where-Object { $_.Title -notmatch '(?i)dynamic update' } |
-        Where-Object { $AllowPreview -or ($_.Title -notmatch '(?i)preview') }
-    if (-not $Filtered) { $Filtered = $Results }
+    # Narrow to the packages we actually want, then take the newest by date (largest as a tie-break).
+    $Filtered = $Results
+    if ($TitleInclude) { $Filtered = $Filtered | Where-Object { $_.Title -match $TitleInclude } }
+    if ($TitleExclude) { $Filtered = $Filtered | Where-Object { $_.Title -notmatch $TitleExclude } }
+    if (-not $AllowPreview) { $Filtered = $Filtered | Where-Object { $_.Title -notmatch '(?i)preview' } }
+    if (-not $Filtered) {
+        Write-HostTimestamp '  No catalog results matched the expected update type after filtering.' -ForegroundColor Yellow
+        return $null
+    }
 
     $Selected = $Filtered |
         Sort-Object -Property @{ Expression = { $_.LastUpdated }; Descending = $true }, @{ Expression = { $_.SizeMB }; Descending = $true } |
@@ -462,37 +482,71 @@ function Get-LatestCatalogPackage {
     }
 
     Write-HostTimestamp "  Selected: $($Selected.Title)$(if ($Selected.LastUpdated) { " (released $($Selected.LastUpdated.ToString('yyyy-MM-dd')))" })" -ForegroundColor Green
-    $Urls = Get-UpdateCatalogDownloadUrl -Guid $Selected.Guid
-    $Url = $Urls | Where-Object { $_ -match '\.(msu|cab)(\?|$)' } | Select-Object -First 1
-    if (-not $Url) { $Url = $Urls | Select-Object -First 1 }
-    if (-not $Url) {
+
+    # A single catalog entry can resolve to MULTIPLE .msu files. For Windows 11 24H2/25H2, Microsoft uses
+    # "checkpoint cumulative updates": the latest LCU download also includes one or more baseline/checkpoint
+    # packages that MUST be integrated first. So download every file the dialog returns and order them so
+    # the checkpoint/baseline packages come before the main LCU (identified by the KB in the title).
+    $Urls = @(Get-UpdateCatalogDownloadUrl -Guid $Selected.Guid)
+    $FileUrls = @($Urls | Where-Object { $_ -match '\.(msu|cab)(\?|$)' })
+    if (-not $FileUrls) { $FileUrls = $Urls }
+    if (-not $FileUrls -or $FileUrls.Count -eq 0) {
         Write-HostTimestamp '  The catalog did not return a download URL for the selected update.' -ForegroundColor Yellow
         return $null
     }
 
-    if (-not (Test-MicrosoftDownloadUrl -Url $Url)) {
-        $BadHost = try { ([Uri]$Url).Host } catch { '(unparseable)' }
-        Write-HostTimestamp "  The update download URL does not point at an official Microsoft host (host: $BadHost). Refusing to download it." -ForegroundColor Red
+    $PrimaryKb = if ($Selected.Title -match '(?i)KB(\d{6,})') { $Matches[1] } else { $null }
+
+    # Helper: extract the numeric KB from a URL/filename for ordering (checkpoints ascending, LCU last).
+    $GetKb = { param($Text) if ($Text -match '(?i)kb(\d{6,})') { [int]$Matches[1] } else { 0 } }
+
+    $Downloaded = New-Object System.Collections.Generic.List[object]
+    foreach ($Url in $FileUrls) {
+        if (-not (Test-MicrosoftDownloadUrl -Url $Url)) {
+            $BadHost = try { ([Uri]$Url).Host } catch { '(unparseable)' }
+            Write-HostTimestamp "  Skipping a download URL that is not an official Microsoft host (host: $BadHost)." -ForegroundColor Yellow
+            continue
+        }
+
+        $FileName = $null
+        try { $FileName = [System.IO.Path]::GetFileName(([Uri]$Url).AbsolutePath) } catch { }
+        if (-not $FileName) { $FileName = "$($Selected.Guid)_$(& $GetKb $Url).msu" }
+        $Destination = Join-Path -Path $DownloadDir -ChildPath $FileName
+
+        if (Test-Path -LiteralPath $Destination) {
+            Write-HostTimestamp "  Already downloaded - reusing: $FileName" -ForegroundColor DarkGray
+        }
+        else {
+            Write-HostTimestamp "  Downloading $FileName ..."
+            if (-not (Get-FileDownload -Url $Url -Destination $Destination)) {
+                Write-HostTimestamp "  Failed to download $FileName." -ForegroundColor Red
+                return $null
+            }
+            Write-HostTimestamp "    Downloaded ($([math]::Round((Get-Item -LiteralPath $Destination).Length / 1MB, 1)) MB)." -ForegroundColor Green
+        }
+
+        $Kb = & $GetKb $FileName
+        $IsPrimary = ($PrimaryKb -and $FileName -match "(?i)kb$PrimaryKb")
+        $Downloaded.Add([PSCustomObject]@{ Path = $Destination; Kb = $Kb; IsPrimary = [bool]$IsPrimary })
+    }
+
+    if ($Downloaded.Count -eq 0) {
+        Write-HostTimestamp '  No update packages could be downloaded.' -ForegroundColor Red
         return $null
     }
 
-    $FileName = $null
-    try { $FileName = [System.IO.Path]::GetFileName(([Uri]$Url).AbsolutePath) } catch { }
-    if (-not $FileName) { $FileName = "$($Selected.Guid).msu" }
-    $Destination = Join-Path -Path $DownloadDir -ChildPath $FileName
-
-    if (Test-Path -LiteralPath $Destination) {
-        Write-HostTimestamp "  Already downloaded - reusing: $Destination" -ForegroundColor DarkGray
-        return $Destination
+    # Order: non-primary (checkpoints/SSU) first (oldest KB first), then the primary LCU last. If we could
+    # not identify the primary KB, fall back to plain KB-ascending order.
+    $Ordered = @(
+        ($Downloaded | Where-Object { -not $_.IsPrimary } | Sort-Object Kb)
+        ($Downloaded | Where-Object { $_.IsPrimary } | Sort-Object Kb)
+    )
+    if ($Downloaded.Count -gt 1) {
+        Write-HostTimestamp "  This update includes $($Downloaded.Count) package(s); they will be integrated in this order:"
+        $Ordered | ForEach-Object { Write-HostTimestamp "    - $(Split-Path -Leaf $_.Path)$(if ($_.IsPrimary) { ' (main cumulative update)' })" }
     }
 
-    Write-HostTimestamp "  Downloading update to $Destination ..."
-    if (-not (Get-FileDownload -Url $Url -Destination $Destination)) {
-        Write-HostTimestamp '  Failed to download the update package.' -ForegroundColor Red
-        return $null
-    }
-    Write-HostTimestamp "  Downloaded ($([math]::Round((Get-Item -LiteralPath $Destination).Length / 1MB, 1)) MB)." -ForegroundColor Green
-    return $Destination
+    return @($Ordered | ForEach-Object { $_.Path })
 }
 
 # Locates oscdimg.exe (from the Windows ADK Deployment Tools), which is required to recompile the ISO.
@@ -564,21 +618,146 @@ function Get-ShortPath {
     return $Path
 }
 
+# Resolves a list of edition tokens (edition names, partial names, or index numbers) to the matching
+# install.wim image indexes. Returns the distinct, sorted indexes that matched. Unmatched tokens are
+# reported via the [ref]$Unmatched list so the caller can decide whether to fail.
+function Resolve-EditionIndexes {
+    param(
+        [Parameter(Mandatory)][object[]]$Images,
+        [Parameter(Mandatory)][string[]]$Tokens,
+        [ref]$Unmatched
+    )
+    $Matched = New-Object System.Collections.Generic.List[int]
+    $NoMatch = New-Object System.Collections.Generic.List[string]
+    foreach ($Token in $Tokens) {
+        $T = "$Token".Trim()
+        if (-not $T) { continue }
+        $Found = $null
+        if ($T -match '^\d+$') {
+            $Found = $Images | Where-Object { $_.ImageIndex -eq [int]$T }
+        }
+        else {
+            $Found = $Images | Where-Object { $_.ImageName -eq $T }
+            if (-not $Found) { $Found = $Images | Where-Object { $_.ImageName -like "*$T*" } }
+        }
+        if ($Found) { $Found | ForEach-Object { [void]$Matched.Add([int]$_.ImageIndex) } }
+        else { [void]$NoMatch.Add($T) }
+    }
+    if ($Unmatched) { $Unmatched.Value = $NoMatch }
+    return ($Matched | Sort-Object -Unique)
+}
+
+# Ensures a mount directory is clean and ready to receive a fresh WIM mount. A previous run that crashed
+# or was killed can leave an image still mounted (or a corrupt mount point) there, which makes the next
+# Mount-WindowsImage fail with "attempted to mount to a directory that is not empty". This discards any
+# image still mounted at the path, clears stale/corrupt mount state, then recreates the empty directory.
+function Reset-MountDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $Normalized = $Path.TrimEnd('\')
+    try {
+        $Mounted = Get-WindowsImage -Mounted -ErrorAction SilentlyContinue
+        foreach ($M in $Mounted) {
+            if ($M.Path -and ($M.Path.TrimEnd('\') -ieq $Normalized)) {
+                Write-HostTimestamp "    A previous run left an image mounted here - discarding it: $Path" -ForegroundColor Yellow
+                Dismount-WindowsImage -Path $Path -Discard -ErrorAction SilentlyContinue | Out-Null
+            }
+        }
+    }
+    catch { }
+
+    # Clear any stale/corrupt mount points DISM is still tracking.
+    try { Clear-WindowsCorruptMountPoint -ErrorAction SilentlyContinue | Out-Null } catch { }
+
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    # If a discarded mount is still releasing, a short pause and retry usually clears it.
+    if (Test-Path -LiteralPath $Path) {
+        Start-Sleep -Seconds 2
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+}
+
 # Applies a set of update packages to a mounted image directory with DISM, reporting per-package results.
+# Packages are applied in the order given (checkpoint/SSU baselines first, the main LCU last).
+#
+# .msu files are applied directly first; if DISM rejects the .msu wrapper (a known failure that surfaces as
+# 0x800401e3 "An error occurred applying the Unattend.xml file from the .msu package"), the .msu is expanded
+# and its inner .cab payload is applied instead - the servicing-stack (SSU) .cab before the main .cab.
 function Add-UpdatesToImage {
     param(
         [Parameter(Mandatory)][string]$MountDir,
         [Parameter(Mandatory)][string[]]$Packages
     )
+
     foreach ($Pkg in $Packages) {
-        Write-HostTimestamp "    Applying $(Split-Path -Leaf $Pkg) ..."
+        $Leaf = Split-Path -Leaf $Pkg
+        Write-HostTimestamp "    Applying $Leaf ..."
+
+        $Applied = $false
         try {
             Add-WindowsPackage -Path $MountDir -PackagePath $Pkg -ErrorAction Stop | Out-Null
-            Write-HostTimestamp "      Applied." -ForegroundColor Green
+            $Applied = $true
+            Write-HostTimestamp '      Applied.' -ForegroundColor Green
         }
         catch {
-            # 0x800f081e / already-applied and superseded packages are common and non-fatal.
-            Write-HostTimestamp "      Could not apply this package: $($_.Exception.Message)" -ForegroundColor Yellow
+            $Msg = $_.Exception.Message
+            # 0x800f081e = the package (or a newer one) is already in the image - safe to treat as done.
+            if ($Msg -match '0x800f081e') {
+                Write-HostTimestamp '      Already present in the image (superseded/not applicable) - skipping.' -ForegroundColor DarkGray
+                continue
+            }
+            Write-HostTimestamp "      Direct apply failed: $Msg" -ForegroundColor Yellow
+        }
+        if ($Applied) { continue }
+
+        # Fallback for .msu wrapper failures: expand the .msu and apply the inner .cab payload directly.
+        if ($Pkg -notlike '*.msu') { continue }
+        Write-HostTimestamp '      Retrying by expanding the .msu and applying its inner .cab payload...' -ForegroundColor Yellow
+
+        $ExpandDir = Join-Path -Path $WorkRoot -ChildPath ("expand_" + [System.IO.Path]::GetFileNameWithoutExtension($Pkg))
+        try {
+            if (Test-Path $ExpandDir) { Remove-Item -LiteralPath $ExpandDir -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -ItemType Directory -Path $ExpandDir -Force -ErrorAction Stop | Out-Null
+
+            # expand.exe -f:* unpacks every file from the .msu into the target folder.
+            & expand.exe "$Pkg" -f:* "$ExpandDir" | Out-Null
+
+            # The applicable payload is the .cab file(s), excluding the WSUSSCAN metadata catalog. Apply any
+            # servicing-stack (SSU) cab first, then the remaining cab(s).
+            $Cabs = Get-ChildItem -Path $ExpandDir -Filter '*.cab' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notmatch '(?i)WSUSSCAN' }
+            $OrderedCabs = @(
+                ($Cabs | Where-Object { $_.Name -match '(?i)SSU|ServicingStack' })
+                ($Cabs | Where-Object { $_.Name -notmatch '(?i)SSU|ServicingStack' })
+            )
+
+            if (-not $OrderedCabs -or $OrderedCabs.Count -eq 0) {
+                Write-HostTimestamp '      No applicable .cab payload was found inside the .msu.' -ForegroundColor Yellow
+            }
+            foreach ($Cab in $OrderedCabs) {
+                Write-HostTimestamp "      Applying inner package $($Cab.Name) ..."
+                try {
+                    Add-WindowsPackage -Path $MountDir -PackagePath $Cab.FullName -ErrorAction Stop | Out-Null
+                    Write-HostTimestamp '        Applied.' -ForegroundColor Green
+                }
+                catch {
+                    if ($_.Exception.Message -match '0x800f081e') {
+                        Write-HostTimestamp '        Already present in the image - skipping.' -ForegroundColor DarkGray
+                    }
+                    else {
+                        Write-HostTimestamp "        Could not apply this package: $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
+                }
+            }
+        }
+        catch {
+            Write-HostTimestamp "      Could not expand/apply the .msu: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        finally {
+            Remove-Item -LiteralPath $ExpandDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }
@@ -633,7 +812,7 @@ else {
 Write-Host $LineBreak
 
 # --- Interactive confirmation ---
-if (-not $Unattended -and -not $SkipInteractive) {
+if (-not $Unattended -and -not $SkipInteractive -and -not $ListEditions) {
     Write-Host "This tool builds an updated Windows installation ISO. It will:"
     if (-not $IsoPath) {
         Write-Host "  - Download the matching official Windows $WindowsVersion ISO from Microsoft (~5-6 GB)"
@@ -644,6 +823,9 @@ if (-not $Unattended -and -not $SkipInteractive) {
         Write-Host "  - Use the ISO you provided: $IsoPath"
     }
     Write-Host "  - Extract it to $ExtractDir"
+    if ($KeepEditions -and $KeepEditions.Count -gt 0) {
+        Write-Host "  - Keep ONLY these editions in the final ISO (remove the rest): $($KeepEditions -join ', ')" -ForegroundColor Yellow
+    }
     if (-not $SkipUpdates) {
         if ($UpdatePath) {
             Write-Host "  - Integrate the update packages found in: $UpdatePath"
@@ -670,27 +852,29 @@ if (-not $Unattended -and -not $SkipInteractive) {
     Write-Host $LineBreak
 }
 
-# --- Locate oscdimg early so we fail fast if the ISO cannot be recompiled ---
+# --- Locate oscdimg early so we fail fast if the ISO cannot be recompiled (not needed for -ListEditions) ---
 $Oscdimg = $null
-Invoke-Task -Description 'Locating oscdimg.exe (Windows ADK Deployment Tools)...' -ScriptBlock {
-    $script:Oscdimg = Find-Oscdimg
-    if ($script:Oscdimg) {
-        Write-HostTimestamp "  Found oscdimg: $($script:Oscdimg)" -ForegroundColor Green
+if (-not $ListEditions) {
+    Invoke-Task -Description 'Locating oscdimg.exe (Windows ADK Deployment Tools)...' -ScriptBlock {
+        $script:Oscdimg = Find-Oscdimg
+        if ($script:Oscdimg) {
+            Write-HostTimestamp "  Found oscdimg: $($script:Oscdimg)" -ForegroundColor Green
+        }
+        elseif ($InstallAdk) {
+            Write-HostTimestamp '  oscdimg was not found. Installing the Windows ADK Deployment Tools...' -ForegroundColor Yellow
+            $script:Oscdimg = Install-AdkDeploymentTools
+            if ($script:Oscdimg) { Write-HostTimestamp "  Installed. Found oscdimg: $($script:Oscdimg)" -ForegroundColor Green }
+        }
     }
-    elseif ($InstallAdk) {
-        Write-HostTimestamp '  oscdimg was not found. Installing the Windows ADK Deployment Tools...' -ForegroundColor Yellow
-        $script:Oscdimg = Install-AdkDeploymentTools
-        if ($script:Oscdimg) { Write-HostTimestamp "  Installed. Found oscdimg: $($script:Oscdimg)" -ForegroundColor Green }
+    $Oscdimg = $script:Oscdimg
+    if (-not $Oscdimg) {
+        Write-HostTimestamp 'oscdimg.exe was not found. It is part of the Windows ADK "Deployment Tools" feature and is required to recompile the ISO.' -ForegroundColor Red
+        Write-HostTimestamp 'Re-run with -InstallAdk to have this script download and install it automatically, or install the Windows ADK (Deployment Tools) manually from Microsoft and re-run.' -ForegroundColor Yellow
+        Stop-Transcript | Out-Null
+        exit 1
     }
+    Write-Host $LineBreak
 }
-$Oscdimg = $script:Oscdimg
-if (-not $Oscdimg) {
-    Write-HostTimestamp 'oscdimg.exe was not found. It is part of the Windows ADK "Deployment Tools" feature and is required to recompile the ISO.' -ForegroundColor Red
-    Write-HostTimestamp 'Re-run with -InstallAdk to have this script download and install it automatically, or install the Windows ADK (Deployment Tools) manually from Microsoft and re-run.' -ForegroundColor Yellow
-    Stop-Transcript | Out-Null
-    exit 1
-}
-Write-Host $LineBreak
 
 # --- Obtain the ISO ---
 $ResolvedIso = $null
@@ -751,6 +935,41 @@ else {
     }
 }
 Write-Host $LineBreak
+
+# --- List editions and exit (-ListEditions) ---
+# Mount the ISO (no full extraction needed) just to read the editions inside install.wim/esd, print them,
+# then dismount and exit. Handy for picking -Edition / -KeepEditions values before a full build.
+if ($ListEditions) {
+    $ListMount = $null
+    try {
+        $ListMount = Mount-DiskImage -ImagePath $ResolvedIso -PassThru -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        $ListDrive = ($ListMount | Get-Volume -ErrorAction SilentlyContinue).DriveLetter
+        if (-not $ListDrive) { $ListDrive = (Get-DiskImage -ImagePath $ResolvedIso | Get-Volume -ErrorAction SilentlyContinue).DriveLetter }
+        if (-not $ListDrive) { throw 'Could not determine the drive letter of the mounted ISO.' }
+
+        $ListImg = "$($ListDrive):\sources\install.wim"
+        if (-not (Test-Path -LiteralPath $ListImg)) { $ListImg = "$($ListDrive):\sources\install.esd" }
+        if (-not (Test-Path -LiteralPath $ListImg)) { throw 'No install.wim or install.esd was found on the ISO.' }
+
+        Write-HostTimestamp "Editions inside $(Split-Path -Leaf $ListImg):" -ForegroundColor Cyan
+        Get-WindowsImage -ImagePath $ListImg -ErrorAction Stop | ForEach-Object {
+            Write-Host ("    [{0}] {1}" -f $_.ImageIndex, $_.ImageName)
+        }
+        Write-Host ''
+        Write-Host 'Use these with -Edition (which to service) or -KeepEditions (which to keep in the final ISO).'
+        Write-Host 'Example: -KeepEditions "Windows 11 Pro","Windows 11 Home"   or   -KeepEditions 6,1'
+    }
+    catch {
+        Write-HostTimestamp "Could not list the editions: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    finally {
+        if ($ListMount) { Dismount-DiskImage -ImagePath $ResolvedIso -ErrorAction SilentlyContinue | Out-Null }
+    }
+    Write-Host $LineBreak
+    Stop-Transcript | Out-Null
+    exit 0
+}
 
 # --- Extract the ISO to the working folder ---
 $MountedImage = $null
@@ -870,16 +1089,21 @@ else {
 
     Invoke-Task -Description 'Downloading the latest cumulative update from the Microsoft Update Catalog...' -ScriptBlock {
         $VerPart = if ($FeatureName) { "Version $FeatureName " } else { '' }
-        $Query = "Cumulative Update for Windows $WindowsVersion $VerPart for $CatalogArch-based Systems"
-        $script:Lcu = Get-LatestCatalogPackage -Query $Query -DownloadDir $DlDir
+        # The monthly LCU is titled e.g. "2026-07 Cumulative Update for Windows 11 Version 24H2 for
+        # x64-based Systems (KB...)" and classified as a Security Update. Restrict the match to real
+        # cumulative updates and exclude the .NET / Dynamic Update entries the same query returns.
+        $Query = "Cumulative Update for Windows $WindowsVersion ${VerPart}for $CatalogArch-based Systems"
+        $Include = '(?i)cumulative update for windows'
+        $Exclude = '(?i)\.net|dynamic update'
+        $script:Lcu = Get-LatestCatalogPackage -Query $Query -DownloadDir $DlDir -TitleInclude $Include -TitleExclude $Exclude
         if (-not $script:Lcu) {
             # Retry with a looser query (some releases omit the "Version xxHx" token in the title).
             $Query2 = "Cumulative Update for Windows $WindowsVersion for $CatalogArch-based Systems"
             Write-HostTimestamp "  Retrying with a broader query: $Query2" -ForegroundColor Yellow
-            $script:Lcu = Get-LatestCatalogPackage -Query $Query2 -DownloadDir $DlDir
+            $script:Lcu = Get-LatestCatalogPackage -Query $Query2 -DownloadDir $DlDir -TitleInclude $Include -TitleExclude $Exclude
         }
     }
-    if ($script:Lcu) { $UpdatePackages.Add($script:Lcu) }
+    if ($script:Lcu) { foreach ($P in @($script:Lcu)) { $UpdatePackages.Add($P) } }
     else {
         Write-HostTimestamp 'Could not obtain a cumulative update from the catalog. You can supply one with -UpdatePath, or use -SkipUpdates to just recompile the ISO.' -ForegroundColor Red
         Stop-Transcript | Out-Null
@@ -891,9 +1115,9 @@ else {
         Invoke-Task -Description 'Downloading the latest .NET cumulative update from the Microsoft Update Catalog...' -ScriptBlock {
             $VerPart = if ($FeatureName) { "Windows $WindowsVersion Version $FeatureName" } else { "Windows $WindowsVersion" }
             $Query = "Cumulative Update for .NET Framework $VerPart for $CatalogArch"
-            $script:DotNet = Get-LatestCatalogPackage -Query $Query -DownloadDir $DlDir
+            $script:DotNet = Get-LatestCatalogPackage -Query $Query -DownloadDir $DlDir -TitleInclude '(?i)\.net framework' -TitleExclude '(?i)dynamic update'
         }
-        if ($script:DotNet) { $UpdatePackages.Add($script:DotNet) }
+        if ($script:DotNet) { foreach ($P in @($script:DotNet)) { $UpdatePackages.Add($P) } }
         else { Write-HostTimestamp '  No .NET cumulative update was integrated (none found).' -ForegroundColor Yellow }
         Write-Host $LineBreak
     }
@@ -901,7 +1125,7 @@ else {
     if ($ServiceWinRE) {
         Invoke-Task -Description 'Looking for a Safe OS Dynamic Update for the recovery image (WinRE)...' -ScriptBlock {
             $VerPart = if ($FeatureName) { "Version $FeatureName " } else { '' }
-            $script:SafeOs = Get-LatestCatalogPackage -Query "Safe OS Dynamic Update Windows $WindowsVersion $VerPart$CatalogArch" -DownloadDir $DlDir
+            $script:SafeOs = Get-LatestCatalogPackage -Query "Safe OS Dynamic Update Windows $WindowsVersion $VerPart$CatalogArch" -DownloadDir $DlDir -TitleInclude '(?i)safe os dynamic update'
         }
         if ($script:SafeOs) { $SafeOsPackage = $script:SafeOs }
         else { Write-HostTimestamp '  No Safe OS Dynamic Update was found; the cumulative update will be applied to WinRE instead.' -ForegroundColor Yellow }
@@ -909,32 +1133,62 @@ else {
     }
 }
 
+# --- Resolve which editions to keep and which to service ---
+$InstallImages = @(Get-WindowsImage -ImagePath $InstallWimExtracted -ErrorAction Stop)
+
+# Which editions to KEEP in the final ISO (default: all of them).
+$KeepIndexes = @($InstallImages.ImageIndex)
+if ($KeepEditions -and $KeepEditions.Count -gt 0) {
+    $KeepUnmatched = $null
+    $KeepIndexes = @(Resolve-EditionIndexes -Images $InstallImages -Tokens $KeepEditions -Unmatched ([ref]$KeepUnmatched))
+    if ($KeepUnmatched -and $KeepUnmatched.Count -gt 0) {
+        Write-HostTimestamp "These -KeepEditions values did not match any edition: $($KeepUnmatched -join ', ')" -ForegroundColor Red
+        Write-HostTimestamp 'Available editions:' -ForegroundColor Yellow
+        $InstallImages | ForEach-Object { Write-Host "    [$($_.ImageIndex)] $($_.ImageName)" }
+        Stop-Transcript | Out-Null
+        exit 1
+    }
+    if ($KeepIndexes.Count -eq 0) {
+        Write-HostTimestamp '-KeepEditions matched no editions. Cannot continue.' -ForegroundColor Red
+        Stop-Transcript | Out-Null
+        exit 1
+    }
+    $KeptNames = $InstallImages | Where-Object { $KeepIndexes -contains $_.ImageIndex } | ForEach-Object { $_.ImageName }
+    $DroppedNames = $InstallImages | Where-Object { $KeepIndexes -notcontains $_.ImageIndex } | ForEach-Object { $_.ImageName }
+    Write-HostTimestamp "Keeping $($KeepIndexes.Count) of $($InstallImages.Count) editions: $($KeptNames -join ', ')" -ForegroundColor Cyan
+    if ($DroppedNames) { Write-HostTimestamp "Removing from the ISO: $($DroppedNames -join ', ')" -ForegroundColor Yellow }
+    Write-Host $LineBreak
+}
+$TrimNeeded = ($KeepIndexes.Count -lt $InstallImages.Count)
+
+# Which of the kept editions to actually service (apply updates to). -Edition narrows this further.
+if ($Edition -eq 'All') {
+    $ServiceIndexes = $KeepIndexes
+}
+else {
+    $EdUnmatched = $null
+    $EdIndexes = @(Resolve-EditionIndexes -Images $InstallImages -Tokens @($Edition) -Unmatched ([ref]$EdUnmatched))
+    if ($EdIndexes.Count -eq 0) {
+        Write-HostTimestamp "Edition '$Edition' was not found in the image. Available editions:" -ForegroundColor Red
+        $InstallImages | ForEach-Object { Write-Host "    [$($_.ImageIndex)] $($_.ImageName)" }
+        Stop-Transcript | Out-Null
+        exit 1
+    }
+    # Only service editions we are keeping in the final ISO.
+    $ServiceIndexes = @($EdIndexes | Where-Object { $KeepIndexes -contains $_ })
+}
+
 # --- Service the images ---
 if ($UpdatePackages.Count -gt 0) {
-    if (Test-Path $MountDir) { Remove-Item -LiteralPath $MountDir -Recurse -Force -ErrorAction SilentlyContinue }
-    New-Item -ItemType Directory -Path $MountDir -Force -ErrorAction Stop | Out-Null
-
-    # Which install.wim indexes to service.
-    $InstallImages = Get-WindowsImage -ImagePath $InstallWimExtracted -ErrorAction Stop
-    $TargetIndexes = if ($Edition -eq 'All') {
-        $InstallImages.ImageIndex
-    }
-    else {
-        $Match = $InstallImages | Where-Object { $_.ImageName -eq $Edition -or $_.ImageName -like "*$Edition*" }
-        if (-not $Match) {
-            Write-HostTimestamp "Edition '$Edition' was not found in the image. Available editions:" -ForegroundColor Red
-            $InstallImages | ForEach-Object { Write-Host "    [$($_.ImageIndex)] $($_.ImageName)" }
-            Stop-Transcript | Out-Null
-            exit 1
-        }
-        $Match.ImageIndex
-    }
+    # Start from a clean mount directory, discarding any stale mount a previous crashed run left behind.
+    Reset-MountDirectory -Path $MountDir
 
     # 1) Service install.wim (each targeted edition).
-    foreach ($Index in $TargetIndexes) {
+    foreach ($Index in $ServiceIndexes) {
         $EditionName = ($InstallImages | Where-Object { $_.ImageIndex -eq $Index }).ImageName
         Invoke-Task -Description "Servicing install.wim index $Index ($EditionName)..." -ScriptBlock {
             try {
+                Reset-MountDirectory -Path $MountDir
                 Write-HostTimestamp '    Mounting the image...'
                 Mount-WindowsImage -ImagePath $InstallWimExtracted -Index $Index -Path $MountDir -ErrorAction Stop | Out-Null
 
@@ -943,8 +1197,7 @@ if ($UpdatePackages.Count -gt 0) {
                     $WinReWim = Join-Path $MountDir 'Windows\System32\Recovery\winre.wim'
                     if (Test-Path -LiteralPath $WinReWim) {
                         $WinReMount = Join-Path $WorkRoot 'WinREMount'
-                        if (Test-Path $WinReMount) { Remove-Item -LiteralPath $WinReMount -Recurse -Force -ErrorAction SilentlyContinue }
-                        New-Item -ItemType Directory -Path $WinReMount -Force -ErrorAction Stop | Out-Null
+                        Reset-MountDirectory -Path $WinReMount
                         try {
                             Set-ItemProperty -LiteralPath $WinReWim -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
                             Write-HostTimestamp '    Servicing the recovery image (winre.wim)...'
@@ -984,6 +1237,7 @@ if ($UpdatePackages.Count -gt 0) {
         foreach ($BootImg in $BootImages) {
             Invoke-Task -Description "Servicing boot.wim index $($BootImg.ImageIndex) ($($BootImg.ImageName))..." -ScriptBlock {
                 try {
+                    Reset-MountDirectory -Path $MountDir
                     Mount-WindowsImage -ImagePath $BootWim -Index $BootImg.ImageIndex -Path $MountDir -ErrorAction Stop | Out-Null
                     Add-UpdatesToImage -MountDir $MountDir -Packages $UpdatePackages
                     & dism.exe /Image:"$MountDir" /Cleanup-Image /StartComponentCleanup | Out-Null
@@ -998,27 +1252,35 @@ if ($UpdatePackages.Count -gt 0) {
         }
     }
 
-    # 3) Re-export install.wim to reclaim the space freed by the component cleanup.
-    Invoke-Task -Description 'Re-exporting install.wim to shrink it...' -ScriptBlock {
+    # 3) Re-export install.wim below (outside this block) to reclaim the space freed by the cleanup.
+    Remove-Item -LiteralPath $MountDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- Re-export install.wim (shrink after servicing and/or drop editions with -KeepEditions) ---
+# Exporting only the kept indexes both reclaims the space freed by the component cleanup AND physically
+# removes any editions the user chose not to keep. Runs when updates were applied or when trimming.
+if (($UpdatePackages.Count -gt 0) -or $TrimNeeded) {
+    $ExportDesc = if ($TrimNeeded) { "Rebuilding install.wim with only the kept edition(s) and shrinking it..." } else { 'Re-exporting install.wim to shrink it...' }
+    Invoke-Task -Description $ExportDesc -ScriptBlock {
         $Temp = Join-Path $ExtractDir 'sources\install_new.wim'
         try {
-            Export-WindowsImage -SourceImagePath $InstallWimExtracted -DestinationImagePath $Temp -CompressionType Max -SourceIndex 1 -ErrorAction Stop | Out-Null
-            $All = Get-WindowsImage -ImagePath $InstallWimExtracted -ErrorAction Stop
-            foreach ($Img in ($All | Where-Object { $_.ImageIndex -gt 1 })) {
-                Export-WindowsImage -SourceImagePath $InstallWimExtracted -DestinationImagePath $Temp -CompressionType Max -SourceIndex $Img.ImageIndex -ErrorAction Stop | Out-Null
+            if (Test-Path -LiteralPath $Temp) { Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue }
+            # Export the kept indexes in their original order into a fresh WIM (re-indexed 1..N).
+            foreach ($Index in ($KeepIndexes | Sort-Object)) {
+                $Name = ($InstallImages | Where-Object { $_.ImageIndex -eq $Index }).ImageName
+                Write-HostTimestamp "  Exporting [$Index] $Name ..."
+                Export-WindowsImage -SourceImagePath $InstallWimExtracted -DestinationImagePath $Temp -CompressionType Max -SourceIndex $Index -ErrorAction Stop | Out-Null
             }
             Remove-Item -LiteralPath $InstallWimExtracted -Force -ErrorAction Stop
             Rename-Item -LiteralPath $Temp -NewName 'install.wim' -ErrorAction Stop
             Write-HostTimestamp '  Re-export complete.' -ForegroundColor Green
         }
         catch {
-            Write-HostTimestamp "  Re-export skipped: $($_.Exception.Message). The (larger) serviced install.wim will be used as-is." -ForegroundColor Yellow
+            Write-HostTimestamp "  Re-export failed: $($_.Exception.Message). The original serviced install.wim will be used as-is." -ForegroundColor Yellow
             Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
         }
     }
     Write-Host $LineBreak
-
-    Remove-Item -LiteralPath $MountDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # --- Recompile the ISO with oscdimg ---

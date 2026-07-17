@@ -59,6 +59,23 @@ To use command-line parameters, run the batch file from a Command Prompt or Powe
     .\Run-Windows-ISO-Updater.bat -Unattended -InstallAdk -Edition "Windows 11 Pro"
     ```
 
+### Removing Editions (Slimming the ISO)
+
+A Windows ISO's `install.wim` usually contains many editions (Home, Home N, Pro, Education, etc.). You can drop the ones you don't want with `-KeepEditions`, which physically removes them when the image is rebuilt — producing a smaller ISO that only offers the editions you keep.
+
+```shell
+:: See what editions are inside the ISO first (downloads/uses the ISO, then just lists and exits)
+.\Run-Windows-ISO-Updater.bat -ListEditions
+
+:: Build an updated ISO containing ONLY Windows 11 Pro and Home (by name)
+.\Run-Windows-ISO-Updater.bat -KeepEditions "Windows 11 Pro","Windows 11 Home"
+
+:: Same idea, selecting by index number instead of name
+.\Run-Windows-ISO-Updater.bat -KeepEditions 6,1
+```
+
+`-KeepEditions` accepts edition names (partial matches allowed) or index numbers. Only the kept editions are serviced and re-exported, so the removed editions are gone from the final `install.wim`. It works with `-SkipUpdates` too, if you only want to trim editions without integrating updates.
+
 ## Command-Line Parameters
 
 The script supports the following optional parameters:
@@ -71,6 +88,8 @@ The script supports the following optional parameters:
 | `-Release` | Fido release to request (e.g. `24H2`, `23H2`) or `Latest`. Defaults to `Latest`. |
 | `-Language` | ISO language as named by Microsoft/Fido (e.g. `English`, `"English International"`). Defaults to `English`. |
 | `-Edition` | Which edition inside `install.wim` to service: `All` (default) or an edition name like `"Windows 11 Pro"`. |
+| `-KeepEditions` | Editions to **keep** in the final ISO, removing the rest to slim it down. Accepts edition names (partial matches allowed) or index numbers, comma-separated. Defaults to keeping all. |
+| `-ListEditions` | List the editions/indexes inside the ISO's `install.wim` and exit, without downloading updates or building anything. Useful for choosing `-Edition`/`-KeepEditions` values. |
 | `-UpdatePath` | Folder containing your own `.msu`/`.cab` update packages to integrate instead of fetching from the Microsoft Update Catalog. |
 | `-IncludeDotNet` | Also download and integrate the latest **.NET cumulative update** from the catalog. |
 | `-ServiceWinRE` | Also service the recovery image (`winre.wim`). Off by default; the Safe OS Dynamic Update is used when available. |
