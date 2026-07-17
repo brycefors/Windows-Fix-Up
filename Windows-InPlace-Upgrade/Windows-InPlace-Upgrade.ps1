@@ -59,9 +59,6 @@ param(
     [Parameter(HelpMessage = 'Turn off Dynamic Update so Setup does not pull the latest fixes online before upgrading')]
     [switch]$NoDynamicUpdate,
 
-    [Parameter(HelpMessage = 'Delete the downloaded ISO after Setup has started')]
-    [switch]$CleanupIso,
-
     [Parameter(HelpMessage = 'Override the URL used to fetch the Fido download helper')]
     [string]$FidoUrl = 'https://github.com/pbatard/Fido/raw/master/Fido.ps1',
 
@@ -540,20 +537,6 @@ if ($null -ne $SetupExitCode -and $SetupExitCode -ne 0) {
 else {
     Write-HostTimestamp 'Windows Setup has started the in-place upgrade.' -ForegroundColor Green
     Write-Host 'The computer will restart several times. Do not power it off during the upgrade.'
-    if ($CleanupIso -and -not $IsoPath) {
-        Write-HostTimestamp 'The downloaded ISO will be removed once Setup has copied what it needs (after this session).' -ForegroundColor DarkGray
-    }
-}
-
-# Optionally remove the downloaded ISO now that Setup has staged its files (only for ISOs we downloaded).
-if ($CleanupIso -and -not $IsoPath -and $ResolvedIso -and (Test-Path -LiteralPath $ResolvedIso)) {
-    try {
-        # Ensure it is not still mounted before deleting.
-        Dismount-DiskImage -ImagePath $ResolvedIso -ErrorAction SilentlyContinue | Out-Null
-        Remove-Item -LiteralPath $ResolvedIso -Force -ErrorAction SilentlyContinue
-        Write-HostTimestamp "Removed the downloaded ISO: $ResolvedIso"
-    }
-    catch { }
 }
 
 Write-HostTimestamp 'Windows In-Place Upgrade script finished.' -ForegroundColor Green

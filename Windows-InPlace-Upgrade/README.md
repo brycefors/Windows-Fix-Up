@@ -114,7 +114,6 @@ powershell -ExecutionPolicy Bypass -File $d -DownloadPath 'C:\ISO'
 | `-DownloadOnly` | Only obtain/download the ISO; do not launch the upgrade. |
 | `-NoReboot` | Prevents Setup from restarting automatically at the end (`/noreboot`). |
 | `-NoDynamicUpdate` | Turns off Dynamic Update so Setup does not pull the latest fixes online before upgrading. |
-| `-CleanupIso` | Deletes the downloaded ISO after Setup has started. |
 | `-FidoUrl` | Override the URL used to fetch the Fido download helper. |
 | `-LogPath` | Directory to write log files to (defaults to the script folder). |
 | `-SkipInteractive` | Skips the interactive confirmation prompt (still shows output). |
@@ -125,7 +124,7 @@ powershell -ExecutionPolicy Bypass -File $d -DownloadPath 'C:\ISO'
 2.  **Disk space check** — Confirms there is enough free space (~20 GB for the upgrade, ~8 GB for download-only) before doing anything.
 3.  **ISO acquisition** — If a valid Windows ISO (larger than 3 GB) is already present in the download folder, it is **reused instead of downloading again**. Otherwise the script downloads the [Fido](https://github.com/pbatard/Fido) helper, uses it to resolve the official Microsoft ISO download URL, then downloads the ISO (resumable via BITS, with an `Invoke-WebRequest` fallback). Skipped entirely when you supply `-IsoPath`.
 4.  **Mount & launch** — Mounts the ISO, locates `setup.exe`, and launches Windows Setup in in-place-upgrade mode with the chosen keep-mode and Dynamic Update enabled.
-5.  **Cleanup** — Dismounts the ISO when appropriate, and optionally deletes the downloaded ISO (`-CleanupIso`).
+5.  **Cleanup** — Dismounts the ISO when appropriate.
 
 ## How the ISO Is Downloaded
 
