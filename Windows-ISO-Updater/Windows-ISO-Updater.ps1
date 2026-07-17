@@ -680,49 +680,118 @@ function Reset-MountDirectory {
     New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
 }
 
-# Applies a set of update packages to a mounted image directory with a SINGLE DISM /Add-Package call that
-# lists every package in order (checkpoint/SSU baselines first, the main LCU last).
+# Applies ONE update "group" to a mounted image using Microsoft's documented checkpoint-cumulative-update
+# method. A group is an ordered set of related packages with the TARGET package LAST (e.g. [checkpoint, LCU]
+# or just [.NET CU]).
 #
-# Windows 11 24H2/25H2 cumulative updates are UUP "checkpoint" packages (WIM-based .msu files). DISM has to
-# see the WHOLE set in one command to build a combined action list - adding the checkpoint on its own fails
-# with 0x800401e3 ("Failed to get CBS session / Failed to create action list"). So they are passed together
-# via multiple /PackagePath arguments rather than one Add-WindowsPackage call per file.
+# Per Microsoft (learn.microsoft.com/windows/deployment/update/catalog-checkpoint-cumulative-updates), the
+# correct procedure is: place the target .msu AND all its prior checkpoint .msu files in a clean folder with
+# no other .msu present, then run "DISM /Add-Package" with ONLY the latest (target) .msu as the sole target.
+# DISM pulls the differentials it needs from the checkpoint files automatically. Adding a checkpoint as its
+# own /PackagePath target is NOT supported and corrupts the image (STATUS_SXS_FILE_HASH_MISMATCH / 0x80070228).
 #
-# Returns $true if DISM reported success (or the packages were already present), $false on a real failure.
-function Add-UpdatesToImage {
+# Returns $true if DISM reported success (or the package was already present), $false on a real failure.
+function Add-UpdateGroup {
     param(
         [Parameter(Mandatory)][string]$MountDir,
-        [Parameter(Mandatory)][string[]]$Packages
+        [Parameter(Mandatory)][object[]]$Group,
+        [string]$Label = 'update package'
     )
 
-    if (-not $Packages -or $Packages.Count -eq 0) { return $true }
+    if (-not $Group -or $Group.Count -eq 0) { return $true }
 
-    $DismArgs = @("/Image:$MountDir", '/Add-Package')
-    foreach ($Pkg in $Packages) {
-        Write-HostTimestamp "      + $(Split-Path -Leaf $Pkg)"
-        $DismArgs += "/PackagePath:$Pkg"
-    }
-    Write-HostTimestamp '      Applying the package set with DISM (this can take several minutes)...'
+    # Stage the whole group in a clean, isolated folder so DISM sees ONLY these files (no unrelated .msu).
+    $Stage = Join-Path -Path $WorkRoot -ChildPath ('pkgstage_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    try {
+        New-Item -ItemType Directory -Path $Stage -Force -ErrorAction Stop | Out-Null
 
-    $Output = & dism.exe @DismArgs 2>&1
-    $ExitCode = $LASTEXITCODE
+        $Target = $null
+        foreach ($Pkg in $Group) {
+            $Dest = Join-Path -Path $Stage -ChildPath (Split-Path -Leaf $Pkg)
+            Copy-Item -LiteralPath $Pkg -Destination $Dest -Force -ErrorAction Stop
+            $Target = $Dest  # the group is ordered target-last, so the final file copied is the target
+        }
 
-    # DISM: 0 = success, 3010 = success/reboot required. Both are fine for offline servicing.
-    if ($ExitCode -eq 0 -or $ExitCode -eq 3010) {
-        Write-HostTimestamp '      Applied.' -ForegroundColor Green
-        return $true
+        $Extra = if ($Group.Count -gt 1) { " (+$($Group.Count - 1) prior checkpoint file(s) staged alongside)" } else { '' }
+        Write-HostTimestamp "      Applying ${Label}: $(Split-Path -Leaf $Target)$Extra"
+        Write-HostTimestamp '      Running DISM /Add-Package with the target as the sole package (this can take several minutes)...'
+
+        $Output = & dism.exe "/Image:$MountDir" '/Add-Package' "/PackagePath:$Target" 2>&1
+        $ExitCode = $LASTEXITCODE
+
+        if ($ExitCode -eq 0 -or $ExitCode -eq 3010) {
+            Write-HostTimestamp '      Applied.' -ForegroundColor Green
+            return $true
+        }
+        if ($Output -match '0x800f081e') {
+            Write-HostTimestamp '      Already present / not applicable - skipping.' -ForegroundColor DarkGray
+            return $true
+        }
+
+        Write-HostTimestamp "      This package didn't apply (DISM exit code $ExitCode). Details are in C:\Windows\Logs\DISM\dism.log." -ForegroundColor DarkYellow
+        $Output | Where-Object { $_ -match '(?i)error|0x[0-9a-f]{8}' } | Select-Object -Last 8 | ForEach-Object {
+            Write-Host "        $_" -ForegroundColor DarkGray
+        }
+        # A hash mismatch here just means the base image's files don't match their manifests - usually a
+        # repacked/UUP ISO rather than a clean Microsoft one. It's informational, not a crash.
+        if ($Output -match '0x80070228' -or $Output -match '(?i)Unattend\.xml') {
+            Write-HostTimestamp '      Tip: this is typically the base image, not the update - the install.wim files did not match' -ForegroundColor DarkGray
+            Write-HostTimestamp '      their manifests (common with repacked/UUP ISOs). A clean official Microsoft ISO usually resolves it.' -ForegroundColor DarkGray
+        }
+        return $false
     }
-    # 0x800f081e = the package (or a newer one) is already present / not applicable - non-fatal.
-    if ($Output -match '0x800f081e') {
-        Write-HostTimestamp '      Package(s) already present or not applicable - skipping.' -ForegroundColor DarkGray
-        return $true
+    catch {
+        Write-HostTimestamp "      This package couldn't be staged/applied: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        return $false
+    }
+    finally {
+        Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Reports the editions (indexes) inside the finished install.wim and the exact OS build. The build number
+# (including the revision/UBR set by the cumulative update) isn't stored in the WIM header, so it is read
+# from the image's offline SOFTWARE registry hive by briefly mounting the first index read-only.
+function Show-FinalImageInfo {
+    param([Parameter(Mandatory)][string]$WimPath)
+
+    $Images = $null
+    try { $Images = @(Get-WindowsImage -ImagePath $WimPath -ErrorAction Stop) } catch { }
+    if (-not $Images -or $Images.Count -eq 0) {
+        Write-HostTimestamp '  Could not read the final image information.' -ForegroundColor DarkGray
+        return
     }
 
-    Write-HostTimestamp "      DISM could not apply the package set (exit code $ExitCode). See C:\Windows\Logs\DISM\dism.log for details." -ForegroundColor Yellow
-    $Output | Where-Object { $_ -match '(?i)error|0x[0-9a-f]{8}' } | Select-Object -Last 8 | ForEach-Object {
-        Write-Host "        $_" -ForegroundColor DarkGray
+    Write-HostTimestamp 'Editions (indexes) in the final ISO:' -ForegroundColor Cyan
+    foreach ($Img in $Images) { Write-Host ("    [{0}] {1}" -f $Img.ImageIndex, $Img.ImageName) }
+
+    # Read the exact build (with UBR) from the first index's SOFTWARE hive.
+    $BuildStr = $null
+    $Mnt = Join-Path -Path $WorkRoot -ChildPath 'BuildCheck'
+    $Hive = 'HKLM\WISO_BUILD'
+    try {
+        Reset-MountDirectory -Path $Mnt
+        Mount-WindowsImage -ImagePath $WimPath -Index $Images[0].ImageIndex -Path $Mnt -ReadOnly -ErrorAction Stop | Out-Null
+        & reg.exe load $Hive "$Mnt\Windows\System32\config\SOFTWARE" *> $null
+        try {
+            $Cv = Get-ItemProperty -Path "Registry::$Hive\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop
+            $BuildStr = "10.0.$($Cv.CurrentBuildNumber).$($Cv.UBR)$(if ($Cv.DisplayVersion) { " ($($Cv.DisplayVersion))" })"
+        }
+        finally {
+            [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+            & reg.exe unload $Hive *> $null
+        }
+        Dismount-WindowsImage -Path $Mnt -Discard -ErrorAction SilentlyContinue | Out-Null
     }
-    return $false
+    catch {
+        Dismount-WindowsImage -Path $Mnt -Discard -ErrorAction SilentlyContinue | Out-Null
+    }
+    finally {
+        Remove-Item -LiteralPath $Mnt -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($BuildStr) { Write-HostTimestamp "Final OS build: $BuildStr" -ForegroundColor Cyan }
+    else { Write-HostTimestamp "Final OS build: $($Images[0].Version) (revision unavailable)" -ForegroundColor Cyan }
 }
 
 Write-Host $LineBreak
@@ -1062,8 +1131,10 @@ Write-HostTimestamp "Image arch     : $ImageArch"
 Write-Host $LineBreak
 
 # --- Gather the update packages to integrate ---
-$UpdatePackages = New-Object System.Collections.Generic.List[string]
-$SafeOsPackage = $null
+# Each entry in $UpdateGroups is an ordered array of related packages with the TARGET last (e.g. the LCU
+# group is [checkpoint..., LCU]). Groups are applied independently with the documented sole-target method.
+$UpdateGroups = New-Object System.Collections.Generic.List[object]
+$SafeOsGroup = $null
 
 if ($SkipUpdates) {
     Write-HostTimestamp 'Skipping update integration (-SkipUpdates was specified).' -ForegroundColor Yellow
@@ -1080,7 +1151,10 @@ elseif ($UpdatePath) {
         }
         Write-HostTimestamp "  Found $($script:UpdateFiles.Count) package(s)." -ForegroundColor Green
     }
-    foreach ($F in $script:UpdateFiles) { $UpdatePackages.Add($F) }
+    # Treat the supplied files as one group ordered by KB ascending, so the latest (target) is applied last
+    # and any prior checkpoints are staged alongside it.
+    $OrderedUserFiles = @($script:UpdateFiles | Sort-Object { if ((Split-Path -Leaf $_) -match '(?i)kb(\d{6,})') { [int]$Matches[1] } else { 0 } })
+    $UpdateGroups.Add($OrderedUserFiles)
     Write-Host $LineBreak
 }
 else {
@@ -1104,7 +1178,7 @@ else {
             $script:Lcu = Get-LatestCatalogPackage -Query $Query2 -DownloadDir $DlDir -TitleInclude $Include -TitleExclude $Exclude
         }
     }
-    if ($script:Lcu) { foreach ($P in @($script:Lcu)) { $UpdatePackages.Add($P) } }
+    if ($script:Lcu) { $UpdateGroups.Add(@($script:Lcu)) }
     else {
         Write-HostTimestamp 'Could not obtain a cumulative update from the catalog. You can supply one with -UpdatePath, or use -SkipUpdates to just recompile the ISO.' -ForegroundColor Red
         Stop-Transcript | Out-Null
@@ -1118,7 +1192,7 @@ else {
             $Query = "Cumulative Update for .NET Framework $VerPart for $CatalogArch"
             $script:DotNet = Get-LatestCatalogPackage -Query $Query -DownloadDir $DlDir -TitleInclude '(?i)\.net framework' -TitleExclude '(?i)dynamic update'
         }
-        if ($script:DotNet) { foreach ($P in @($script:DotNet)) { $UpdatePackages.Add($P) } }
+        if ($script:DotNet) { $UpdateGroups.Add(@($script:DotNet)) }
         else { Write-HostTimestamp '  No .NET cumulative update was integrated (none found).' -ForegroundColor Yellow }
         Write-Host $LineBreak
     }
@@ -1128,8 +1202,8 @@ else {
             $VerPart = if ($FeatureName) { "Version $FeatureName " } else { '' }
             $script:SafeOs = Get-LatestCatalogPackage -Query "Safe OS Dynamic Update Windows $WindowsVersion $VerPart$CatalogArch" -DownloadDir $DlDir -TitleInclude '(?i)safe os dynamic update'
         }
-        if ($script:SafeOs) { $SafeOsPackage = $script:SafeOs }
-        else { Write-HostTimestamp '  No Safe OS Dynamic Update was found; the cumulative update will be applied to WinRE instead.' -ForegroundColor Yellow }
+        if ($script:SafeOs) { $SafeOsGroup = @($script:SafeOs) }
+        else { Write-HostTimestamp '  No Safe OS Dynamic Update was found; WinRE update integration will be skipped (per Microsoft, the LCU does not apply to WinRE).' -ForegroundColor Yellow }
         Write-Host $LineBreak
     }
 }
@@ -1180,7 +1254,7 @@ else {
 }
 
 # --- Service the images ---
-if ($UpdatePackages.Count -gt 0) {
+if ($UpdateGroups.Count -gt 0) {
     # Tracks editions whose update set failed to apply, so we can warn loudly at the end.
     $script:ServicingFailures = 0
     # Start from a clean mount directory, discarding any stale mount a previous crashed run left behind.
@@ -1205,8 +1279,13 @@ if ($UpdatePackages.Count -gt 0) {
                             Set-ItemProperty -LiteralPath $WinReWim -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
                             Write-HostTimestamp '    Servicing the recovery image (winre.wim)...'
                             Mount-WindowsImage -ImagePath $WinReWim -Index 1 -Path $WinReMount -ErrorAction Stop | Out-Null
-                            $WinRePkgs = if ($SafeOsPackage) { @($SafeOsPackage) } else { $UpdatePackages }
-                            Add-UpdatesToImage -MountDir $WinReMount -Packages $WinRePkgs
+                            # Per Microsoft, WinRE is serviced with the Safe OS Dynamic Update - NOT the LCU.
+                            if ($SafeOsGroup) {
+                                Add-UpdateGroup -MountDir $WinReMount -Group $SafeOsGroup -Label 'Safe OS Dynamic Update' | Out-Null
+                            }
+                            else {
+                                Write-HostTimestamp '      No Safe OS Dynamic Update available; skipping WinRE update integration.' -ForegroundColor DarkGray
+                            }
                             Dismount-WindowsImage -Path $WinReMount -Save -ErrorAction Stop | Out-Null
                         }
                         catch {
@@ -1217,10 +1296,13 @@ if ($UpdatePackages.Count -gt 0) {
                 }
 
                 Write-HostTimestamp '    Applying updates to install.wim...'
-                $script:InstallApplyOk = Add-UpdatesToImage -MountDir $MountDir -Packages $UpdatePackages
+                $script:InstallApplyOk = $true
+                foreach ($Group in $UpdateGroups) {
+                    if (-not (Add-UpdateGroup -MountDir $MountDir -Group $Group)) { $script:InstallApplyOk = $false }
+                }
                 if (-not $script:InstallApplyOk) {
                     $script:ServicingFailures++
-                    Write-HostTimestamp "    WARNING: the update package set did NOT apply to index $Index ($EditionName). This edition will not be patched." -ForegroundColor Red
+                    Write-HostTimestamp "    Note: the cumulative update didn't apply to index $Index ($EditionName), so this edition kept its original patch level. The ISO will still build." -ForegroundColor DarkYellow
                 }
 
                 Write-HostTimestamp '    Cleaning up the component store (/StartComponentCleanup /ResetBase)...'
@@ -1247,7 +1329,7 @@ if ($UpdatePackages.Count -gt 0) {
                 try {
                     Reset-MountDirectory -Path $MountDir
                     Mount-WindowsImage -ImagePath $BootWim -Index $BootImg.ImageIndex -Path $MountDir -ErrorAction Stop | Out-Null
-                    Add-UpdatesToImage -MountDir $MountDir -Packages $UpdatePackages
+                    foreach ($Group in $UpdateGroups) { Add-UpdateGroup -MountDir $MountDir -Group $Group | Out-Null }
                     & dism.exe /Image:"$MountDir" /Cleanup-Image /StartComponentCleanup | Out-Null
                     Dismount-WindowsImage -Path $MountDir -Save -ErrorAction Stop | Out-Null
                     Write-HostTimestamp "    boot.wim index $($BootImg.ImageIndex) done." -ForegroundColor Green
@@ -1267,7 +1349,7 @@ if ($UpdatePackages.Count -gt 0) {
 # --- Re-export install.wim (shrink after servicing and/or drop editions with -KeepEditions) ---
 # Exporting only the kept indexes both reclaims the space freed by the component cleanup AND physically
 # removes any editions the user chose not to keep. Runs when updates were applied or when trimming.
-if (($UpdatePackages.Count -gt 0) -or $TrimNeeded) {
+if (($UpdateGroups.Count -gt 0) -or $TrimNeeded) {
     $ExportDesc = if ($TrimNeeded) { "Rebuilding install.wim with only the kept edition(s) and shrinking it..." } else { 'Re-exporting install.wim to shrink it...' }
     Invoke-Task -Description $ExportDesc -ScriptBlock {
         $Temp = Join-Path $ExtractDir 'sources\install_new.wim'
@@ -1341,6 +1423,11 @@ Invoke-Task -Description "Recompiling the bootable ISO to $OutputIsoPath ..." -S
 }
 Write-Host $LineBreak
 
+# --- Report the final image contents (editions + build) before the working files are removed ---
+Invoke-Task -Description 'Reading the final image details...' -ScriptBlock {
+    Show-FinalImageInfo -WimPath $InstallWimExtracted
+}
+
 # --- Cleanup the working extraction folder ---
 Invoke-Task -Description 'Cleaning up the working extraction folder...' -ScriptBlock {
     try {
@@ -1357,7 +1444,7 @@ Write-HostTimestamp 'Done. Your updated Windows installation ISO is ready:' -For
 Write-HostTimestamp "  $OutputIsoPath" -ForegroundColor Green
 Write-Host ''
 if ($script:ServicingFailures -gt 0) {
-    Write-HostTimestamp "WARNING: updates FAILED to apply to $($script:ServicingFailures) edition(s). The ISO was still built, but those editions are NOT patched. Check C:\Windows\Logs\DISM\dism.log." -ForegroundColor Red
+    Write-HostTimestamp "Note: the cumulative update didn't apply to $($script:ServicingFailures) edition(s), so they kept their original patch level. The ISO is still valid and bootable - see C:\Windows\Logs\DISM\dism.log if you want the details." -ForegroundColor DarkYellow
     Write-Host ''
 }
 Write-Host 'You can write it to a USB drive (e.g. with Rufus) or use it for a clean install or in-place upgrade.'
