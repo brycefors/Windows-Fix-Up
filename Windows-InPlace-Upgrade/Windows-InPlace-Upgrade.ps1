@@ -11,7 +11,7 @@
 #      helper, which queries Microsoft's own software-download servers) and downloads the ISO - unless you
 #      supply your own with -IsoPath.
 #   3. Mounts the ISO and launches Windows Setup in in-place-upgrade mode, keeping apps and data by
-#      default (/auto upgrade), with Dynamic Update enabled so the latest setup fixes are pulled first.
+#      default (/auto upgrade), with the Setup GUI hidden (/quiet) and Dynamic Update disabled by default.
 #   4. Dismounts the ISO when done.
 #
 # The ISO download is large (~5-6 GB) and the upgrade needs roughly 20 GB of free space to stage, so the
@@ -27,7 +27,7 @@
 # -------------------------------------------------
 # Parameters for the script
 param(
-    [Parameter(HelpMessage = 'Runs the script without any confirmation prompts and launches Setup silently (/quiet)')]
+    [Parameter(HelpMessage = 'Runs the script without any confirmation prompts')]
     [switch]$Unattended,
 
     [Parameter(HelpMessage = 'Path to an existing Windows ISO to use instead of downloading one from Microsoft')]
@@ -56,8 +56,11 @@ param(
     [Parameter(HelpMessage = 'Do not let Setup restart the machine automatically at the end (/noreboot)')]
     [switch]$NoReboot,
 
-    [Parameter(HelpMessage = 'Turn off Dynamic Update so Setup does not pull the latest fixes online before upgrading')]
-    [switch]$NoDynamicUpdate,
+    [Parameter(HelpMessage = 'Enable Dynamic Update so Setup pulls the latest fixes online before upgrading (disabled by default)')]
+    [switch]$DynamicUpdate,
+
+    [Parameter(HelpMessage = 'Show the Windows Setup GUI. By default Setup runs with its GUI hidden (/quiet)')]
+    [switch]$ShowUI,
 
     [Parameter(HelpMessage = 'Override the URL used to fetch the Fido download helper')]
     [string]$FidoUrl = 'https://github.com/pbatard/Fido/raw/master/Fido.ps1',
@@ -295,8 +298,8 @@ function Get-WindowsIsoUrl {
 }
 
 # Builds the Windows Setup argument list for the requested keep-mode and options. In-place-upgrade repair
-# keeps apps and data by default (/auto upgrade). Dynamic Update is enabled so Setup pulls the newest
-# setup/servicing fixes before it runs, which is what makes this repair updates so reliably.
+# keeps apps and data by default (/auto upgrade). The Setup GUI is hidden (/quiet) and Dynamic Update is
+# disabled by default; pass -ShowUI or -DynamicUpdate to change either.
 function Get-SetupArguments {
     $SetupArgs = @('/auto', 'upgrade', '/eula', 'accept', '/compat', 'ignorewarning', '/migratedrivers', 'all', '/showoobe', 'none')
 
@@ -305,14 +308,15 @@ function Get-SetupArguments {
         'KeepNothing' { $SetupArgs = @('/auto', 'clean', '/eula', 'accept', '/compat', 'ignorewarning', '/showoobe', 'none') }
     }
 
-    if ($NoDynamicUpdate) { $SetupArgs += @('/dynamicupdate', 'disable') }
-    else                  { $SetupArgs += @('/dynamicupdate', 'enable') }
+    if ($DynamicUpdate) { $SetupArgs += @('/dynamicupdate', 'enable') }
+    else                { $SetupArgs += @('/dynamicupdate', 'disable') }
 
     # Reduce telemetry from the Setup process itself.
     $SetupArgs += @('/telemetry', 'disable')
 
-    if ($NoReboot)   { $SetupArgs += '/noreboot' }
-    if ($Unattended) { $SetupArgs += '/quiet' }
+    if ($NoReboot) { $SetupArgs += '/noreboot' }
+    # The Setup GUI is hidden by default (/quiet); pass -ShowUI to display it.
+    if (-not $ShowUI) { $SetupArgs += '/quiet' }
 
     return $SetupArgs
 }
@@ -552,7 +556,7 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $DownloadOnly) {
         'KeepAll'     { Write-Host "      -> Keeps your apps, settings, and personal files" -ForegroundColor Green }
         'KeepNothing' { Write-Host "      -> CLEAN install: apps, settings, and files are NOT kept" -ForegroundColor Red }
     }
-    if (-not $NoDynamicUpdate) { Write-Host "  - Let Setup pull the latest fixes online first (Dynamic Update)" }
+    if ($DynamicUpdate) { Write-Host "  - Let Setup pull the latest fixes online first (Dynamic Update)" }
     Write-Host ""
     Write-Host "The upgrade takes 20-90 minutes and WILL RESTART the computer several times." -ForegroundColor Yellow
     Write-Host "Close your apps and save your work before continuing." -ForegroundColor Yellow

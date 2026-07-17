@@ -104,7 +104,7 @@ powershell -ExecutionPolicy Bypass -File $d -DownloadPath 'C:\ISO'
 
 | Parameter | Description |
 |---|---|
-| `-Unattended` | Runs with no confirmation prompts and launches Setup silently (`/quiet`). |
+| `-Unattended` | Runs with no confirmation prompts. |
 | `-IsoPath` | Path to an existing Windows ISO to use instead of downloading one from Microsoft. |
 | `-WindowsVersion` | Windows version to upgrade to: `10` or `11`. Defaults to `11`. |
 | `-Release` | Fido release to request (e.g. `24H2`, `23H2`) or `Latest`. Defaults to `Latest`. |
@@ -113,7 +113,8 @@ powershell -ExecutionPolicy Bypass -File $d -DownloadPath 'C:\ISO'
 | `-DownloadPath` | Directory to download the ISO into (defaults to the script folder). |
 | `-DownloadOnly` | Only obtain/download the ISO; do not launch the upgrade. |
 | `-NoReboot` | Prevents Setup from restarting automatically at the end (`/noreboot`). |
-| `-NoDynamicUpdate` | Turns off Dynamic Update so Setup does not pull the latest fixes online before upgrading. |
+| `-DynamicUpdate` | Enables Dynamic Update so Setup pulls the latest fixes online before upgrading (disabled by default). |
+| `-ShowUI` | Shows the Windows Setup GUI. By default Setup runs with its GUI hidden (`/quiet`). |
 | `-FidoUrl` | Override the URL used to fetch the Fido download helper. |
 | `-LogPath` | Directory to write log files to (defaults to the script folder). |
 | `-SkipInteractive` | Skips the interactive confirmation prompt (still shows output). |
@@ -123,7 +124,7 @@ powershell -ExecutionPolicy Bypass -File $d -DownloadPath 'C:\ISO'
 1.  **System detection** — Reads the installed Windows version, edition, architecture, and build so the correct ISO is requested and shown in the preflight summary.
 2.  **Disk space check** — Confirms there is enough free space (~20 GB for the upgrade, ~8 GB for download-only) before doing anything.
 3.  **ISO acquisition** — If a valid Windows ISO (larger than 3 GB) is already present in the download folder, it is **reused instead of downloading again**. Otherwise the script downloads the [Fido](https://github.com/pbatard/Fido) helper, uses it to resolve the official Microsoft ISO download URL, then downloads the ISO (resumable via BITS, with an `Invoke-WebRequest` fallback). Skipped entirely when you supply `-IsoPath`.
-4.  **Mount & launch** — Mounts the ISO, locates `setup.exe`, and launches Windows Setup in in-place-upgrade mode with the chosen keep-mode and Dynamic Update enabled.
+4.  **Mount & launch** — Mounts the ISO, locates `setup.exe`, and launches Windows Setup in in-place-upgrade mode with the chosen keep-mode. By default the Setup GUI is hidden (`/quiet`) and Dynamic Update is disabled.
 5.  **Cleanup** — Dismounts the ISO when appropriate.
 
 ## How the ISO Is Downloaded
