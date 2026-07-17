@@ -124,6 +124,17 @@ The script performs the following actions in sequence to repair and optimize you
 18. **Final Restart**
     *   If you agreed to the automatic restart at the beginning or used the `-AutoReboot` parameter, the script will initiate a 60-second countdown before rebooting. Otherwise, it will remind you to restart manually.
 
+## Companion Scripts
+
+This repository includes several specialized companion scripts for jobs the main "shotgun" tool intentionally leaves alone. Each lives in its own folder with its own batch wrapper and README:
+
+| Script | What it does |
+|---|---|
+| [Windows Clean-Up](Windows-Clean-Up/README.md) | Reclaims disk space on the system drive using escalating cleanup levels, with optional adaptive scaling based on how little free space remains. |
+| [Windows Update Fix](Windows-Update-Fix/README.md) | Repairs a Windows Update experience broken by leftover or misconfigured Local Group Policy, with an adaptive remediation mode. |
+| [Windows In-Place Upgrade](Windows-InPlace-Upgrade/README.md) | Performs an in-place upgrade (repair install) that re-lays the OS while keeping apps and files — the most reliable fix for deep servicing-stack corruption. |
+| [Windows ISO Updater](Windows-ISO-Updater/README.md) | Downloads the latest official Windows ISO, slipstreams the latest cumulative update into it, and recompiles a fresh, fully-patched bootable ISO. |
+
 ## Additional Information
 ### Does This Script Work?
 
