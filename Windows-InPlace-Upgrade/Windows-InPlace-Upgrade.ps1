@@ -252,9 +252,29 @@ function Get-FileDownload {
     return $false
 }
 
+# Verifies a download URL points at an official Microsoft host over HTTPS, so the script never downloads
+# a Windows "ISO" from somewhere it should not. Microsoft serves the ISOs from hosts under microsoft.com
+# (e.g. software.download.prss.microsoft.com, software-download.microsoft.com). Returns $true only for an
+# https:// URL whose host is microsoft.com or a *.microsoft.com subdomain.
+function Test-MicrosoftDownloadUrl {
+    param([string]$Url)
+    if (-not $Url) { return $false }
+    try {
+        $Uri = [Uri]$Url
+    }
+    catch {
+        return $false
+    }
+    if ($Uri.Scheme -ne 'https') { return $false }
+    # Match the exact host or any subdomain of microsoft.com (case-insensitive). Using the parsed Host
+    # (not a substring of the raw URL) avoids spoofing like "microsoft.com.evil.example".
+    return ($Uri.Host -match '(?i)(^|\.)microsoft\.com$')
+}
+
 # Uses the community "Fido" helper (which queries Microsoft's own software-download servers) to resolve
 # the official, matching Windows ISO download URL. Downloads Fido to a temp file, runs it with -GetUrl,
-# and returns the resulting URL string, or $null on failure. Fido: https://github.com/pbatard/Fido
+# and returns the resulting URL string, or $null on failure. The resolved URL is verified to point at an
+# official Microsoft host before being returned. Fido: https://github.com/pbatard/Fido
 function Get-WindowsIsoUrl {
     param(
         [Parameter(Mandatory)][string]$Version,      # 10 or 11
@@ -296,7 +316,17 @@ function Get-WindowsIsoUrl {
     if (-not $Url) {
         Write-HostTimestamp '  Fido did not return a download URL. Microsoft may have changed its download page, or the requested release/language is unavailable.' -ForegroundColor Red
         Write-HostTimestamp '  Download an ISO yourself and re-run with -IsoPath "C:\path\to\Windows.iso".' -ForegroundColor Yellow
+        return $null
     }
+
+    # Safety check: only download from an official Microsoft host over HTTPS.
+    if (-not (Test-MicrosoftDownloadUrl -Url $Url)) {
+        $BadHost = try { ([Uri]$Url).Host } catch { '(unparseable)' }
+        Write-HostTimestamp "  The resolved download URL does not point at an official Microsoft host (host: $BadHost). Refusing to download it." -ForegroundColor Red
+        Write-HostTimestamp '  Download an ISO yourself from https://www.microsoft.com/software-download and re-run with -IsoPath.' -ForegroundColor Yellow
+        return $null
+    }
+    Write-HostTimestamp "  Verified the ISO download comes from an official Microsoft host: $(([Uri]$Url).Host)" -ForegroundColor Green
     return $Url
 }
 
