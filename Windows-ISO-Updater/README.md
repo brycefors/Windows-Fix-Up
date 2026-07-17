@@ -26,16 +26,18 @@ This PowerShell script automates the whole process. A clean install or in-place 
 > [!TIP]
 > **It is recommended to download the ISO yourself and pass it with `-IsoPath`.** The automatic download relies on the community Fido helper, which queries Microsoft's software-download servers on your behalf. Microsoft rate-limits and can temporarily block IP addresses that make repeated ISO requests, which causes the automatic download to fail. Downloading the ISO once from [microsoft.com/software-download](https://www.microsoft.com/software-download) (or with the Media Creation Tool) and reusing it with `-IsoPath` avoids this entirely — and the script also reuses any ISO already sitting in the download folder.
 
-- The Microsoft Update Catalog has **no public API**, so the script parses its search pages to find the latest cumulative update. If Microsoft changes the catalog layout the lookup may need adjustment; you can always supply your own `.msu`/`.cab` packages with `-UpdatePath`.
-- Recompiling the ISO requires **`oscdimg.exe`**, part of the **Windows ADK "Deployment Tools"** feature. If it is not installed, pass `-InstallAdk` to have the script download and install it from Microsoft, or install the ADK manually first.
+- The Microsoft Update Catalog has **no public API**, so the script parses its search pages to find the latest cumulative update. If Microsoft changes the catalog layout the lookup may need adjustment; you can always supply your own `.msu`/`.cab` packages with `-UpdatePath`.- Recompiling the ISO requires **`oscdimg.exe`**, part of the **Windows ADK "Deployment Tools"** feature. If it is not installed, pass `-InstallAdk` to have the script download and install it from Microsoft, or install the ADK manually first.
 - Every download URL (ISO, updates, ADK) is validated to point at an **official Microsoft host over HTTPS** before anything is downloaded.
+
+> [!IMPORTANT]
+> The working and download folders **must be on a local, fixed disk**. Cloud-synced folders (Google Drive, OneDrive, Dropbox, etc.) turn files into on-demand placeholders and sync them in the background, which makes DISM unable to read the `.msu`/`.wim` reliably — this shows up as *"An error occurred applying the Unattend.xml file from the .msu package"*. By default the script works and downloads under `<SystemDrive>\WISO-Work`; if you run it from a cloud-synced folder, keep `-WorkPath`/`-DownloadPath` pointed at a local disk (and preferably pass your ISO with `-IsoPath` from a local copy).
 
 ## Requirements
 
 - **PowerShell 5.0+** and **Windows 10 / Server 2016** or newer, run **as Administrator**.
 - An internet connection (unless you supply both the ISO with `-IsoPath` and updates with `-UpdatePath`).
 - The **Windows ADK Deployment Tools** (`oscdimg.exe`) — installed automatically with `-InstallAdk`.
-- Plenty of free disk space on the working drive — see [Disk Space Requirements](#disk-space-requirements).
+- Plenty of free disk space on a **local** working drive — see [Disk Space Requirements](#disk-space-requirements).
 
 ## How to Run This Script
 

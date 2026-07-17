@@ -680,86 +680,49 @@ function Reset-MountDirectory {
     New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
 }
 
-# Applies a set of update packages to a mounted image directory with DISM, reporting per-package results.
-# Packages are applied in the order given (checkpoint/SSU baselines first, the main LCU last).
+# Applies a set of update packages to a mounted image directory with a SINGLE DISM /Add-Package call that
+# lists every package in order (checkpoint/SSU baselines first, the main LCU last).
 #
-# .msu files are applied directly first; if DISM rejects the .msu wrapper (a known failure that surfaces as
-# 0x800401e3 "An error occurred applying the Unattend.xml file from the .msu package"), the .msu is expanded
-# and its inner .cab payload is applied instead - the servicing-stack (SSU) .cab before the main .cab.
+# Windows 11 24H2/25H2 cumulative updates are UUP "checkpoint" packages (WIM-based .msu files). DISM has to
+# see the WHOLE set in one command to build a combined action list - adding the checkpoint on its own fails
+# with 0x800401e3 ("Failed to get CBS session / Failed to create action list"). So they are passed together
+# via multiple /PackagePath arguments rather than one Add-WindowsPackage call per file.
+#
+# Returns $true if DISM reported success (or the packages were already present), $false on a real failure.
 function Add-UpdatesToImage {
     param(
         [Parameter(Mandatory)][string]$MountDir,
         [Parameter(Mandatory)][string[]]$Packages
     )
 
+    if (-not $Packages -or $Packages.Count -eq 0) { return $true }
+
+    $DismArgs = @("/Image:$MountDir", '/Add-Package')
     foreach ($Pkg in $Packages) {
-        $Leaf = Split-Path -Leaf $Pkg
-        Write-HostTimestamp "    Applying $Leaf ..."
-
-        $Applied = $false
-        try {
-            Add-WindowsPackage -Path $MountDir -PackagePath $Pkg -ErrorAction Stop | Out-Null
-            $Applied = $true
-            Write-HostTimestamp '      Applied.' -ForegroundColor Green
-        }
-        catch {
-            $Msg = $_.Exception.Message
-            # 0x800f081e = the package (or a newer one) is already in the image - safe to treat as done.
-            if ($Msg -match '0x800f081e') {
-                Write-HostTimestamp '      Already present in the image (superseded/not applicable) - skipping.' -ForegroundColor DarkGray
-                continue
-            }
-            Write-HostTimestamp "      Direct apply failed: $Msg" -ForegroundColor Yellow
-        }
-        if ($Applied) { continue }
-
-        # Fallback for .msu wrapper failures: expand the .msu and apply the inner .cab payload directly.
-        if ($Pkg -notlike '*.msu') { continue }
-        Write-HostTimestamp '      Retrying by expanding the .msu and applying its inner .cab payload...' -ForegroundColor Yellow
-
-        $ExpandDir = Join-Path -Path $WorkRoot -ChildPath ("expand_" + [System.IO.Path]::GetFileNameWithoutExtension($Pkg))
-        try {
-            if (Test-Path $ExpandDir) { Remove-Item -LiteralPath $ExpandDir -Recurse -Force -ErrorAction SilentlyContinue }
-            New-Item -ItemType Directory -Path $ExpandDir -Force -ErrorAction Stop | Out-Null
-
-            # expand.exe -f:* unpacks every file from the .msu into the target folder.
-            & expand.exe "$Pkg" -f:* "$ExpandDir" | Out-Null
-
-            # The applicable payload is the .cab file(s), excluding the WSUSSCAN metadata catalog. Apply any
-            # servicing-stack (SSU) cab first, then the remaining cab(s).
-            $Cabs = Get-ChildItem -Path $ExpandDir -Filter '*.cab' -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notmatch '(?i)WSUSSCAN' }
-            $OrderedCabs = @(
-                ($Cabs | Where-Object { $_.Name -match '(?i)SSU|ServicingStack' })
-                ($Cabs | Where-Object { $_.Name -notmatch '(?i)SSU|ServicingStack' })
-            )
-
-            if (-not $OrderedCabs -or $OrderedCabs.Count -eq 0) {
-                Write-HostTimestamp '      No applicable .cab payload was found inside the .msu.' -ForegroundColor Yellow
-            }
-            foreach ($Cab in $OrderedCabs) {
-                Write-HostTimestamp "      Applying inner package $($Cab.Name) ..."
-                try {
-                    Add-WindowsPackage -Path $MountDir -PackagePath $Cab.FullName -ErrorAction Stop | Out-Null
-                    Write-HostTimestamp '        Applied.' -ForegroundColor Green
-                }
-                catch {
-                    if ($_.Exception.Message -match '0x800f081e') {
-                        Write-HostTimestamp '        Already present in the image - skipping.' -ForegroundColor DarkGray
-                    }
-                    else {
-                        Write-HostTimestamp "        Could not apply this package: $($_.Exception.Message)" -ForegroundColor Yellow
-                    }
-                }
-            }
-        }
-        catch {
-            Write-HostTimestamp "      Could not expand/apply the .msu: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-        finally {
-            Remove-Item -LiteralPath $ExpandDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        Write-HostTimestamp "      + $(Split-Path -Leaf $Pkg)"
+        $DismArgs += "/PackagePath:$Pkg"
     }
+    Write-HostTimestamp '      Applying the package set with DISM (this can take several minutes)...'
+
+    $Output = & dism.exe @DismArgs 2>&1
+    $ExitCode = $LASTEXITCODE
+
+    # DISM: 0 = success, 3010 = success/reboot required. Both are fine for offline servicing.
+    if ($ExitCode -eq 0 -or $ExitCode -eq 3010) {
+        Write-HostTimestamp '      Applied.' -ForegroundColor Green
+        return $true
+    }
+    # 0x800f081e = the package (or a newer one) is already present / not applicable - non-fatal.
+    if ($Output -match '0x800f081e') {
+        Write-HostTimestamp '      Package(s) already present or not applicable - skipping.' -ForegroundColor DarkGray
+        return $true
+    }
+
+    Write-HostTimestamp "      DISM could not apply the package set (exit code $ExitCode). See C:\Windows\Logs\DISM\dism.log for details." -ForegroundColor Yellow
+    $Output | Where-Object { $_ -match '(?i)error|0x[0-9a-f]{8}' } | Select-Object -Last 8 | ForEach-Object {
+        Write-Host "        $_" -ForegroundColor DarkGray
+    }
+    return $false
 }
 
 Write-Host $LineBreak
@@ -769,12 +732,26 @@ Write-Host $LineBreak
 $WinInfo = Get-InstalledWindowsInfo
 
 # --- Resolve working folders ---
-# The working folder should live on a fast drive with lots of free space and, ideally, no spaces in the
-# path (oscdimg's -bootdata argument dislikes spaces; short paths are used to work around it regardless).
+# The working and download folders MUST live on a local, fixed disk. Cloud-synced folders (Google Drive,
+# OneDrive, Dropbox, etc.) turn files into on-demand placeholders and sync them in the background, which
+# makes DISM unable to read the .msu/.wim reliably ("An error occurred applying the Unattend.xml file from
+# the .msu package"). They should also have lots of free space and, ideally, no spaces in the path
+# (oscdimg's -bootdata dislikes spaces; short paths are used to work around it regardless).
 $WorkRoot = if ($WorkPath) { $WorkPath } else { Join-Path -Path $env:SystemDrive -ChildPath 'WISO-Work' }
 $ExtractDir = Join-Path -Path $WorkRoot -ChildPath 'ISO'
 $MountDir   = Join-Path -Path $WorkRoot -ChildPath 'Mount'
-$DlDir = if ($DownloadPath) { $DownloadPath } else { $PSScriptRoot }
+# Default downloads to a LOCAL folder under the work root - NOT the script folder, which may sit on a
+# cloud-synced drive (this repo, for example, lives under a Google Drive "My Drive" path).
+$DlDir = if ($DownloadPath) { $DownloadPath } else { Join-Path -Path $WorkRoot -ChildPath 'Downloads' }
+
+# Warn if a working/download path looks like a cloud-synced folder - servicing from there is unreliable.
+$CloudPattern = '(?i)[\\/](My Drive|Google Drive|GoogleDrive|OneDrive|OneDrive - |Dropbox|iCloudDrive|Box)[\\/]'
+foreach ($Pair in @(@{ Name = 'Working folder'; Path = $WorkRoot }, @{ Name = 'Download folder'; Path = $DlDir })) {
+    if ($Pair.Path -match $CloudPattern -or $Pair.Path -match '(?i)OneDrive') {
+        Write-HostTimestamp "WARNING: The $($Pair.Name.ToLower()) is on a cloud-synced path ($($Pair.Path))." -ForegroundColor Yellow
+        Write-HostTimestamp "         DISM cannot reliably service files that a cloud client streams/dehydrates. Use -WorkPath and -DownloadPath to point at a LOCAL disk (e.g. C:\WISO-Work)." -ForegroundColor Yellow
+    }
+}
 
 foreach ($Dir in @($WorkRoot, $DlDir)) {
     try {
@@ -882,6 +859,30 @@ if ($IsoPath) {
     if (Test-Path -LiteralPath $IsoPath) {
         $ResolvedIso = (Resolve-Path -LiteralPath $IsoPath).Path
         Write-HostTimestamp "Using the provided ISO: $ResolvedIso" -ForegroundColor Green
+
+        # If the ISO sits on a cloud-synced path, copy it to the local download folder first. Mounting and
+        # reading a cloud placeholder during the long extraction is slow and unreliable; a local copy is not.
+        if (($ResolvedIso -match $CloudPattern -or $ResolvedIso -match '(?i)OneDrive') -and
+            -not ($DlDir -match $CloudPattern -or $DlDir -match '(?i)OneDrive')) {
+            $LocalIso = Join-Path -Path $DlDir -ChildPath (Split-Path -Leaf $ResolvedIso)
+            $SourceLen = (Get-Item -LiteralPath $ResolvedIso).Length
+            if ((Test-Path -LiteralPath $LocalIso) -and ((Get-Item -LiteralPath $LocalIso).Length -eq $SourceLen)) {
+                Write-HostTimestamp "  A local copy already exists - using it: $LocalIso" -ForegroundColor Green
+                $ResolvedIso = $LocalIso
+            }
+            else {
+                try {
+                    Invoke-Task -Description "The ISO is on a cloud-synced path; copying it to a local disk first ($([math]::Round($SourceLen / 1GB, 2)) GB): $LocalIso ..." -ScriptBlock {
+                        Copy-Item -LiteralPath $ResolvedIso -Destination $LocalIso -Force -ErrorAction Stop
+                        Write-HostTimestamp '  Copy complete.' -ForegroundColor Green
+                    }
+                    $ResolvedIso = $LocalIso
+                }
+                catch {
+                    Write-HostTimestamp "  Could not copy the ISO locally ($($_.Exception.Message)). Proceeding from the cloud path - this may be slow or fail." -ForegroundColor Yellow
+                }
+            }
+        }
     }
     else {
         Write-HostTimestamp "The ISO path '$IsoPath' does not exist. Cannot continue." -ForegroundColor Red
@@ -1180,6 +1181,8 @@ else {
 
 # --- Service the images ---
 if ($UpdatePackages.Count -gt 0) {
+    # Tracks editions whose update set failed to apply, so we can warn loudly at the end.
+    $script:ServicingFailures = 0
     # Start from a clean mount directory, discarding any stale mount a previous crashed run left behind.
     Reset-MountDirectory -Path $MountDir
 
@@ -1213,7 +1216,12 @@ if ($UpdatePackages.Count -gt 0) {
                     }
                 }
 
-                Add-UpdatesToImage -MountDir $MountDir -Packages $UpdatePackages
+                Write-HostTimestamp '    Applying updates to install.wim...'
+                $script:InstallApplyOk = Add-UpdatesToImage -MountDir $MountDir -Packages $UpdatePackages
+                if (-not $script:InstallApplyOk) {
+                    $script:ServicingFailures++
+                    Write-HostTimestamp "    WARNING: the update package set did NOT apply to index $Index ($EditionName). This edition will not be patched." -ForegroundColor Red
+                }
 
                 Write-HostTimestamp '    Cleaning up the component store (/StartComponentCleanup /ResetBase)...'
                 # ResetBase permanently removes superseded components, shrinking the image. This is slow.
@@ -1348,6 +1356,10 @@ Write-Host $LineBreak
 Write-HostTimestamp 'Done. Your updated Windows installation ISO is ready:' -ForegroundColor Green
 Write-HostTimestamp "  $OutputIsoPath" -ForegroundColor Green
 Write-Host ''
+if ($script:ServicingFailures -gt 0) {
+    Write-HostTimestamp "WARNING: updates FAILED to apply to $($script:ServicingFailures) edition(s). The ISO was still built, but those editions are NOT patched. Check C:\Windows\Logs\DISM\dism.log." -ForegroundColor Red
+    Write-Host ''
+}
 Write-Host 'You can write it to a USB drive (e.g. with Rufus) or use it for a clean install or in-place upgrade.'
 Write-Host $LineBreak
 
