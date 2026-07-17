@@ -612,6 +612,7 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $DownloadOnly) {
     Write-Host ""
     Write-Host "The upgrade takes 20-90 minutes and WILL RESTART the computer several times." -ForegroundColor Yellow
     Write-Host "Close your apps and save your work before continuing." -ForegroundColor Yellow
+    Write-Host "Once Setup starts, closing this window will NOT stop the upgrade." -ForegroundColor Yellow
     Write-Host ""
     $Confirm = Read-Host "Type 'Y' to continue, or anything else to cancel"
     if ($Confirm -notin @('Y', 'y', 'Yes', 'yes')) {
@@ -817,6 +818,10 @@ else {
     Write-Host 'If the upgrade did not complete, check C:\$WINDOWS.~BT\Sources\Panther\setupact.log.'
 }
 
+if ($SetupStarted) {
+    Write-HostTimestamp 'NOTE: Windows Setup runs as its own process - closing this window will NOT stop the upgrade.' -ForegroundColor Cyan
+}
+
 # Schedule cleanup of the ISO - but ONLY when this run downloaded it (never an -IsoPath ISO or one that
 # was already sitting in the download folder). The task runs after the next boot, once Setup is done.
 if ($SetupStarted -and $IsoWasDownloaded -and $ResolvedIso) {
@@ -834,7 +839,7 @@ elseif ($SetupStarted -and -not $IsoWasDownloaded -and $ResolvedIso) {
 
 Write-HostTimestamp 'Windows In-Place Upgrade script finished.' -ForegroundColor Green
 if (-not $Unattended -and -not $SkipInteractive) {
-    Read-Host -Prompt 'Close window or press enter to exit.'
+    Read-Host -Prompt 'Closing this window will NOT stop the upgrade. Press enter to exit.'
 }
 
 # Stop logging
