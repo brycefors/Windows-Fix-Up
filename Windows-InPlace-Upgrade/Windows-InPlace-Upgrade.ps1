@@ -498,6 +498,50 @@ function Watch-SetupProgress {
     return [PSCustomObject]@{ Progressed = $Progressed; RebootPending = $RebootPending; LastProgress = $LastProgress }
 }
 
+# Registers a one-shot SYSTEM scheduled task that deletes the DOWNLOADED ISO once the upgrade is out of
+# the way. The ISO stays mounted while Setup runs and the machine reboots during the upgrade, so we
+# cannot safely delete it in-line; instead the task fires at startup (after a short delay), waits for any
+# Setup process to finish, dismounts the image if needed, deletes the ISO, and then removes itself. It is
+# only ever called for an ISO this run downloaded - never for -IsoPath or a reused existing ISO.
+function Register-IsoCleanupTask {
+    param([Parameter(Mandatory)][string]$IsoPath)
+
+    $TaskName = 'WindowsInPlaceUpgrade_IsoCleanup'
+    $WorkDir = Join-Path -Path $env:ProgramData -ChildPath 'Windows-InPlace-Upgrade'
+    try { if (-not (Test-Path $WorkDir)) { New-Item -ItemType Directory -Path $WorkDir -Force -ErrorAction Stop | Out-Null } }
+    catch { $WorkDir = $env:TEMP }
+    $WorkerFile = Join-Path -Path $WorkDir -ChildPath 'Cleanup-Iso.ps1'
+    $WorkerLog = Join-Path -Path $WorkDir -ChildPath 'Cleanup-Iso.log'
+
+    # Worker script: wait out any running Setup, dismount/delete the ISO, then unregister and self-delete.
+    $WorkerContent = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+`$Iso = '$($IsoPath.Replace("'", "''"))'
+`$TaskName = '$TaskName'
+try { Start-Transcript -Path '$($WorkerLog.Replace("'", "''"))' -Force | Out-Null } catch { }
+# Do not pull the ISO out from under an active Setup: wait until no Setup process is running (max ~2 hrs).
+`$Names = @('setup','SetupHost','SetupPrep','SetupPlatform','Windows10UpgraderApp')
+for (`$i = 0; `$i -lt 240; `$i++) {
+    if (-not (Get-Process -Name `$Names -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Seconds 30
+}
+try { Dismount-DiskImage -ImagePath `$Iso -ErrorAction SilentlyContinue | Out-Null } catch { }
+if (Test-Path -LiteralPath `$Iso) { Remove-Item -LiteralPath `$Iso -Force -ErrorAction SilentlyContinue }
+try { Unregister-ScheduledTask -TaskName `$TaskName -Confirm:`$false -ErrorAction SilentlyContinue } catch { }
+try { Stop-Transcript | Out-Null } catch { }
+Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
+"@
+    Set-Content -Path $WorkerFile -Value $WorkerContent -Encoding UTF8 -Force -ErrorAction Stop
+
+    $Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$WorkerFile`""
+    $Trigger = New-ScheduledTaskTrigger -AtStartup
+    # Give the machine a few minutes after boot before the cleanup fires.
+    try { $Trigger.Delay = 'PT3M' } catch { }
+    $Principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force -ErrorAction Stop | Out-Null
+}
+
 Write-Host $LineBreak
 Write-HostTimestamp "Windows In-Place Upgrade (repair install) on $($env:ComputerName)" -ForegroundColor Cyan
 Write-Host $LineBreak
@@ -585,6 +629,9 @@ if ($Unattended) {
 
 # --- Obtain the ISO ---
 $ResolvedIso = $null
+# Tracks whether THIS run downloaded the ISO. Only a downloaded ISO is eligible for auto-cleanup - an
+# ISO supplied with -IsoPath or one found already sitting in the download folder is left untouched.
+$IsoWasDownloaded = $false
 
 if ($IsoPath) {
     if (Test-Path -LiteralPath $IsoPath) {
@@ -655,6 +702,7 @@ else {
             }
             Write-HostTimestamp "  Download complete ($SizeGB GB)." -ForegroundColor Green
         }
+        $IsoWasDownloaded = $true
     }
 }
 
@@ -767,6 +815,21 @@ elseif ($SetupOutcome -and $SetupOutcome.RebootPending) {
 else {
     Write-HostTimestamp 'Windows Setup has finished running.' -ForegroundColor Green
     Write-Host 'If the upgrade did not complete, check C:\$WINDOWS.~BT\Sources\Panther\setupact.log.'
+}
+
+# Schedule cleanup of the ISO - but ONLY when this run downloaded it (never an -IsoPath ISO or one that
+# was already sitting in the download folder). The task runs after the next boot, once Setup is done.
+if ($SetupStarted -and $IsoWasDownloaded -and $ResolvedIso) {
+    try {
+        Register-IsoCleanupTask -IsoPath $ResolvedIso
+        Write-HostTimestamp "Scheduled a one-time cleanup task to delete the downloaded ISO ($ResolvedIso) after the upgrade completes." -ForegroundColor Cyan
+    }
+    catch {
+        Write-HostTimestamp "Could not schedule the ISO cleanup task: $($_.Exception.Message). You can delete the ISO manually later: $ResolvedIso" -ForegroundColor Yellow
+    }
+}
+elseif ($SetupStarted -and -not $IsoWasDownloaded -and $ResolvedIso) {
+    Write-HostTimestamp "The ISO was supplied or reused (not downloaded by this run), so it will be left in place: $ResolvedIso" -ForegroundColor DarkGray
 }
 
 Write-HostTimestamp 'Windows In-Place Upgrade script finished.' -ForegroundColor Green

@@ -16,6 +16,7 @@ This PowerShell script automates the whole process: it detects your installed Wi
 - [What the Script Does](#what-the-script-does)
 - [How the ISO Is Downloaded](#how-the-iso-is-downloaded)
 - [Keep Modes](#keep-modes)
+- [Upgrading Incompatible Machines](#upgrading-incompatible-machines)
 - [Disk Space Requirements](#disk-space-requirements)
 - [Logging](#logging)
 
@@ -126,7 +127,7 @@ powershell -ExecutionPolicy Bypass -File $d -DownloadPath 'C:\ISO'
 2.  **Disk space check** — Confirms there is enough free space (~20 GB for the upgrade, ~8 GB for download-only) before doing anything.
 3.  **ISO acquisition** — If a valid Windows ISO (larger than 3 GB) is already present in the download folder, it is **reused instead of downloading again**. Otherwise the script downloads the [Fido](https://github.com/pbatard/Fido) helper, uses it to resolve the official Microsoft ISO download URL, then downloads the ISO (resumable via BITS, with an `Invoke-WebRequest` fallback). Skipped entirely when you supply `-IsoPath`.
 4.  **Mount & launch** — Mounts the ISO, locates `setup.exe`, and launches Windows Setup in in-place-upgrade mode with the chosen keep-mode. By default the Setup GUI is hidden (`/quiet`) and Dynamic Update is disabled.
-5.  **Cleanup** — Dismounts the ISO when appropriate.
+5.  **Cleanup** — Dismounts the ISO if Setup fails to start. When the ISO was **downloaded by the script**, a one-time SYSTEM scheduled task (`WindowsInPlaceUpgrade_IsoCleanup`) is registered to delete it after the next boot once Setup has finished, then unregister itself. An ISO supplied with `-IsoPath` or one that was already present in the download folder is **never deleted**.
 
 ## How the ISO Is Downloaded
 
@@ -144,6 +145,17 @@ If you would rather not run an external helper, download an ISO manually (e.g. f
 |---|---|
 | `KeepAll` *(default)* | Keeps your apps, settings, and personal files. This is the true "repair install." |
 | `KeepNothing` | Clean install — nothing is kept. **Use with caution.** |
+
+## Upgrading Incompatible Machines
+
+Windows 11 refuses to upgrade PCs that fail its hardware requirements (TPM 2.0, Secure Boot, a supported CPU, minimum RAM). Passing `-BypassCompatChecks` works around this by launching Setup with its `/product server` switch, which runs the Server SKU installer and skips those consumer compatibility gates while still performing a normal in-place upgrade:
+
+```powershell
+.\Windows-InPlace-Upgrade.ps1 -BypassCompatChecks
+```
+
+> [!WARNING]
+> This bypass installs Windows 11 on hardware Microsoft does not officially support. Such machines **may not be entitled to updates** and can behave unpredictably. Use it only when you understand and accept those risks. It does not change what Setup keeps — combine it with the default `KeepAll` for a normal repair-style upgrade.
 
 ## Disk Space Requirements
 
