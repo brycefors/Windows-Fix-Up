@@ -860,9 +860,33 @@ elseif ($SetupOutcome -and $SetupOutcome.RebootPending) {
         Write-Host 'The computer will restart automatically to continue. Do not power it off during the upgrade.'
     }
 }
+elseif ($NoReboot) {
+    # -NoReboot was requested, so Setup intentionally does NOT restart at the end of the down-level phase.
+    # In that case "no automatic reboot" is expected, not a failure signal - and the pending-reboot flag is
+    # not always registered before setup.exe exits. Do not cry failure here; give a neutral, cautious note.
+    $ExitHex = if ($null -ne $SetupExitCode) { '0x{0:X8}' -f ([uint32]($SetupExitCode -band 0xFFFFFFFF)) } else { $null }
+    $ExitNote = if ($ExitHex) { " (exit code $SetupExitCode / $ExitHex)" } else { '' }
+    Write-HostTimestamp "Windows Setup finished its down-level phase without restarting because -NoReboot was set$ExitNote." -ForegroundColor Cyan
+    Write-Host 'Restart the computer when ready to let Setup finish the upgrade.'
+    Write-Host 'If, after rebooting, the upgrade does not continue, review C:\$WINDOWS.~BT\Sources\Panther\setupact.log and setuperr.log (or run SetupDiag: https://aka.ms/SetupDiag).'
+}
 else {
-    Write-HostTimestamp 'Windows Setup has finished running.' -ForegroundColor Green
-    Write-Host 'If the upgrade did not complete, check C:\$WINDOWS.~BT\Sources\Panther\setupact.log.'
+    # Setup ran and then exited WITHOUT leaving a pending-reboot indicator AND -NoReboot was not requested.
+    # A successful in-place upgrade always finishes its down-level phase by scheduling a restart to continue,
+    # so reaching here means Setup quit before that point - which almost always means the upgrade FAILED
+    # (blocking compat issue, driver/app hold, media/space problem, etc.), not that it succeeded silently.
+    # Treat it as a probable failure and point at the diagnostics.
+    $ExitHex = if ($null -ne $SetupExitCode) { '0x{0:X8}' -f ([uint32]($SetupExitCode -band 0xFFFFFFFF)) } else { $null }
+    $ExitNote = if ($ExitHex) { " (exit code $SetupExitCode / $ExitHex)" } else { '' }
+    Write-HostTimestamp "Windows Setup finished but did NOT schedule a restart$ExitNote." -ForegroundColor Yellow
+    Write-HostTimestamp 'A successful in-place upgrade would have queued an automatic reboot to continue, so this almost certainly means Setup FAILED and rolled back.' -ForegroundColor Yellow
+    Write-Host 'Review these logs to find the reason:'
+    Write-Host '  - C:\$WINDOWS.~BT\Sources\Panther\setupact.log   (search for "Overall progress" and lines near "error")'
+    Write-Host '  - C:\$WINDOWS.~BT\Sources\Panther\setuperr.log'
+    Write-Host '  - Run SetupDiag (https://aka.ms/SetupDiag) for a plain-language diagnosis of the failure.'
+    if ($ExitHex) {
+        Write-Host "  - Look up the Setup exit code $ExitHex (e.g. 0xC1900208 = an app/compat block, 0xC1900101 = a driver/rollback failure)."
+    }
 }
 
 if ($SetupStarted) {
