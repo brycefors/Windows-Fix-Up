@@ -716,16 +716,26 @@ function Add-UpdateGroup {
         Write-HostTimestamp "      Applying ${Label}: $(Split-Path -Leaf $Target)$Extra"
         Write-HostTimestamp '      Running DISM /Add-Package with the target as the sole package (this can take several minutes)...'
 
-        $Output = & dism.exe "/Image:$MountDir" '/Add-Package' "/PackagePath:$Target" 2>&1
-        $ExitCode = $LASTEXITCODE
+        # Run DISM, and if it fails on the first try, retry once - transient issues (locked files, a busy
+        # servicing stack, a momentary I/O hiccup) often clear on a second attempt.
+        $MaxAttempts = 2
+        for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
+            $Output = & dism.exe "/Image:$MountDir" '/Add-Package' "/PackagePath:$Target" 2>&1
+            $ExitCode = $LASTEXITCODE
 
-        if ($ExitCode -eq 0 -or $ExitCode -eq 3010) {
-            Write-HostTimestamp '      Applied.' -ForegroundColor Green
-            return $true
-        }
-        if ($Output -match '0x800f081e') {
-            Write-HostTimestamp '      Already present / not applicable - skipping.' -ForegroundColor DarkGray
-            return $true
+            if ($ExitCode -eq 0 -or $ExitCode -eq 3010) {
+                Write-HostTimestamp '      Applied.' -ForegroundColor Green
+                return $true
+            }
+            if ($Output -match '0x800f081e') {
+                Write-HostTimestamp '      Already present / not applicable - skipping.' -ForegroundColor DarkGray
+                return $true
+            }
+
+            if ($Attempt -lt $MaxAttempts) {
+                Write-HostTimestamp "      DISM /Add-Package failed (exit code $ExitCode). Retrying once..." -ForegroundColor DarkYellow
+                Start-Sleep -Seconds 5
+            }
         }
 
         Write-HostTimestamp "      This package didn't apply (DISM exit code $ExitCode). Details are in C:\Windows\Logs\DISM\dism.log." -ForegroundColor DarkYellow
