@@ -366,7 +366,7 @@ $CleanupLevel = 0
 #   * At/under the aggressive threshold -> Aggressive cleanup.
 # Remediation runs hands-off (no prompts).
 if ($Remediate) {
-    Clear-Host
+    # Clear-Host
     Write-HostTimestamp "Running in adaptive Remediation mode on $($env:ComputerName) - assessing free disk space..." -ForegroundColor Cyan
     $FreeGB = Get-SystemDriveFreeGB
     if ($null -eq $FreeGB) {
@@ -395,7 +395,7 @@ if ($Remediate) {
 # --- Forced level (optional) ---
 # Skips the free-space assessment entirely and applies the specified level directly.
 if ($ForceLevel -and -not $Remediate) {
-    Clear-Host
+    # Clear-Host
     $CleanupLevel = switch ($ForceLevel) { 'Light' { 1 } 'Medium' { 2 } 'Severe' { 3 } 'Aggressive' { 4 } }
     $LevelColor = switch ($CleanupLevel) { 1 { 'Green' } 2 { 'Yellow' } 3 { 'Yellow' } 4 { 'Red' } }
     Write-HostTimestamp "Running in Forced level mode ($ForceLevel) on $($env:ComputerName)..." -ForegroundColor Cyan
@@ -408,7 +408,7 @@ if ($ForceLevel -and -not $Remediate) {
 # When not in an automated mode, show the free space, recommend a level based on the thresholds,
 # and let the user confirm or choose a different level.
 if (-not $Unattended -and -not $SkipInteractive) {
-    Clear-Host
+    # Clear-Host
     if ($script:AuditMode) {
         Write-HostTimestamp "Running Windows Clean-Up in AUDIT mode (read-only) on $($env:ComputerName)..." -ForegroundColor Cyan
     }
