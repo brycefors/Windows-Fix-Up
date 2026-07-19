@@ -14,7 +14,7 @@
 #      default (/auto upgrade), with the Setup GUI hidden (/quiet) and Dynamic Update disabled by default.
 #   4. Dismounts the ISO when done.
 #
-# The ISO download is large (~5-6 GB) and the upgrade needs roughly 20 GB of free space to stage, so the
+# The ISO download is large (~8 GB) and the upgrade needs roughly 20 GB of free space to stage, so the
 # script checks disk space up front. Setup itself takes 20-90 minutes and will restart the machine several
 # times; by default it prompts before it begins. For hands-off use pass -Unattended (and optionally
 # -NoReboot to hold the final restart).
@@ -47,7 +47,7 @@ param(
     [ValidateSet('KeepAll', 'KeepNothing')]
     [string]$KeepMode = 'KeepAll',
 
-    [Parameter(HelpMessage = 'Directory to download the ISO into (defaults to C:\Temp\Windows-InPlace-Upgrade). Needs ~6 GB free')]
+    [Parameter(HelpMessage = 'Directory to download the ISO into (defaults to C:\Temp\Windows-InPlace-Upgrade). Needs ~8 GB free')]
     [string]$DownloadPath = 'C:\Temp\Windows-InPlace-Upgrade',
 
     [Parameter(HelpMessage = 'Only obtain/download the ISO; do not launch the in-place upgrade')]
@@ -631,7 +631,7 @@ Write-Host "  Upgrade target : Windows $WindowsVersion ($Release, $Language)"
 Write-Host $LineBreak
 
 # --- Disk space check ---
-# An in-place upgrade downloads a ~5-6 GB ISO and needs roughly 20 GB free to stage the new OS alongside
+# An in-place upgrade downloads a ~8 GB ISO and needs roughly 20 GB free to stage the new OS alongside
 # the current one. Gate the run on available space so it does not fail partway through.
 $FreeGB = Get-SystemDriveFreeGB
 if ($null -eq $FreeGB) {
@@ -671,7 +671,7 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $DownloadOnly) {
     Write-Host ""
     Write-Host "It will:"
     if (-not $IsoPath) {
-        Write-Host "  - Download the matching official Windows $WindowsVersion ISO from Microsoft (~5-6 GB)"
+        Write-Host "  - Download the matching official Windows $WindowsVersion ISO from Microsoft (~8 GB)"
     }
     else {
         Write-Host "  - Use the ISO you provided: $IsoPath"

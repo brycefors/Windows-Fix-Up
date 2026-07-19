@@ -26,7 +26,7 @@ This PowerShell script automates the whole process: it detects your installed Wi
 > An in-place upgrade **re-installs Windows**. Although it is designed to preserve your apps and files, any OS-level change carries risk. **Back up important data first.** The process takes 20–90 minutes and **restarts the computer several times** — do not power the machine off while it is running.
 
 - Requires **PowerShell 5.0+** and **Windows 10 / Server 2016** or newer.
-- Needs an internet connection to download the ISO (unless you supply your own with `-IsoPath`) and roughly **20 GB of free disk space** to stage the upgrade (plus ~6 GB for the ISO).
+- Needs an internet connection to download the ISO (unless you supply your own with `-IsoPath`) and roughly **20 GB of free disk space** to stage the upgrade (plus ~8 GB for the ISO).
 - The script downloads and runs the third-party **Fido** helper to resolve the official Microsoft ISO link. If you prefer not to run external code, download an ISO yourself and pass it with `-IsoPath`.
 - After a successful upgrade you can reclaim 10–30 GB by removing the leftover `Windows.old` / `$Windows.~BT` folders — the main [Windows Fix-Up](../README.md) script does this with `-CleanupUpgradeFolders`.
 

@@ -873,7 +873,7 @@ Write-HostTimestamp "Download folder: $DlDir"
 Write-Host $LineBreak
 
 # --- Disk space check ---
-# The download (~6 GB), extracted media (~6 GB), the mounted image, and the re-exported image all coexist
+# The download (~8 GB), extracted media (~8 GB), the mounted image, and the re-exported image all coexist
 # during the build, so the working drive needs plenty of headroom.
 $FreeGB = Get-DriveFreeGB -Path $WorkRoot
 if ($null -eq $FreeGB) {
@@ -894,7 +894,7 @@ Write-Host $LineBreak
 if (-not $Unattended -and -not $SkipInteractive -and -not $ListEditions) {
     Write-Host "This tool builds an updated Windows installation ISO. It will:"
     if (-not $IsoPath) {
-        Write-Host "  - Download the matching official Windows $WindowsVersion ISO from Microsoft (~5-6 GB)"
+        Write-Host "  - Download the matching official Windows $WindowsVersion ISO from Microsoft (~8 GB)"
         Write-Host "      TIP: Microsoft can rate-limit/block repeated ISO downloads. If the download fails," -ForegroundColor Yellow
         Write-Host "           download the ISO yourself and re-run with -IsoPath to avoid this." -ForegroundColor Yellow
     }
