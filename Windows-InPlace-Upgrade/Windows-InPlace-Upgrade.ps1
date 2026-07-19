@@ -438,6 +438,70 @@ function Test-IsoIsWindowsMedia {
     }
 }
 
+# Windows Setup needs stable local media - running it from a network share or an on-demand OneDrive/cloud
+# file can stall or fail (and a dehydrated cloud placeholder is not actually present on disk). If the ISO
+# lives in a network location (UNC path or mapped network drive) or a OneDrive/cloud folder, this copies
+# it to a local staging folder and returns the local path; otherwise it returns the original path
+# unchanged. Returns $null if a needed copy fails.
+function Get-LocalIsoPath {
+    param(
+        [Parameter(Mandatory)][string]$IsoPath,
+        [string]$StagingDir = 'C:\Temp'
+    )
+
+    $Reason = $null
+
+    # Network location: a UNC path (\\server\share\...) or a mapped network drive (DriveType 4).
+    if ($IsoPath -match '^\\\\') {
+        $Reason = 'a network location (UNC path)'
+    }
+    else {
+        try {
+            $Qualifier = Split-Path -Path $IsoPath -Qualifier -ErrorAction SilentlyContinue  # e.g. "Z:"
+            if ($Qualifier) {
+                $Disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$Qualifier'" -ErrorAction SilentlyContinue
+                if ($Disk -and $Disk.DriveType -eq 4) { $Reason = 'a mapped network drive' }
+            }
+        }
+        catch { }
+    }
+
+    # OneDrive / cloud folder: a path under a known OneDrive root, or a dehydrated cloud placeholder file.
+    if (-not $Reason) {
+        $OneDriveRoots = @($env:OneDrive, $env:OneDriveCommercial, $env:OneDriveConsumer) |
+            Where-Object { $_ } | Select-Object -Unique
+        foreach ($Root in $OneDriveRoots) {
+            if ($IsoPath -like "$Root*") { $Reason = 'a OneDrive folder'; break }
+        }
+    }
+    if (-not $Reason) {
+        try {
+            $Item = Get-Item -LiteralPath $IsoPath -Force -ErrorAction Stop
+            # Offline (0x1000) or RecallOnDataAccess (0x400000) mark a cloud-only / on-demand placeholder.
+            $Attr = [int]$Item.Attributes
+            if (($Attr -band 0x1000) -or ($Attr -band 0x400000)) {
+                $Reason = 'an on-demand cloud file (not fully downloaded locally)'
+            }
+        }
+        catch { }
+    }
+
+    if (-not $Reason) { return $IsoPath }
+
+    Write-HostTimestamp "The ISO is on $Reason. Copying it locally to $StagingDir before use (Setup cannot run reliably from there)..." -ForegroundColor Yellow
+    try {
+        if (-not (Test-Path $StagingDir)) { New-Item -ItemType Directory -Path $StagingDir -Force -ErrorAction Stop | Out-Null }
+        $Destination = Join-Path -Path $StagingDir -ChildPath (Split-Path -Path $IsoPath -Leaf)
+        Copy-Item -LiteralPath $IsoPath -Destination $Destination -Force -ErrorAction Stop
+        Write-HostTimestamp "  Copied to $Destination" -ForegroundColor Green
+        return $Destination
+    }
+    catch {
+        Write-HostTimestamp "  Could not copy the ISO locally: $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+}
+
 # Returns $true if any Windows Setup process is currently running. Setup.exe is only a small launcher
 # that spawns the real long-running workers, so we watch for the whole family, not just setup.exe.
 function Test-SetupRunning {
@@ -732,14 +796,28 @@ if ($Unattended) {
 
 # --- Obtain the ISO ---
 $ResolvedIso = $null
-# Tracks whether THIS run downloaded the ISO. Only a downloaded ISO is eligible for auto-cleanup - an
-# ISO supplied with -IsoPath or one found already sitting in the download folder is left untouched.
+# Tracks whether THIS run created the local ISO that Setup will use - either by downloading it, or by
+# staging a local copy of a network/OneDrive ISO into C:\Temp. Only an ISO this run created locally is
+# eligible for auto-cleanup; an ISO already sitting locally (supplied with -IsoPath or found in the
+# download folder) is left untouched.
 $IsoWasDownloaded = $false
+$IsoWasStaged = $false
 
 if ($IsoPath) {
     if (Test-Path -LiteralPath $IsoPath) {
         $ResolvedIso = (Resolve-Path -LiteralPath $IsoPath).Path
         Write-HostTimestamp "Using the provided ISO: $ResolvedIso" -ForegroundColor Green
+        # If it lives on a network share or a OneDrive/cloud folder, stage a local copy so Setup can run
+        # reliably (Setup cannot run dependably from a network location or an on-demand cloud file).
+        $LocalIso = Get-LocalIsoPath -IsoPath $ResolvedIso
+        if (-not $LocalIso) {
+            Write-HostTimestamp 'Could not stage the ISO to a local drive. Cannot continue.' -ForegroundColor Red
+            Stop-Transcript | Out-Null
+            exit 1
+        }
+        # A staged local copy is a throwaway artifact this run created, so mark it for the same auto-cleanup.
+        if ($LocalIso -ne $ResolvedIso) { $IsoWasStaged = $true }
+        $ResolvedIso = $LocalIso
     }
     else {
         Write-HostTimestamp "The ISO path '$IsoPath' does not exist. Cannot continue." -ForegroundColor Red
@@ -779,6 +857,17 @@ else {
         Write-HostTimestamp '  Not valid Windows installation media - skipping and checking the next ISO.' -ForegroundColor Yellow
     }
     if ($ResolvedIso) {
+        # If the reused ISO sits on a network share or OneDrive/cloud folder (e.g. -DownloadPath points
+        # there), stage a local copy so Setup can run reliably.
+        $LocalIso = Get-LocalIsoPath -IsoPath $ResolvedIso
+        if (-not $LocalIso) {
+            Write-HostTimestamp 'Could not stage the ISO to a local drive. Cannot continue.' -ForegroundColor Red
+            Stop-Transcript | Out-Null
+            exit 1
+        }
+        # A staged local copy is a throwaway artifact this run created, so mark it for the same auto-cleanup.
+        if ($LocalIso -ne $ResolvedIso) { $IsoWasStaged = $true }
+        $ResolvedIso = $LocalIso
         Write-Host $LineBreak
     }
     else {
@@ -886,11 +975,11 @@ try {
         # IMPORTANT: from here on Setup can restart the machine at any time (unless -NoReboot), which can
         # kill this script. Schedule the ISO cleanup NOW - before the monitoring loop that the reboot
         # interrupts - so it is guaranteed to be registered even though later steps may never run.
-        if ($IsoWasDownloaded -and $ResolvedIso) {
+        if (($IsoWasDownloaded -or $IsoWasStaged) -and $ResolvedIso) {
             try {
                 Register-IsoCleanupTask -IsoPath $ResolvedIso -PreviousBuild $PreUpgradeBuild
                 $script:CleanupScheduled = $true
-                Write-HostTimestamp "  Scheduled a one-time task to delete the downloaded ISO after the upgrade, but only if the Windows build changes: $ResolvedIso" -ForegroundColor Cyan
+                Write-HostTimestamp "  Scheduled a one-time task to delete the $(if ($IsoWasStaged) { 'staged' } else { 'downloaded' }) ISO after the upgrade, but only if the Windows build changes: $ResolvedIso" -ForegroundColor Cyan
             }
             catch {
                 Write-HostTimestamp "  Could not schedule the ISO cleanup task: $($_.Exception.Message). Delete it manually later: $ResolvedIso" -ForegroundColor Yellow
@@ -977,17 +1066,17 @@ if ($SetupStarted) {
 # The ISO cleanup task is normally scheduled right after Setup launches (above), so it survives Setup's
 # automatic reboot. This is only a fallback for the rare case where we got here without it being
 # scheduled (e.g. -NoReboot and Setup exited before the launch block reached that point).
-if ($SetupStarted -and $IsoWasDownloaded -and $ResolvedIso -and -not $CleanupScheduled) {
+if ($SetupStarted -and ($IsoWasDownloaded -or $IsoWasStaged) -and $ResolvedIso -and -not $CleanupScheduled) {
     try {
         Register-IsoCleanupTask -IsoPath $ResolvedIso -PreviousBuild $PreUpgradeBuild
-        Write-HostTimestamp "Scheduled a one-time cleanup task to delete the downloaded ISO ($ResolvedIso) after the upgrade, but only if the Windows build changes." -ForegroundColor Cyan
+        Write-HostTimestamp "Scheduled a one-time cleanup task to delete the $(if ($IsoWasStaged) { 'staged' } else { 'downloaded' }) ISO ($ResolvedIso) after the upgrade, but only if the Windows build changes." -ForegroundColor Cyan
     }
     catch {
         Write-HostTimestamp "Could not schedule the ISO cleanup task: $($_.Exception.Message). You can delete the ISO manually later: $ResolvedIso" -ForegroundColor Yellow
     }
 }
-elseif ($SetupStarted -and -not $IsoWasDownloaded -and $ResolvedIso) {
-    Write-HostTimestamp "The ISO was supplied or reused (not downloaded by this run), so it will be left in place: $ResolvedIso" -ForegroundColor DarkGray
+elseif ($SetupStarted -and -not $IsoWasDownloaded -and -not $IsoWasStaged -and $ResolvedIso) {
+    Write-HostTimestamp "The ISO was supplied or reused (not created by this run), so it will be left in place: $ResolvedIso" -ForegroundColor DarkGray
 }
 
 Write-HostTimestamp 'Windows In-Place Upgrade script finished.' -ForegroundColor Green
