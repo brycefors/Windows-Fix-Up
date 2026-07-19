@@ -220,7 +220,7 @@ function Set-ServiceStartupType {
 #      care about and note its Build (Build.UBR), Availability date, and KB article.
 #   3. Add or replace the matching entry below. Old entries can stay or be trimmed - they are only used
 #      as a fallback.
-# Last verified against Microsoft release information: 2026-07-14
+# Last verified against Microsoft release information: 2026-07-19
 $script:KnownBuildReleases = @{
     # --- Windows 11 (every non-preview build, past 2 year(s)) ---
     '28000.2525'  = @{ Date = '2026-07-14'; KB = 'KB5101649' }  # 26H1
@@ -229,6 +229,7 @@ $script:KnownBuildReleases = @{
     '28000.1836'  = @{ Date = '2026-04-14'; KB = 'KB5083768' }  # 26H1
     '28000.1719'  = @{ Date = '2026-03-10'; KB = 'KB5079466' }  # 26H1
     '28000.1575'  = @{ Date = '2026-02-10'; KB = 'KB5077179' }  # 26H1
+    '26200.8894'  = @{ Date = '2026-07-18'; KB = 'KB5121767' }  # 25H2
     '26200.8875'  = @{ Date = '2026-07-14'; KB = 'KB5101650' }  # 25H2
     '26200.8655'  = @{ Date = '2026-06-09'; KB = 'KB5094126' }  # 25H2
     '26200.8457'  = @{ Date = '2026-05-12'; KB = 'KB5089549' }  # 25H2
@@ -244,6 +245,7 @@ $script:KnownBuildReleases = @{
     '26200.7171'  = @{ Date = '2025-11-11'; KB = 'KB5068861' }  # 25H2
     '26200.6901'  = @{ Date = '2025-10-20'; KB = 'KB5070773' }  # 25H2
     '26200.6899'  = @{ Date = '2025-10-14'; KB = 'KB5066835' }  # 25H2
+    '26100.8894'  = @{ Date = '2026-07-18'; KB = 'KB5121767' }  # 24H2
     '26100.8875'  = @{ Date = '2026-07-14'; KB = 'KB5101650' }  # 24H2
     '26100.8655'  = @{ Date = '2026-06-09'; KB = 'KB5094126' }  # 24H2
     '26100.8457'  = @{ Date = '2026-05-12'; KB = 'KB5089549' }  # 24H2
