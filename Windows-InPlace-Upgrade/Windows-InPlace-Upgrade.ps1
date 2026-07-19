@@ -572,6 +572,9 @@ function Watch-SetupProgress {
                         if ($Pct -ne $script:_WatchLastProgress) {
                             $script:_WatchLastProgress = $Pct
                             Write-HostTimestamp "    Setup progress: $Pct%"
+                            if ($Pct -ge 99) {
+                                Write-HostTimestamp '    Setup is almost done - the computer will restart soon to continue the upgrade.' -ForegroundColor Yellow
+                            }
                         }
                     }
                 }
