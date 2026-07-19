@@ -107,7 +107,7 @@ The script supports the following optional parameters:
 | `-InstallAdk` | If `oscdimg.exe` is not found, download and silently install the ADK Deployment Tools from Microsoft. |
 | `-FidoUrl` | Override the URL used to fetch the Fido download helper. |
 | `-AdkSetupUrl` | Override the URL used to download the Windows ADK setup bootstrapper. |
-| `-LogPath` | Directory to write log files to. Defaults to the script folder. |
+| `-LogPath` | Directory to write log files to. Defaults to `C:\temp\Windows-ISO-Updater`. |
 | `-SkipInteractive` | Skips the interactive confirmation prompt (still shows output). |
 
 ## What the Script Does
@@ -133,4 +133,4 @@ Because the download, the extracted media, the mounted image, and the re-exporte
 
 ## Logging
 
-Each run writes a timestamped transcript to the script folder (or `-LogPath`) named `Windows-ISO-Updater_<date>_<time>.log`. The 30 most recent logs are kept and older ones are pruned automatically.
+Each run writes a timestamped transcript to `C:\temp\Windows-ISO-Updater` (or `-LogPath`) named `Windows-ISO-Updater_<date>_<time>.log`. The 30 most recent logs are kept and older ones are pruned automatically.

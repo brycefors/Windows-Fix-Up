@@ -99,8 +99,8 @@ param(
     [Parameter(HelpMessage = 'Override the URL used to download the Windows ADK setup bootstrapper (Deployment Tools)')]
     [string]$AdkSetupUrl = 'https://go.microsoft.com/fwlink/?linkid=2289980',
 
-    [Parameter(HelpMessage = 'Directory to write log files to (defaults to the script folder)')]
-    [string]$LogPath,
+    [Parameter(HelpMessage = 'Directory to write log files to (defaults to C:\temp\Windows-ISO-Updater)')]
+    [string]$LogPath = 'C:\temp\Windows-ISO-Updater',
 
     [switch]$SkipInteractive # Skips the interactive confirmation prompt
 )
@@ -148,7 +148,8 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 $Host.UI.RawUI.WindowTitle = "Windows ISO Updater - Running as Administrator"
 
 # --- Start Logging ---
-# Resolve the log directory: use -LogPath if provided, otherwise default to the script folder
+# Resolve the log directory: use -LogPath (defaults to C:\temp\Windows-ISO-Updater), creating it if
+# needed; fall back to the script folder if that path cannot be used.
 $LogDir = $PSScriptRoot
 if ($LogPath) {
     try {
