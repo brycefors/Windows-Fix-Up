@@ -410,6 +410,34 @@ function Test-WindowsInstallMedia {
     return $Result
 }
 
+# Mounts an ISO just long enough to confirm it is real Windows installation media, then dismounts it.
+# Used to vet already-downloaded ISOs before reusing one. Returns $true only when the ISO contains
+# setup.exe and a Windows OS image (via Test-WindowsInstallMedia). Never throws.
+function Test-IsoIsWindowsMedia {
+    param([Parameter(Mandatory)][string]$IsoPath)
+
+    $Mounted = $null
+    try {
+        $Mounted = Mount-DiskImage -ImagePath $IsoPath -PassThru -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        $DriveLetter = ($Mounted | Get-Volume -ErrorAction SilentlyContinue).DriveLetter
+        if (-not $DriveLetter) {
+            $DriveLetter = (Get-DiskImage -ImagePath $IsoPath | Get-Volume -ErrorAction SilentlyContinue).DriveLetter
+        }
+        if (-not $DriveLetter) { return $false }
+        $Media = Test-WindowsInstallMedia -DriveLetter $DriveLetter
+        return [bool]$Media.IsValid
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($Mounted) {
+            try { Dismount-DiskImage -ImagePath $IsoPath -ErrorAction SilentlyContinue | Out-Null } catch { }
+        }
+    }
+}
+
 # Returns $true if any Windows Setup process is currently running. Setup.exe is only a small launcher
 # that spawns the real long-running workers, so we watch for the whole family, not just setup.exe.
 function Test-SetupRunning {
@@ -732,16 +760,25 @@ else {
     }
 
     # If a valid Windows ISO (larger than 3 GB) is already present in the download folder, reuse it
-    # rather than downloading again. Prefer the largest/newest matching file.
-    $ExistingIso = Get-ChildItem -Path $DlDir -Filter '*.iso' -File -ErrorAction SilentlyContinue |
+    # rather than downloading again. Check candidates newest-first (by last-modified time): mount each
+    # briefly to confirm it is genuine Windows installation media, and skip any that are not, moving on
+    # to the next-most-recent ISO until a valid one is found.
+    $IsoCandidates = @(Get-ChildItem -Path $DlDir -Filter '*.iso' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Length -gt 3GB } |
-        Sort-Object -Property Length -Descending |
-        Select-Object -First 1
-    if ($ExistingIso) {
-        $ResolvedIso = $ExistingIso.FullName
-        $SizeGB = [math]::Round($ExistingIso.Length / 1GB, 2)
-        Write-HostTimestamp "An ISO is already downloaded - reusing it instead of downloading again: $ResolvedIso ($SizeGB GB)" -ForegroundColor Green
-        Write-HostTimestamp '  Delete it (or use -DownloadPath to point elsewhere) if you want a fresh download.' -ForegroundColor DarkGray
+        Sort-Object -Property LastWriteTime -Descending)
+
+    foreach ($Candidate in $IsoCandidates) {
+        $SizeGB = [math]::Round($Candidate.Length / 1GB, 2)
+        Write-HostTimestamp "Found an existing ISO: $($Candidate.FullName) ($SizeGB GB, modified $($Candidate.LastWriteTime)). Verifying it is Windows installation media..."
+        if (Test-IsoIsWindowsMedia -IsoPath $Candidate.FullName) {
+            $ResolvedIso = $Candidate.FullName
+            Write-HostTimestamp "  Verified - reusing this ISO instead of downloading again." -ForegroundColor Green
+            Write-HostTimestamp '  Delete it (or use -DownloadPath to point elsewhere) if you want a fresh download.' -ForegroundColor DarkGray
+            break
+        }
+        Write-HostTimestamp '  Not valid Windows installation media - skipping and checking the next ISO.' -ForegroundColor Yellow
+    }
+    if ($ResolvedIso) {
         Write-Host $LineBreak
     }
     else {

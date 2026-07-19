@@ -55,8 +55,8 @@ param(
     [int]$CooldownDays = 7,
     [Parameter(HelpMessage = 'Bypass the cooldown and run -Remediate or -ForceLevel regardless of when it last ran')]
     [switch]$IgnoreCooldown,
-    [Parameter(HelpMessage = 'Directory to write log files to (defaults to the script folder)')]
-    [string]$LogPath,
+    [Parameter(HelpMessage = 'Directory to write log files to (defaults to C:\Temp\Windows-Clean-Up)')]
+    [string]$LogPath = 'C:\Temp\Windows-Clean-Up',
     [switch]$SkipInteractive # Skips the interactive confirmation prompt
 )
 
@@ -103,7 +103,8 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 $Host.UI.RawUI.WindowTitle = "Windows Clean-Up - Running as Administrator"
 
 # --- Start Logging ---
-# Resolve the log directory: use -LogPath if provided, otherwise default to the script folder
+# Resolve the log directory: use -LogPath (defaults to C:\Temp\Windows-Clean-Up), creating it if
+# needed, and fall back to the script folder if it cannot be used.
 $LogDir = $PSScriptRoot
 if ($LogPath) {
     try {
