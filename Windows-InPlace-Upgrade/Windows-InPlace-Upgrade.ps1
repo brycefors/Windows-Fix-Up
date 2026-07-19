@@ -47,8 +47,8 @@ param(
     [ValidateSet('KeepAll', 'KeepNothing')]
     [string]$KeepMode = 'KeepAll',
 
-    [Parameter(HelpMessage = 'Directory to download the ISO into (defaults to the script folder). Needs ~6 GB free')]
-    [string]$DownloadPath,
+    [Parameter(HelpMessage = 'Directory to download the ISO into (defaults to C:\Temp\Windows-InPlace-Upgrade). Needs ~6 GB free')]
+    [string]$DownloadPath = 'C:\Temp\Windows-InPlace-Upgrade',
 
     [Parameter(HelpMessage = 'Only obtain/download the ISO; do not launch the in-place upgrade')]
     [switch]$DownloadOnly,
@@ -68,8 +68,8 @@ param(
     [Parameter(HelpMessage = 'Override the URL used to fetch the Fido download helper')]
     [string]$FidoUrl = 'https://github.com/pbatard/Fido/raw/master/Fido.ps1',
 
-    [Parameter(HelpMessage = 'Directory to write log files to (defaults to the script folder)')]
-    [string]$LogPath,
+    [Parameter(HelpMessage = 'Directory to write log files to (defaults to C:\Temp\Windows-InPlace-Upgrade)')]
+    [string]$LogPath = 'C:\Temp\Windows-InPlace-Upgrade',
 
     [switch]$SkipInteractive # Skips the interactive confirmation prompt
 )
@@ -117,7 +117,8 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 $Host.UI.RawUI.WindowTitle = "Windows In-Place Upgrade - Running as Administrator"
 
 # --- Start Logging ---
-# Resolve the log directory: use -LogPath if provided, otherwise default to the script folder
+# Resolve the log directory: use -LogPath (defaults to C:\Temp\Windows-InPlace-Upgrade), creating it if
+# needed; fall back to the script folder if that path cannot be used.
 $LogDir = $PSScriptRoot
 if ($LogPath) {
     try {
@@ -529,12 +530,19 @@ function Watch-SetupProgress {
 }
 
 # Registers a one-shot SYSTEM scheduled task that deletes the DOWNLOADED ISO once the upgrade is out of
-# the way. The ISO stays mounted while Setup runs and the machine reboots during the upgrade, so we
-# cannot safely delete it in-line; instead the task fires at startup (after a short delay), waits for any
-# Setup process to finish, dismounts the image if needed, deletes the ISO, and then removes itself. It is
-# only ever called for an ISO this run downloaded - never for -IsoPath or a reused existing ISO.
+# the way - but ONLY if the full Windows build (CurrentBuildNumber.UBR) actually changed from what it was
+# before the upgrade (whether from the in-place upgrade itself or a cumulative patch). If the build is
+# unchanged the ISO is kept and the task re-checks on later startups (up to a bounded number of attempts),
+# so a failed/rolled-back upgrade does not leave the task running forever. The ISO stays mounted while
+# Setup runs and the machine reboots during the upgrade, so we cannot safely delete it in-line; instead
+# the task fires at startup (after a short delay), waits for any Setup process to finish, compares the
+# build, and only then dismounts/deletes the ISO before removing itself. It is only ever called for an ISO
+# this run downloaded - never for -IsoPath or a reused existing ISO.
 function Register-IsoCleanupTask {
-    param([Parameter(Mandatory)][string]$IsoPath)
+    param(
+        [Parameter(Mandatory)][string]$IsoPath,
+        [Parameter(Mandatory)][string]$PreviousBuild
+    )
 
     $TaskName = 'WindowsInPlaceUpgrade_IsoCleanup'
     $WorkDir = Join-Path -Path $env:ProgramData -ChildPath 'Windows-InPlace-Upgrade'
@@ -542,12 +550,18 @@ function Register-IsoCleanupTask {
     catch { $WorkDir = $env:TEMP }
     $WorkerFile = Join-Path -Path $WorkDir -ChildPath 'Cleanup-Iso.ps1'
     $WorkerLog = Join-Path -Path $WorkDir -ChildPath 'Cleanup-Iso.log'
+    $AttemptsFile = Join-Path -Path $WorkDir -ChildPath 'Cleanup-Attempts.txt'
 
-    # Worker script: wait out any running Setup, dismount/delete the ISO, then unregister and self-delete.
+    # Worker script: wait out any running Setup, compare the current build against the pre-upgrade build,
+    # and only dismount/delete the ISO if it changed. Then unregister and self-delete (or, if the build has
+    # not changed yet, keep the ISO and re-check next startup until a bounded attempt cap is reached).
     $WorkerContent = @"
 `$ErrorActionPreference = 'SilentlyContinue'
 `$Iso = '$($IsoPath.Replace("'", "''"))'
 `$TaskName = '$TaskName'
+`$PrevBuild = '$($PreviousBuild.Replace("'", "''"))'
+`$AttemptsFile = '$($AttemptsFile.Replace("'", "''"))'
+`$MaxAttempts = 50
 try { Start-Transcript -Path '$($WorkerLog.Replace("'", "''"))' -Force | Out-Null } catch { }
 # Do not pull the ISO out from under an active Setup: wait until no Setup process is running (max ~2 hrs).
 `$Names = @('setup','SetupHost','SetupPrep','SetupPlatform','Windows10UpgraderApp')
@@ -555,11 +569,36 @@ for (`$i = 0; `$i -lt 240; `$i++) {
     if (-not (Get-Process -Name `$Names -ErrorAction SilentlyContinue)) { break }
     Start-Sleep -Seconds 30
 }
-try { Dismount-DiskImage -ImagePath `$Iso -ErrorAction SilentlyContinue | Out-Null } catch { }
-if (Test-Path -LiteralPath `$Iso) { Remove-Item -LiteralPath `$Iso -Force -ErrorAction SilentlyContinue }
-try { Unregister-ScheduledTask -TaskName `$TaskName -Confirm:`$false -ErrorAction SilentlyContinue } catch { }
-try { Stop-Transcript | Out-Null } catch { }
-Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
+function Complete-Cleanup {
+    try { Unregister-ScheduledTask -TaskName `$TaskName -Confirm:`$false -ErrorAction SilentlyContinue } catch { }
+    Remove-Item -LiteralPath `$AttemptsFile -Force -ErrorAction SilentlyContinue
+    try { Stop-Transcript | Out-Null } catch { }
+    Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
+}
+# Read the current full build (CurrentBuildNumber.UBR) and compare it to the build recorded before the upgrade.
+`$Reg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+`$CurBuild = if (`$Reg -and `$Reg.CurrentBuildNumber) { if (`$null -ne `$Reg.UBR) { "`$(`$Reg.CurrentBuildNumber).`$(`$Reg.UBR)" } else { "`$(`$Reg.CurrentBuildNumber)" } } else { '' }
+Write-Output "Pre-upgrade build: `$PrevBuild  |  Current build: `$CurBuild"
+if (`$CurBuild -and `$CurBuild -ne `$PrevBuild) {
+    Write-Output 'Build changed (upgrade or patch) - deleting the downloaded ISO.'
+    try { Dismount-DiskImage -ImagePath `$Iso -ErrorAction SilentlyContinue | Out-Null } catch { }
+    if (Test-Path -LiteralPath `$Iso) { Remove-Item -LiteralPath `$Iso -Force -ErrorAction SilentlyContinue }
+    Complete-Cleanup
+}
+else {
+    `$Attempts = 0
+    try { if (Test-Path -LiteralPath `$AttemptsFile) { `$Attempts = [int](Get-Content -LiteralPath `$AttemptsFile -ErrorAction SilentlyContinue) } } catch { }
+    `$Attempts++
+    Set-Content -LiteralPath `$AttemptsFile -Value `$Attempts -Force -ErrorAction SilentlyContinue
+    if (`$Attempts -ge `$MaxAttempts) {
+        Write-Output "Build unchanged after `$Attempts checks - giving up and leaving the ISO in place."
+        Complete-Cleanup
+    }
+    else {
+        Write-Output "Build unchanged - keeping the ISO; will re-check on the next startup (attempt `$Attempts/`$MaxAttempts)."
+        try { Stop-Transcript | Out-Null } catch { }
+    }
+}
 "@
     Set-Content -Path $WorkerFile -Value $WorkerContent -Encoding UTF8 -Force -ErrorAction Stop
 
@@ -578,6 +617,11 @@ Write-Host $LineBreak
 
 # --- Gather system info ---
 $WinInfo = Get-InstalledWindowsInfo
+
+# Record the current full OS build (CurrentBuildNumber.UBR) BEFORE the upgrade. The ISO cleanup task uses
+# this to decide whether the build actually changed (from the upgrade or a later patch) and only deletes
+# the downloaded ISO if it did.
+$PreUpgradeBuild = if ($null -ne $WinInfo.Ubr) { "$($WinInfo.Build).$($WinInfo.Ubr)" } else { "$($WinInfo.Build)" }
 
 Write-HostTimestamp "Installed OS   : $($WinInfo.ProductName)$(if ($WinInfo.EditionId) { " (Edition: $($WinInfo.EditionId))" })" -ForegroundColor Cyan
 Write-Host "  Feature update : $($WinInfo.DisplayVersion)"
@@ -807,9 +851,9 @@ try {
         # interrupts - so it is guaranteed to be registered even though later steps may never run.
         if ($IsoWasDownloaded -and $ResolvedIso) {
             try {
-                Register-IsoCleanupTask -IsoPath $ResolvedIso
+                Register-IsoCleanupTask -IsoPath $ResolvedIso -PreviousBuild $PreUpgradeBuild
                 $script:CleanupScheduled = $true
-                Write-HostTimestamp "  Scheduled a one-time task to delete the downloaded ISO after the upgrade completes: $ResolvedIso" -ForegroundColor Cyan
+                Write-HostTimestamp "  Scheduled a one-time task to delete the downloaded ISO after the upgrade, but only if the Windows build changes: $ResolvedIso" -ForegroundColor Cyan
             }
             catch {
                 Write-HostTimestamp "  Could not schedule the ISO cleanup task: $($_.Exception.Message). Delete it manually later: $ResolvedIso" -ForegroundColor Yellow
@@ -898,8 +942,8 @@ if ($SetupStarted) {
 # scheduled (e.g. -NoReboot and Setup exited before the launch block reached that point).
 if ($SetupStarted -and $IsoWasDownloaded -and $ResolvedIso -and -not $CleanupScheduled) {
     try {
-        Register-IsoCleanupTask -IsoPath $ResolvedIso
-        Write-HostTimestamp "Scheduled a one-time cleanup task to delete the downloaded ISO ($ResolvedIso) after the upgrade completes." -ForegroundColor Cyan
+        Register-IsoCleanupTask -IsoPath $ResolvedIso -PreviousBuild $PreUpgradeBuild
+        Write-HostTimestamp "Scheduled a one-time cleanup task to delete the downloaded ISO ($ResolvedIso) after the upgrade, but only if the Windows build changes." -ForegroundColor Cyan
     }
     catch {
         Write-HostTimestamp "Could not schedule the ISO cleanup task: $($_.Exception.Message). You can delete the ISO manually later: $ResolvedIso" -ForegroundColor Yellow

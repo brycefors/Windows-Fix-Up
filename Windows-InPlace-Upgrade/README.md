@@ -111,14 +111,14 @@ powershell -ExecutionPolicy Bypass -File $d -DownloadPath 'C:\ISO'
 | `-Release` | Fido release to request (e.g. `24H2`, `23H2`) or `Latest`. Defaults to `Latest`. |
 | `-Language` | ISO language as named by Microsoft/Fido (e.g. `English`, `"English International"`). Defaults to `English`. |
 | `-KeepMode` | What Setup keeps: `KeepAll` (apps + data, default) or `KeepNothing` (clean install). |
-| `-DownloadPath` | Directory to download the ISO into (defaults to the script folder). |
+| `-DownloadPath` | Directory to download the ISO into (defaults to `C:\Temp\Windows-InPlace-Upgrade`). |
 | `-DownloadOnly` | Only obtain/download the ISO; do not launch the upgrade. |
 | `-NoReboot` | Prevents Setup from restarting automatically at the end (`/noreboot`). |
 | `-DynamicUpdate` | Enables Dynamic Update so Setup pulls the latest fixes online before upgrading (disabled by default). |
 | `-ShowUI` | Shows the Windows Setup GUI. By default Setup runs with its GUI hidden (`/quiet`). |
 | `-BypassCompatChecks` | Bypasses the Windows 11 hardware compatibility checks (TPM 2.0, Secure Boot, supported CPU, RAM) on incompatible machines using Setup's `/product server` switch. |
 | `-FidoUrl` | Override the URL used to fetch the Fido download helper. |
-| `-LogPath` | Directory to write log files to (defaults to the script folder). |
+| `-LogPath` | Directory to write log files to (defaults to `C:\Temp\Windows-InPlace-Upgrade`). |
 | `-SkipInteractive` | Skips the interactive confirmation prompt (still shows output). |
 
 ## What the Script Does
@@ -127,7 +127,7 @@ powershell -ExecutionPolicy Bypass -File $d -DownloadPath 'C:\ISO'
 2.  **Disk space check** — Confirms there is enough free space (~20 GB for the upgrade, ~8 GB for download-only) before doing anything.
 3.  **ISO acquisition** — If a valid Windows ISO (larger than 3 GB) is already present in the download folder, it is **reused instead of downloading again**. Otherwise the script downloads the [Fido](https://github.com/pbatard/Fido) helper, uses it to resolve the official Microsoft ISO download URL, then downloads the ISO (resumable via BITS, with an `Invoke-WebRequest` fallback). Skipped entirely when you supply `-IsoPath`.
 4.  **Mount & launch** — Mounts the ISO, locates `setup.exe`, and launches Windows Setup in in-place-upgrade mode with the chosen keep-mode. By default the Setup GUI is hidden (`/quiet`) and Dynamic Update is disabled.
-5.  **Cleanup** — Dismounts the ISO if Setup fails to start. When the ISO was **downloaded by the script**, a one-time SYSTEM scheduled task (`WindowsInPlaceUpgrade_IsoCleanup`) is registered to delete it after the next boot once Setup has finished, then unregister itself. An ISO supplied with `-IsoPath` or one that was already present in the download folder is **never deleted**.
+5.  **Cleanup** — Dismounts the ISO if Setup fails to start. When the ISO was **downloaded by the script**, a SYSTEM scheduled task (`WindowsInPlaceUpgrade_IsoCleanup`) is registered that, after the next boot once Setup has finished, compares the full Windows build (`CurrentBuildNumber.UBR`) against what it was before the upgrade and **only deletes the ISO if the build actually changed** (from the upgrade or a later patch); otherwise it keeps the ISO and re-checks on subsequent startups, then unregisters itself. An ISO supplied with `-IsoPath` or one that was already present in the download folder is **never deleted**.
 
 ## How the ISO Is Downloaded
 
@@ -164,4 +164,4 @@ Windows 11 refuses to upgrade PCs that fail its hardware requirements (TPM 2.0, 
 
 ## Logging
 
-Every run is transcribed to a timestamped `Windows-InPlace-Upgrade_YYYY-MM-DD_HH-mm-ss.log` file in the script folder (or `-LogPath`). The 30 most recent logs are kept; older ones are pruned automatically. If Setup itself fails, its detailed logs live in `C:\$WINDOWS.~BT\Sources\Panther\setupact.log`.
+Every run is transcribed to a timestamped `Windows-InPlace-Upgrade_YYYY-MM-DD_HH-mm-ss.log` file in `C:\Temp\Windows-InPlace-Upgrade` (or `-LogPath`). The 30 most recent logs are kept; older ones are pruned automatically. If Setup itself fails, its detailed logs live in `C:\$WINDOWS.~BT\Sources\Panther\setupact.log`.
