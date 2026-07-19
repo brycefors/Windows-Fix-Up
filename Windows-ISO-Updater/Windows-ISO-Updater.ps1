@@ -18,8 +18,9 @@
 #      latest combined Servicing Stack + Cumulative Update (LCU) - and the .NET cumulative update
 #      (on by default; disable with -SkipDotNet) - from the Microsoft Update Catalog. You may
 #      instead point at your own .msu/.cab files with -UpdatePath.
-#   4. Integrates the update(s) offline with DISM into install.wim (every edition, or one you pick),
-#      boot.wim (Windows Setup / WinPE), and optionally winre.wim (recovery).
+#   4. Integrates the update(s) offline with DISM into install.wim (by default only the highest edition
+#      present - e.g. Pro over Home - is kept and serviced; use -KeepAllEditions or -KeepEditions to
+#      change this), boot.wim (Windows Setup / WinPE), and optionally winre.wim (recovery).
 #   5. Cleans up the component store (/StartComponentCleanup /ResetBase) and re-exports install.wim to
 #      shrink it.
 #   6. Recompiles a new bootable ISO with oscdimg (from the Windows ADK), preserving both the BIOS and
@@ -56,8 +57,11 @@ param(
     [Parameter(HelpMessage = 'Which edition inside install.wim to service: "All" (default) or an edition name like "Windows 11 Pro"')]
     [string]$Edition = 'All',
 
-    [Parameter(HelpMessage = 'Editions to KEEP in the final ISO, removing the rest to slim it down. Accepts edition names like "Windows 11 Pro" (partial matches allowed) or index numbers, comma-separated. Defaults to keeping all editions')]
+    [Parameter(HelpMessage = 'Editions to KEEP in the final ISO, removing the rest to slim it down. Accepts edition names like "Windows 11 Pro" (partial matches allowed) or index numbers, comma-separated. Overrides the default of keeping only the highest edition')]
     [string[]]$KeepEditions,
+
+    [Parameter(HelpMessage = 'Keep every edition in the final ISO. By default only the highest edition present (e.g. Enterprise over Pro, or Pro over Home) is kept to speed up servicing and shrink the ISO')]
+    [switch]$KeepAllEditions,
 
     [Parameter(HelpMessage = 'Only list the editions/indexes inside the ISO''s install.wim and exit (does not download updates or build anything). Useful for choosing -Edition/-KeepEditions values')]
     [switch]$ListEditions,
@@ -647,6 +651,24 @@ function Resolve-EditionIndexes {
     return ($Matched | Sort-Object -Unique)
 }
 
+# Scores a Windows edition name so the "highest" edition can be picked automatically. Only Enterprise,
+# Pro, and Home are considered (Enterprise > Pro > Home); Education and Workstation editions (including
+# "Pro Education" and "Pro for Workstations") are deliberately excluded and scored lowest so they are
+# never chosen when a plain Enterprise/Pro/Home edition is present. Within a tier, base editions are
+# preferred over the "N" and "Single Language" variants.
+function Get-EditionRank {
+    param([string]$Name)
+    $n = "$Name".ToLower()
+    if ($n -match 'education|workstation') { $Rank = 5 }  # excluded tiers - lowest priority
+    elseif ($n -match 'enterprise') { $Rank = 60 }
+    elseif ($n -match 'pro') { $Rank = 40 }
+    elseif ($n -match 'home|core') { $Rank = 20 }
+    else { $Rank = 10 }
+    if ($n -match '(^|\s)n(\s|$)') { $Rank -= 2 }   # prefer base over "N" variants
+    if ($n -match 'single language') { $Rank -= 1 } # prefer base over Single Language
+    return $Rank
+}
+
 # Ensures a mount directory is clean and ready to receive a fresh WIM mount. A previous run that crashed
 # or was killed can leave an image still mounted (or a corrupt mount point) there, which makes the next
 # Mount-WindowsImage fail with "attempted to mount to a directory that is not empty". This discards any
@@ -881,6 +903,12 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $ListEditions) {
     Write-Host "  - Extract it to $ExtractDir"
     if ($KeepEditions -and $KeepEditions.Count -gt 0) {
         Write-Host "  - Keep ONLY these editions in the final ISO (remove the rest): $($KeepEditions -join ', ')" -ForegroundColor Yellow
+    }
+    elseif ($KeepAllEditions) {
+        Write-Host "  - Keep ALL editions in the final ISO (-KeepAllEditions)"
+    }
+    else {
+        Write-Host "  - Keep ONLY the highest edition present (e.g. Enterprise over Pro, or Pro over Home) to speed up the build; use -KeepAllEditions to keep them all" -ForegroundColor Yellow
     }
     if (-not $SkipUpdates) {
         if ($UpdatePath) {
@@ -1221,7 +1249,11 @@ else {
 # --- Resolve which editions to keep and which to service ---
 $InstallImages = @(Get-WindowsImage -ImagePath $InstallWimExtracted -ErrorAction Stop)
 
-# Which editions to KEEP in the final ISO (default: all of them).
+# Which editions to KEEP in the final ISO.
+#   * -KeepEditions <list>  : keep exactly what the user named (highest precedence).
+#   * -KeepAllEditions      : keep every edition in the media.
+#   * default               : keep only the single highest edition (e.g. Pro over Home) to speed up
+#                             servicing and shrink the ISO.
 $KeepIndexes = @($InstallImages.ImageIndex)
 if ($KeepEditions -and $KeepEditions.Count -gt 0) {
     $KeepUnmatched = $null
@@ -1241,6 +1273,24 @@ if ($KeepEditions -and $KeepEditions.Count -gt 0) {
     $KeptNames = $InstallImages | Where-Object { $KeepIndexes -contains $_.ImageIndex } | ForEach-Object { $_.ImageName }
     $DroppedNames = $InstallImages | Where-Object { $KeepIndexes -notcontains $_.ImageIndex } | ForEach-Object { $_.ImageName }
     Write-HostTimestamp "Keeping $($KeepIndexes.Count) of $($InstallImages.Count) editions: $($KeptNames -join ', ')" -ForegroundColor Cyan
+    if ($DroppedNames) { Write-HostTimestamp "Removing from the ISO: $($DroppedNames -join ', ')" -ForegroundColor Yellow }
+    Write-Host $LineBreak
+}
+elseif ($KeepAllEditions) {
+    Write-HostTimestamp "Keeping all $($InstallImages.Count) editions (-KeepAllEditions)." -ForegroundColor Cyan
+    Write-Host $LineBreak
+}
+elseif ($InstallImages.Count -gt 1) {
+    # Default: keep only the single highest-ranked edition. Sort by rank (desc), then prefer the shorter
+    # (base) name, then the lowest index, and take the top one.
+    $Top = $InstallImages |
+        Sort-Object @{ Expression = { Get-EditionRank $_.ImageName }; Descending = $true },
+        @{ Expression = { "$($_.ImageName)".Length } },
+        @{ Expression = { [int]$_.ImageIndex } } |
+        Select-Object -First 1
+    $KeepIndexes = @([int]$Top.ImageIndex)
+    $DroppedNames = $InstallImages | Where-Object { $_.ImageIndex -ne $Top.ImageIndex } | ForEach-Object { $_.ImageName }
+    Write-HostTimestamp "Keeping only the highest edition to speed up the build: $($Top.ImageName). Use -KeepAllEditions to keep them all, or -KeepEditions to choose." -ForegroundColor Cyan
     if ($DroppedNames) { Write-HostTimestamp "Removing from the ISO: $($DroppedNames -join ', ')" -ForegroundColor Yellow }
     Write-Host $LineBreak
 }

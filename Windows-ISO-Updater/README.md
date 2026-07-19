@@ -63,11 +63,14 @@ To use command-line parameters, run the batch file from a Command Prompt or Powe
 
 ### Removing Editions (Slimming the ISO)
 
-A Windows ISO's `install.wim` usually contains many editions (Home, Home N, Pro, Education, etc.). You can drop the ones you don't want with `-KeepEditions`, which physically removes them when the image is rebuilt — producing a smaller ISO that only offers the editions you keep.
+A Windows ISO's `install.wim` usually contains many editions (Home, Home N, Pro, Education, etc.). **By default the script keeps only the highest edition present** (e.g. Enterprise over Pro, or Pro over Home) and removes the rest — this speeds up servicing and produces a smaller ISO. Use `-KeepAllEditions` to keep every edition, or `-KeepEditions` to choose exactly which ones to keep.
 
 ```shell
 :: See what editions are inside the ISO first (downloads/uses the ISO, then just lists and exits)
 .\Run-Windows-ISO-Updater.bat -ListEditions
+
+:: Keep EVERY edition instead of just the highest one
+.\Run-Windows-ISO-Updater.bat -KeepAllEditions
 
 :: Build an updated ISO containing ONLY Windows 11 Pro and Home (by name)
 .\Run-Windows-ISO-Updater.bat -KeepEditions "Windows 11 Pro","Windows 11 Home"
@@ -76,7 +79,7 @@ A Windows ISO's `install.wim` usually contains many editions (Home, Home N, Pro,
 .\Run-Windows-ISO-Updater.bat -KeepEditions 6,1
 ```
 
-`-KeepEditions` accepts edition names (partial matches allowed) or index numbers. Only the kept editions are serviced and re-exported, so the removed editions are gone from the final `install.wim`. It works with `-SkipUpdates` too, if you only want to trim editions without integrating updates.
+`-KeepEditions` accepts edition names (partial matches allowed) or index numbers, and overrides the highest-edition default. Only the kept editions are serviced and re-exported, so the removed editions are gone from the final `install.wim`. It works with `-SkipUpdates` too, if you only want to trim editions without integrating updates.
 
 ## Command-Line Parameters
 
@@ -90,7 +93,8 @@ The script supports the following optional parameters:
 | `-Release` | Fido release to request (e.g. `24H2`, `23H2`) or `Latest`. Defaults to `Latest`. |
 | `-Language` | ISO language as named by Microsoft/Fido (e.g. `English`, `"English International"`). Defaults to `English`. |
 | `-Edition` | Which edition inside `install.wim` to service: `All` (default) or an edition name like `"Windows 11 Pro"`. |
-| `-KeepEditions` | Editions to **keep** in the final ISO, removing the rest to slim it down. Accepts edition names (partial matches allowed) or index numbers, comma-separated. Defaults to keeping all. |
+| `-KeepEditions` | Editions to **keep** in the final ISO, removing the rest to slim it down. Accepts edition names (partial matches allowed) or index numbers, comma-separated. Overrides the default of keeping only the highest edition. |
+| `-KeepAllEditions` | Keep **every** edition in the final ISO. By default only the highest edition present (e.g. Enterprise over Pro, or Pro over Home) is kept. |
 | `-ListEditions` | List the editions/indexes inside the ISO's `install.wim` and exit, without downloading updates or building anything. Useful for choosing `-Edition`/`-KeepEditions` values. |
 | `-UpdatePath` | Folder containing your own `.msu`/`.cab` update packages to integrate instead of fetching from the Microsoft Update Catalog. |
 | `-SkipDotNet` | Skip the **.NET cumulative update**. The .NET update is downloaded and integrated **by default**; use this switch to leave it out. |
@@ -112,7 +116,7 @@ The script supports the following optional parameters:
 2.  **Obtain the ISO** — Downloads the matching official Microsoft ISO via the community [Fido](https://github.com/pbatard/Fido) helper, or reuses an ISO already in the download folder, or uses `-IsoPath`.
 3.  **Extract the ISO** — Mounts the ISO and mirrors its contents into the working folder with `robocopy`, then dismounts. If the media ships `install.esd`, it is converted to an editable `install.wim`.
 4.  **Find the updates** — Detects the feature update (e.g. `24H2`) and architecture from the image, then downloads the latest combined Servicing Stack + Cumulative Update (and, by default, the .NET cumulative update — disable with `-SkipDotNet`) from the Microsoft Update Catalog. `-UpdatePath` uses your own packages instead.
-5.  **Integrate the updates** — Uses offline DISM to apply the package(s) to `install.wim` (every edition, or the one chosen with `-Edition`), to `boot.wim` (Windows Setup / WinPE), and optionally to `winre.wim`.
+5.  **Integrate the updates** — Uses offline DISM to apply the package(s) to `install.wim` (by default only the highest edition present — override with `-KeepAllEditions` or `-KeepEditions`/`-Edition`), to `boot.wim` (Windows Setup / WinPE), and optionally to `winre.wim`.
 6.  **Clean up and shrink** — Runs `DISM /Cleanup-Image /StartComponentCleanup /ResetBase` and re-exports `install.wim` to reclaim space.
 7.  **Recompile the ISO** — Uses `oscdimg` to build a new bootable ISO, preserving both the **BIOS (`etfsboot.com`)** and **UEFI (`efisys.bin`)** boot sectors so the media boots on legacy and modern PCs alike.
 8.  **Clean up** — Removes the extracted working files, leaving the finished ISO.
