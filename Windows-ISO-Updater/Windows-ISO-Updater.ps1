@@ -1084,6 +1084,23 @@ if ($ListEditions) {
 $MountedImage = $null
 try {
     Invoke-Task -Description "Mounting the ISO to copy its contents: $ResolvedIso ..." -ScriptBlock {
+        # If a previous attempt left this ISO mounted, dismount it before mounting again. If that
+        # dismount fails (or the image will not release), do NOT proceed on a stale/duplicate mount -
+        # throw so the outer catch aborts the whole run.
+        $Existing = Get-DiskImage -ImagePath $ResolvedIso -ErrorAction SilentlyContinue
+        if ($Existing -and $Existing.Attached) {
+            Write-HostTimestamp '  This ISO is still mounted from a previous attempt - dismounting it first...' -ForegroundColor Yellow
+            try {
+                Dismount-DiskImage -ImagePath $ResolvedIso -ErrorAction Stop | Out-Null
+                Start-Sleep -Seconds 2
+            }
+            catch {
+                throw "The ISO is still mounted from a previous attempt and could not be dismounted: $($_.Exception.Message). Aborting."
+            }
+            if ((Get-DiskImage -ImagePath $ResolvedIso -ErrorAction SilentlyContinue).Attached) {
+                throw 'The ISO is still mounted from a previous attempt and could not be dismounted. Aborting.'
+            }
+        }
         $script:MountedImage = Mount-DiskImage -ImagePath $ResolvedIso -PassThru -ErrorAction Stop
         Start-Sleep -Seconds 2
     }
