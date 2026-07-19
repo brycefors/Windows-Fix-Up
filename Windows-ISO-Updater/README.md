@@ -93,7 +93,7 @@ The script supports the following optional parameters:
 | `-KeepEditions` | Editions to **keep** in the final ISO, removing the rest to slim it down. Accepts edition names (partial matches allowed) or index numbers, comma-separated. Defaults to keeping all. |
 | `-ListEditions` | List the editions/indexes inside the ISO's `install.wim` and exit, without downloading updates or building anything. Useful for choosing `-Edition`/`-KeepEditions` values. |
 | `-UpdatePath` | Folder containing your own `.msu`/`.cab` update packages to integrate instead of fetching from the Microsoft Update Catalog. |
-| `-IncludeDotNet` | Also download and integrate the latest **.NET cumulative update** from the catalog. |
+| `-SkipDotNet` | Skip the **.NET cumulative update**. The .NET update is downloaded and integrated **by default**; use this switch to leave it out. |
 | `-ServiceWinRE` | Also service the recovery image (`winre.wim`). Off by default; the Safe OS Dynamic Update is used when available. |
 | `-SkipUpdates` | Skip update integration entirely and just extract and recompile the ISO. |
 | `-DownloadPath` | Directory to download the ISO/updates into. Defaults to the script folder. |
@@ -111,7 +111,7 @@ The script supports the following optional parameters:
 1.  **Locate `oscdimg.exe`** — Fails fast (or installs the ADK with `-InstallAdk`) so the build cannot get most of the way through and then be unable to recompile the ISO.
 2.  **Obtain the ISO** — Downloads the matching official Microsoft ISO via the community [Fido](https://github.com/pbatard/Fido) helper, or reuses an ISO already in the download folder, or uses `-IsoPath`.
 3.  **Extract the ISO** — Mounts the ISO and mirrors its contents into the working folder with `robocopy`, then dismounts. If the media ships `install.esd`, it is converted to an editable `install.wim`.
-4.  **Find the updates** — Detects the feature update (e.g. `24H2`) and architecture from the image, then downloads the latest combined Servicing Stack + Cumulative Update (and, with `-IncludeDotNet`, the .NET cumulative update) from the Microsoft Update Catalog. `-UpdatePath` uses your own packages instead.
+4.  **Find the updates** — Detects the feature update (e.g. `24H2`) and architecture from the image, then downloads the latest combined Servicing Stack + Cumulative Update (and, by default, the .NET cumulative update — disable with `-SkipDotNet`) from the Microsoft Update Catalog. `-UpdatePath` uses your own packages instead.
 5.  **Integrate the updates** — Uses offline DISM to apply the package(s) to `install.wim` (every edition, or the one chosen with `-Edition`), to `boot.wim` (Windows Setup / WinPE), and optionally to `winre.wim`.
 6.  **Clean up and shrink** — Runs `DISM /Cleanup-Image /StartComponentCleanup /ResetBase` and re-exports `install.wim` to reclaim space.
 7.  **Recompile the ISO** — Uses `oscdimg` to build a new bootable ISO, preserving both the **BIOS (`etfsboot.com`)** and **UEFI (`efisys.bin`)** boot sectors so the media boots on legacy and modern PCs alike.

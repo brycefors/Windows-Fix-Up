@@ -15,9 +15,9 @@
 #      your own ISO avoids this (the script also reuses any ISO already in the download folder).
 #   2. Extracts the ISO to a writable working folder.
 #   3. Detects the Windows feature-update (e.g. 24H2) and architecture from the image, then downloads the
-#      latest combined Servicing Stack + Cumulative Update (LCU) - and optionally the .NET cumulative
-#      update - from the Microsoft Update Catalog. You may instead point at your own .msu/.cab files with
-#      -UpdatePath.
+#      latest combined Servicing Stack + Cumulative Update (LCU) - and the .NET cumulative update
+#      (on by default; disable with -SkipDotNet) - from the Microsoft Update Catalog. You may
+#      instead point at your own .msu/.cab files with -UpdatePath.
 #   4. Integrates the update(s) offline with DISM into install.wim (every edition, or one you pick),
 #      boot.wim (Windows Setup / WinPE), and optionally winre.wim (recovery).
 #   5. Cleans up the component store (/StartComponentCleanup /ResetBase) and re-exports install.wim to
@@ -65,8 +65,8 @@ param(
     [Parameter(HelpMessage = 'Folder containing your own .msu/.cab update packages to integrate instead of fetching from the Microsoft Update Catalog')]
     [string]$UpdatePath,
 
-    [Parameter(HelpMessage = 'Also download and integrate the latest .NET cumulative update from the Microsoft Update Catalog')]
-    [switch]$IncludeDotNet,
+    [Parameter(HelpMessage = 'Skip downloading and integrating the latest .NET cumulative update. The .NET update is included by default; use this switch to leave it out')]
+    [switch]$SkipDotNet,
 
     [Parameter(HelpMessage = 'Also service the recovery image (winre.wim). Off by default; the correct component for WinRE is the Safe OS Dynamic Update, which is fetched when available')]
     [switch]$ServiceWinRE,
@@ -887,7 +887,7 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $ListEditions) {
             Write-Host "  - Integrate the update packages found in: $UpdatePath"
         }
         else {
-            Write-Host "  - Download the latest cumulative update(s) from the Microsoft Update Catalog"
+            Write-Host "  - Download the latest cumulative update(s)$(if (-not $SkipDotNet) { ' and the latest .NET cumulative update' }) from the Microsoft Update Catalog"
         }
         Write-Host "  - Integrate the update(s) into install.wim ($Edition), boot.wim$(if ($ServiceWinRE) { ', and winre.wim' })"
         Write-Host "  - Clean up and re-export the images to shrink them"
@@ -1196,7 +1196,7 @@ else {
     }
     Write-Host $LineBreak
 
-    if ($IncludeDotNet) {
+    if (-not $SkipDotNet) {
         Invoke-Task -Description 'Downloading the latest .NET cumulative update from the Microsoft Update Catalog...' -ScriptBlock {
             $VerPart = if ($FeatureName) { "Windows $WindowsVersion Version $FeatureName" } else { "Windows $WindowsVersion" }
             $Query = "Cumulative Update for .NET Framework $VerPart for $CatalogArch"
