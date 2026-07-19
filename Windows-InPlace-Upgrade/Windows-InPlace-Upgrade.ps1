@@ -1049,16 +1049,45 @@ else {
     # so reaching here means Setup quit before that point - which almost always means the upgrade FAILED
     # (blocking compat issue, driver/app hold, media/space problem, etc.), not that it succeeded silently.
     # Treat it as a probable failure and point at the diagnostics.
-    $ExitHex = if ($null -ne $SetupExitCode) { '0x{0:X8}' -f ([uint32]($SetupExitCode -band 0xFFFFFFFF)) } else { $null }
-    $ExitNote = if ($ExitHex) { " (exit code $SetupExitCode / $ExitHex)" } else { '' }
-    Write-HostTimestamp "Windows Setup finished but did NOT schedule a restart$ExitNote." -ForegroundColor Yellow
-    Write-HostTimestamp 'A successful in-place upgrade would have queued an automatic reboot to continue, so this almost certainly means Setup FAILED and rolled back.' -ForegroundColor Yellow
-    Write-Host 'Review these logs to find the reason:'
-    Write-Host '  - C:\$WINDOWS.~BT\Sources\Panther\setupact.log   (search for "Overall progress" and lines near "error")'
-    Write-Host '  - C:\$WINDOWS.~BT\Sources\Panther\setuperr.log'
-    Write-Host '  - Run SetupDiag (https://aka.ms/SetupDiag) for a plain-language diagnosis of the failure.'
-    if ($ExitHex) {
-        Write-Host "  - Look up the Setup exit code $ExitHex (e.g. 0xC1900208 = an app/compat block, 0xC1900101 = a driver/rollback failure)."
+
+    # BUT: if Setup reached ~100% the machine may simply be in the middle of triggering its restart, and the
+    # pending-reboot flag can lag a little behind setup.exe exiting. Give it a minute or two to either show
+    # the pending reboot (success) or actually start restarting before we call it a failure.
+    if ($SetupOutcome -and $SetupOutcome.LastProgress -ge 100) {
+        Write-HostTimestamp 'Windows Setup reached 100% - it may be preparing to restart. Waiting up to 2 minutes to confirm...' -ForegroundColor Cyan
+        $ConfirmDeadline = (Get-Date).AddMinutes(2)
+        while ((Get-Date) -lt $ConfirmDeadline) {
+            if (Test-PendingReboot) { $SetupOutcome.RebootPending = $true; break }
+            if (Test-SetupRunning) { $SetupOutcome.RebootPending = $true; break }
+            Start-Sleep -Seconds 10
+        }
+        if (-not $SetupOutcome.RebootPending) {
+            Write-HostTimestamp 'No restart was scheduled within the wait window, so this most likely indicates a failure.' -ForegroundColor Yellow
+        }
+    }
+
+    if ($SetupOutcome -and $SetupOutcome.RebootPending) {
+        # A restart showed up during the confirmation wait above - Setup actually succeeded.
+        Write-HostTimestamp 'Windows Setup finished its down-level phase and a restart is required to continue the upgrade.' -ForegroundColor Green
+        if ($NoReboot) {
+            Write-Host 'Restart the computer when ready to let Setup finish the upgrade.'
+        }
+        else {
+            Write-Host 'The computer will restart automatically to continue. Do not power it off during the upgrade.'
+        }
+    }
+    else {
+        $ExitHex = if ($null -ne $SetupExitCode) { '0x{0:X8}' -f ([uint32]($SetupExitCode -band 0xFFFFFFFF)) } else { $null }
+        $ExitNote = if ($ExitHex) { " (exit code $SetupExitCode / $ExitHex)" } else { '' }
+        Write-HostTimestamp "Windows Setup finished but did NOT schedule a restart$ExitNote." -ForegroundColor Yellow
+        Write-HostTimestamp 'A successful in-place upgrade would have queued an automatic reboot to continue, so this almost certainly means Setup FAILED and rolled back.' -ForegroundColor Yellow
+        Write-Host 'Review these logs to find the reason:'
+        Write-Host '  - C:\$WINDOWS.~BT\Sources\Panther\setupact.log   (search for "Overall progress" and lines near "error")'
+        Write-Host '  - C:\$WINDOWS.~BT\Sources\Panther\setuperr.log'
+        Write-Host '  - Run SetupDiag (https://aka.ms/SetupDiag) for a plain-language diagnosis of the failure.'
+        if ($ExitHex) {
+            Write-Host "  - Look up the Setup exit code $ExitHex (e.g. 0xC1900208 = an app/compat block, 0xC1900101 = a driver/rollback failure)."
+        }
     }
 }
 
