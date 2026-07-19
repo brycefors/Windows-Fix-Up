@@ -114,7 +114,7 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 }
 
 # Add a Window Title
-$Host.UI.RawUI.WindowTitle = "Windows In-Place Upgrade - Running as Administrator"
+$Host.UI.RawUI.WindowTitle = "Windows In-Place Upgrade - Running as Administrator - $env:COMPUTERNAME"
 
 # --- Start Logging ---
 # Resolve the log directory: use -LogPath (defaults to C:\Temp\Windows-InPlace-Upgrade), creating it if

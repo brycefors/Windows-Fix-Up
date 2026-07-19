@@ -100,7 +100,7 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 }
 
 # Add a Window Title
-$Host.UI.RawUI.WindowTitle = "Windows Clean-Up - Running as Administrator"
+$Host.UI.RawUI.WindowTitle = "Windows Clean-Up - Running as Administrator - $env:COMPUTERNAME"
 
 # --- Start Logging ---
 # Resolve the log directory: use -LogPath (defaults to C:\Temp\Windows-Clean-Up), creating it if
@@ -308,7 +308,7 @@ $script:AuditTotalBytes = 0
 # Tracks whether any step made a change that a restart would finalize (e.g. disabling hibernation).
 $script:RebootRecommended = $false
 if ($script:AuditMode) {
-    $Host.UI.RawUI.WindowTitle = "Windows Clean-Up - AUDIT (read-only)"
+    $Host.UI.RawUI.WindowTitle = "Windows Clean-Up - AUDIT (read-only) - $env:COMPUTERNAME"
     Write-HostTimestamp 'AUDIT MODE: read-only. Nothing will be deleted or changed; only estimates will be reported.' -ForegroundColor Cyan
     Write-Host $LineBreak
 }

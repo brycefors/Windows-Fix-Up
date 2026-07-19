@@ -76,7 +76,7 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 }
 
 # Add a Window Title
-$Host.UI.RawUI.WindowTitle = "Windows Fix Up - Running as Administrator"
+$Host.UI.RawUI.WindowTitle = "Windows Fix Up - Running as Administrator - $env:COMPUTERNAME"
 
 # --- Start Logging ---
 # Create a log file in the same directory as the script
