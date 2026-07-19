@@ -1452,48 +1452,64 @@ if (($UpdateGroups.Count -gt 0) -or $TrimNeeded) {
 }
 
 # --- Recompile the ISO with oscdimg ---
+# Default the output path to the download folder, naming it after the source ISO with an "-Updated_<date>"
+# suffix so it sits next to the original without overwriting it.
 if (-not $OutputIsoPath) {
     $BaseName = [System.IO.Path]::GetFileNameWithoutExtension($ResolvedIso)
     $OutputIsoPath = Join-Path -Path $DlDir -ChildPath "$BaseName-Updated_$(Get-Date -Format 'yyyyMMdd').iso"
 }
+# Make sure the destination folder exists before oscdimg writes the ISO into it.
 try {
     $OutDir = Split-Path -Path $OutputIsoPath -Parent
     if ($OutDir -and -not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force -ErrorAction Stop | Out-Null }
 }
 catch { }
 
+# The two boot sectors extracted from the source media: etfsboot.com boots the ISO on legacy BIOS PCs,
+# efisys.bin boots it on modern UEFI PCs. Both are fed to oscdimg so the new ISO boots on either.
 $EtfsBoot = Join-Path $ExtractDir 'boot\etfsboot.com'
 $EfiSys   = Join-Path $ExtractDir 'efi\microsoft\boot\efisys.bin'
 
 Invoke-Task -Description "Recompiling the bootable ISO to $OutputIsoPath ..." -ScriptBlock {
+    # Remove any leftover ISO at the target path from a previous run so oscdimg starts clean.
     if (Test-Path -LiteralPath $OutputIsoPath) { Remove-Item -LiteralPath $OutputIsoPath -Force -ErrorAction SilentlyContinue }
 
     # Build the dual (BIOS + UEFI) boot data. Use 8.3 short paths for the boot files so any spaces in the
     # working path do not break oscdimg's -bootdata argument.
     $BootArg = $null
     if ((Test-Path -LiteralPath $EtfsBoot) -and (Test-Path -LiteralPath $EfiSys)) {
+        # Both boot sectors present -> build dual-boot data: "2" entries, one for BIOS (p0) and one for
+        # UEFI (pEF), each pointing at its (short-path) boot file.
         $EtfsShort = Get-ShortPath -Path $EtfsBoot
         $EfiShort  = Get-ShortPath -Path $EfiSys
         $BootArg = "2#p0,e,b$EtfsShort#pEF,e,b$EfiShort"
     }
     elseif (Test-Path -LiteralPath $EfiSys) {
-        # UEFI-only media (no BIOS boot sector present).
+        # UEFI-only media (no BIOS boot sector present): a single UEFI (pEF) boot entry.
         $BootArg = "1#pEF,e,b$(Get-ShortPath -Path $EfiSys)"
     }
     else {
+        # Neither boot sector was found; oscdimg will still build the ISO, but it may not be bootable.
         Write-HostTimestamp '  No boot sectors were found in the extracted media; the resulting ISO may not be bootable.' -ForegroundColor Yellow
     }
 
+    # oscdimg switches: -m (ignore the 4 GB image size limit), -o (de-duplicate identical files to save
+    # space), -u2 (write a pure UDF file system, required for the large install.wim), -udfver102 (UDF
+    # revision 1.02 for broad compatibility). -bootdata makes the ISO bootable; the last two arguments are
+    # the source folder to package and the output ISO path.
     $OscdimgArgs = @('-m', '-o', '-u2', '-udfver102')
     if ($BootArg) { $OscdimgArgs += "-bootdata:$BootArg" }
     $OscdimgArgs += @($ExtractDir, $OutputIsoPath)
 
+    # Run oscdimg and wait for it to finish, then verify it actually produced the ISO.
     Write-HostTimestamp "  Running: `"$Oscdimg`" $($OscdimgArgs -join ' ')"
     $Proc = Start-Process -FilePath $Oscdimg -ArgumentList $OscdimgArgs -Wait -PassThru -NoNewWindow -ErrorAction Stop
     if ($Proc.ExitCode -ne 0) {
+        # A non-zero exit code means oscdimg failed to build the image.
         throw "oscdimg returned exit code $($Proc.ExitCode)."
     }
     if (-not (Test-Path -LiteralPath $OutputIsoPath)) {
+        # Guard against the rare case where oscdimg exits 0 but no file was written.
         throw 'oscdimg reported success but the output ISO was not created.'
     }
     $SizeGB = [math]::Round((Get-Item -LiteralPath $OutputIsoPath).Length / 1GB, 2)
