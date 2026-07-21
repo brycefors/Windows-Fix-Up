@@ -569,6 +569,31 @@ function Watch-SetupProgress {
                     $ProgressMatches = [regex]::Matches($Content, 'Overall progress:\s*\[(\d+)%\]')
                     if ($ProgressMatches.Count -gt 0) {
                         $Pct = [int]$ProgressMatches[$ProgressMatches.Count - 1].Groups[1].Value
+
+                        # If the very first percentage we ever see is high (>= 80%), it is almost certainly
+                        # leftover progress from a previous run's log (Setup does some initial cleanup before
+                        # the real upgrade starts). Treat it as a cleanup phase and ignore these inflated
+                        # readings until progress drops back into the genuine 0-20% starting range.
+                        if (-not $script:_WatchSeenProgress) {
+                            $script:_WatchSeenProgress = $true
+                            if ($Pct -ge 80) {
+                                $script:_WatchCleanupPhase = $true
+                                Write-HostTimestamp "    Setup reports $Pct% on first detection - treating this as initial cleanup from a previous run; waiting for the real upgrade to begin (progress will reset toward 0-20%)..." -ForegroundColor DarkGray
+                            }
+                        }
+
+                        if ($script:_WatchCleanupPhase) {
+                            if ($Pct -le 20) {
+                                # Progress has reset - the real upgrade is now underway.
+                                $script:_WatchCleanupPhase = $false
+                                Write-HostTimestamp '    Real upgrade progress has begun.' -ForegroundColor Cyan
+                            }
+                            else {
+                                # Still in the cleanup phase - do not report inflated percentages as real progress.
+                                return
+                            }
+                        }
+
                         if ($Pct -ne $script:_WatchLastProgress) {
                             $script:_WatchLastProgress = $Pct
                             Write-HostTimestamp "    Setup progress: $Pct%"
@@ -584,6 +609,8 @@ function Watch-SetupProgress {
     }
     $script:_WatchLastProgress = -1
     $script:_WatchLogFile = $null
+    $script:_WatchSeenProgress = $false
+    $script:_WatchCleanupPhase = $false
 
     Write-HostTimestamp '  Monitoring the Setup process - this window will not exit until Setup completes...' -ForegroundColor Cyan
 
