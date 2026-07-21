@@ -68,9 +68,27 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
     throw "This script requires PowerShell 5.1 or higher. You are currently running $($PSVersionTable.PSVersion)."
 }
 
-# Require Administrator elevation. Per the specification we do NOT self-elevate here - we throw a terminating error.
+# Require Administrator elevation. Self-elevate by relaunching in an elevated PowerShell session (UAC prompt).
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $IsAdmin) {
+    if ([int](Get-CimInstance -Class Win32_OperatingSystem | Select-Object -ExpandProperty BuildNumber) -ge 6000) {
+        # Rebuild the argument list, forwarding every bound parameter (with its value) to the elevated instance.
+        $ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$($MyInvocation.MyCommand.Path)`"")
+        foreach ($Parameter in $PSBoundParameters.GetEnumerator()) {
+            $Value = $Parameter.Value
+            if ($Value -is [switch]) {
+                if ($Value.IsPresent) { $ArgumentList += "-$($Parameter.Key)" }
+            }
+            else {
+                $ArgumentList += "-$($Parameter.Key)"
+                $ArgumentList += "`"$Value`""
+            }
+        }
+
+        Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList $ArgumentList
+        exit
+    }
+
     throw 'Administrator elevation is required. Re-run this script from an elevated (Run as administrator) PowerShell session.'
 }
 

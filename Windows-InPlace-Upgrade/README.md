@@ -111,7 +111,7 @@ powershell -ExecutionPolicy Bypass -File $d -DownloadPath 'C:\ISO'
 | `-Release` | Fido release to request (e.g. `24H2`, `23H2`) or `Latest`. Defaults to `Latest`. |
 | `-Language` | ISO language as named by Microsoft/Fido (e.g. `English`, `"English International"`). Defaults to `English`. |
 | `-KeepMode` | What Setup keeps: `KeepAll` (apps + data, default) or `KeepNothing` (clean install). |
-| `-DownloadPath` | Directory to download the ISO into (defaults to `C:\Temp\Windows-InPlace-Upgrade`). |
+| `-DownloadPath` | Directory to download the ISO into (defaults to `C:\Temp\WindowsISO`). |
 | `-DownloadOnly` | Only obtain/download the ISO; do not launch the upgrade. |
 | `-NoReboot` | Prevents Setup from restarting automatically at the end (`/noreboot`). |
 | `-DynamicUpdate` | Enables Dynamic Update so Setup pulls the latest fixes online before upgrading (disabled by default). |

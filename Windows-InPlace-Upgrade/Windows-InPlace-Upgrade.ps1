@@ -47,8 +47,8 @@ param(
     [ValidateSet('KeepAll', 'KeepNothing')]
     [string]$KeepMode = 'KeepAll',
 
-    [Parameter(HelpMessage = 'Directory to download the ISO into (defaults to C:\Temp\Windows-InPlace-Upgrade). Needs ~8 GB free')]
-    [string]$DownloadPath = 'C:\Temp\Windows-InPlace-Upgrade',
+    [Parameter(HelpMessage = 'Directory to download the ISO into (defaults to C:\Temp\WindowsISO). Needs ~8 GB free')]
+    [string]$DownloadPath = 'C:\Temp\WindowsISO',
 
     [Parameter(HelpMessage = 'Only obtain/download the ISO; do not launch the in-place upgrade')]
     [switch]$DownloadOnly,
