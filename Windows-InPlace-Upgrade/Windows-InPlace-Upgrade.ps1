@@ -16,8 +16,9 @@
 #
 # The ISO download is large (~8 GB) and the upgrade needs roughly 20 GB of free space to stage, so the
 # script checks disk space up front. Setup itself takes 20-90 minutes and will restart the machine several
-# times; by default it prompts before it begins. For hands-off use pass -Unattended (and optionally
-# -NoReboot to hold the final restart).
+# times; by default it prompts before it begins. When the down-level phase succeeds the script schedules a
+# warned 15-minute delayed restart (pass -ImmediateReboot to restart at once, or -NoReboot to restart
+# manually). For hands-off use pass -Unattended.
 # -------------------------------------------------
 # How to Run .PS1 Script with PowerShell:
 # NOTE: It is recommended to use the "Run-Windows-InPlace-Upgrade.bat" to invoke this script. However, you can run the .PS1 directly if needed.
@@ -55,6 +56,9 @@ param(
 
     [Parameter(HelpMessage = 'Do not let Setup restart the machine automatically at the end (/noreboot)')]
     [switch]$NoReboot,
+
+    [Parameter(HelpMessage = 'Restore the original behavior: restart immediately when the upgrade succeeds, instead of the default warned 15-minute delayed restart')]
+    [switch]$ImmediateReboot,
 
     [Parameter(HelpMessage = 'Enable Dynamic Update so Setup pulls the latest fixes online before upgrading (disabled by default)')]
     [switch]$DynamicUpdate,
@@ -352,11 +356,52 @@ function Get-SetupArguments {
     # Reduce telemetry from the Setup process itself.
     $SetupArgs += @('/telemetry', 'disable')
 
-    if ($NoReboot) { $SetupArgs += '/noreboot' }
+    # Hold Setup's own automatic restart by default so the script can schedule a warned 15-minute delayed
+    # reboot instead. -NoReboot leaves the machine up entirely; -ImmediateReboot lets Setup restart at once
+    # (the original behavior). -NoReboot always wins if both are somehow set.
+    if ($NoReboot -or -not $ImmediateReboot) { $SetupArgs += '/noreboot' }
     # The Setup GUI is hidden by default (/quiet); pass -ShowUI to display it.
     if (-not $ShowUI) { $SetupArgs += '/quiet' }
 
     return $SetupArgs
+}
+
+# Handles the restart after Setup finishes its down-level phase successfully. By default we held Setup's
+# own restart (via /noreboot in Get-SetupArguments) and instead schedule a warned, delayed automatic
+# restart so the user has time to save work. -ImmediateReboot restores Setup's original behavior of
+# restarting right away; -NoReboot leaves the machine up for a manual restart.
+function Invoke-PostUpgradeReboot {
+    $RebootDelayMinutes = 15
+
+    if ($NoReboot) {
+        Write-Host 'Restart the computer when ready to let Setup finish the upgrade.'
+        return
+    }
+    if ($ImmediateReboot) {
+        Write-Host 'The computer will restart automatically to continue. Do not power it off during the upgrade.'
+        return
+    }
+
+    # Default: schedule a warned, delayed automatic restart so the user has time to save their work.
+    $DelaySeconds = $RebootDelayMinutes * 60
+    $RebootMessage = "Windows will restart in $RebootDelayMinutes minutes to finish the in-place upgrade. Save your work now. Do not power off during the upgrade."
+    Write-HostTimestamp "The computer will automatically restart in $RebootDelayMinutes minutes to continue the upgrade." -ForegroundColor Yellow
+    Write-Host '  Save your work now. To restart sooner, run:  shutdown /r /t 0'
+    Write-Host '  To cancel the scheduled restart, run:         shutdown /a'
+    try {
+        # Clear any restart Setup/Windows may already have queued, then schedule the warned one.
+        & shutdown.exe /a 2>$null | Out-Null
+        & shutdown.exe /r /t $DelaySeconds /c $RebootMessage 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-HostTimestamp "Scheduled the restart (shutdown /r /t $DelaySeconds)." -ForegroundColor Green
+        }
+        else {
+            Write-HostTimestamp "Could not schedule the delayed restart (shutdown exit code $LASTEXITCODE). Restart manually to continue the upgrade." -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-HostTimestamp "Could not schedule the delayed restart: $($_.Exception.Message). Restart manually to continue the upgrade." -ForegroundColor Yellow
+    }
 }
 
 # Confirms the mounted drive really is Windows installation media before we launch Setup from it, so we
@@ -807,6 +852,15 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $DownloadOnly) {
     if ($BypassCompatChecks) { Write-Host "  - Bypass the Windows 11 hardware compatibility checks (/product server) - for incompatible PCs" -ForegroundColor Yellow }
     Write-Host ""
     Write-Host "The upgrade takes 20-90 minutes and WILL RESTART the computer several times." -ForegroundColor Yellow
+    if ($NoReboot) {
+        Write-Host "When the first phase succeeds it will NOT restart automatically (-NoReboot); restart manually to continue." -ForegroundColor Yellow
+    }
+    elseif ($ImmediateReboot) {
+        Write-Host "When the first phase succeeds it will restart immediately (-ImmediateReboot)." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "When the first phase succeeds it will restart automatically after a 15-minute warning (you can cancel with 'shutdown /a')." -ForegroundColor Yellow
+    }
     Write-Host "Close your apps and save your work before continuing." -ForegroundColor Yellow
     Write-Host "Once Setup starts, closing this window will NOT stop the upgrade." -ForegroundColor Yellow
     Write-Host ""
@@ -1053,12 +1107,7 @@ if (-not $SetupStarted) {
 }
 elseif ($SetupOutcome -and $SetupOutcome.RebootPending) {
     Write-HostTimestamp 'Windows Setup finished its down-level phase and a restart is required to continue the upgrade.' -ForegroundColor Green
-    if ($NoReboot) {
-        Write-Host 'Restart the computer when ready to let Setup finish the upgrade.'
-    }
-    else {
-        Write-Host 'The computer will restart automatically to continue. Do not power it off during the upgrade.'
-    }
+    Invoke-PostUpgradeReboot
 }
 elseif ($NoReboot) {
     # -NoReboot was requested, so Setup intentionally does NOT restart at the end of the down-level phase.
@@ -1096,12 +1145,7 @@ else {
     if ($SetupOutcome -and $SetupOutcome.RebootPending) {
         # A restart showed up during the confirmation wait above - Setup actually succeeded.
         Write-HostTimestamp 'Windows Setup finished its down-level phase and a restart is required to continue the upgrade.' -ForegroundColor Green
-        if ($NoReboot) {
-            Write-Host 'Restart the computer when ready to let Setup finish the upgrade.'
-        }
-        else {
-            Write-Host 'The computer will restart automatically to continue. Do not power it off during the upgrade.'
-        }
+        Invoke-PostUpgradeReboot
     }
     else {
         $ExitHex = if ($null -ne $SetupExitCode) { '0x{0:X8}' -f ([uint32]($SetupExitCode -band 0xFFFFFFFF)) } else { $null }

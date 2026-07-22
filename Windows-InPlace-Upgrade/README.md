@@ -118,7 +118,8 @@ powershell -ExecutionPolicy Bypass -File $d -DownloadPath 'C:\ISO'
 | `-KeepMode` | What Setup keeps: `KeepAll` (apps + data, default) or `KeepNothing` (clean install). |
 | `-DownloadPath` | Directory to download the ISO into (defaults to `C:\Temp\WindowsISO`). |
 | `-DownloadOnly` | Only obtain/download the ISO; do not launch the upgrade. |
-| `-NoReboot` | Prevents Setup from restarting automatically at the end (`/noreboot`). |
+| `-NoReboot` | Prevents any automatic restart at the end (`/noreboot`); restart manually to continue the upgrade. |
+| `-ImmediateReboot` | Restart immediately when the down-level phase succeeds, instead of the default 15-minute warned delayed restart. |
 | `-DynamicUpdate` | Enables Dynamic Update so Setup pulls the latest fixes online before upgrading (disabled by default). |
 | `-ShowUI` | Shows the Windows Setup GUI. By default Setup runs with its GUI hidden (`/quiet`). |
 | `-BypassCompatChecks` | Bypasses the Windows 11 hardware compatibility checks (TPM 2.0, Secure Boot, supported CPU, RAM) on incompatible machines using Setup's `/product server` switch. |
