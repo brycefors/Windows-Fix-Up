@@ -562,6 +562,43 @@ function Invoke-SafeRemediation {
 # Build / patch currency check
 # ---------------------------------------------------------------------------------------------------------------
 
+# Reads Windows' own component-store package data (via DISM) to find the highest cumulative-update revision
+# (UBR) that has actually been laid down on this machine, and whether it is fully Installed or still pending.
+# Cumulative-update package names carry the version as <build>.<UBR>.<x>.<y>, e.g.
+# "Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.8894.1.9" -> build 26100, UBR 8894. This lets us
+# derive the update UBR straight from what is installed inside Windows, with no online/offline reference
+# table. Returns a PSCustomObject (Build, Ubr, State) for the newest cumulative update, or $null if unreadable.
+function Get-InstalledUpdateUbr {
+    param([int]$RunningBuild)
+
+    try {
+        $packages = Get-WindowsPackage -Online -ErrorAction Stop |
+            Where-Object { $_.PackageName -match 'RollupFix' }
+    }
+    catch {
+        return $null
+    }
+    if (-not $packages) { return $null }
+
+    $best = $null
+    foreach ($pkg in $packages) {
+        if ($pkg.PackageName -match '~~(\d+)\.(\d+)\.\d+\.\d+') {
+            $pkgBuild = [int]$Matches[1]
+            $pkgUbr = [int]$Matches[2]
+            # Only compare against updates for the build line the machine is actually on.
+            if ($RunningBuild -and $pkgBuild -ne $RunningBuild) { continue }
+            if (-not $best -or $pkgUbr -gt $best.Ubr) {
+                $best = [pscustomobject]@{
+                    Build = $pkgBuild
+                    Ubr   = $pkgUbr
+                    State = "$($pkg.PackageState)"
+                }
+            }
+        }
+    }
+    return $best
+}
+
 # Determines whether the machine appears to be behind on quality updates. This is an OFFLINE heuristic: rather
 # than looking up the latest available build online, it reports the OS build and the date of the most recent
 # quality-update install. If nothing has installed within -StaleBuildDays, the build is likely not recent and
@@ -571,23 +608,37 @@ function Test-BuildCurrency {
 
     $caption = $null
     $buildUbr = $null
+    $runningBuild = $null
+    $runningUbr = $null
     try {
         $reg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
         $caption = if ($reg.ProductName) { $reg.ProductName } else { $null }
+        # The registry ProductName still reads "Windows 10 ..." on Windows 11 (Microsoft never updated it);
+        # the real distinction is the build number - 22000 and higher is Windows 11.
+        if ($caption -and $reg.CurrentBuildNumber -and [int]$reg.CurrentBuildNumber -ge 22000) {
+            $caption = $caption -replace 'Windows 10', 'Windows 11'
+        }
         if ($reg.DisplayVersion) { $caption = "$caption ($($reg.DisplayVersion))" }
-        if ($reg.CurrentBuildNumber -and $null -ne $reg.UBR) {
-            $buildUbr = "$($reg.CurrentBuildNumber).$($reg.UBR)"
+        if ($reg.CurrentBuildNumber) { $runningBuild = [int]$reg.CurrentBuildNumber }
+        if ($null -ne $reg.UBR) { $runningUbr = [int]$reg.UBR }
+        if ($runningBuild -and $null -ne $runningUbr) {
+            $buildUbr = "$runningBuild.$runningUbr"
         }
     }
     catch { }
 
-    # Determine the most recent quality-update install date.
+    # Determine the most recent quality update - both its install date and its KB (Windows' own record).
     $lastUpdate = $null
+    $lastKb = $null
     try {
-        $lastUpdate = (Get-HotFix -ErrorAction Stop |
-                Where-Object { $_.InstalledOn } |
-                Sort-Object -Property InstalledOn -Descending |
-                Select-Object -First 1).InstalledOn
+        $lastHotfix = Get-HotFix -ErrorAction Stop |
+            Where-Object { $_.InstalledOn } |
+            Sort-Object -Property InstalledOn -Descending |
+            Select-Object -First 1
+        if ($lastHotfix) {
+            $lastUpdate = $lastHotfix.InstalledOn
+            $lastKb = $lastHotfix.HotFixID
+        }
     }
     catch { }
 
@@ -603,13 +654,28 @@ function Test-BuildCurrency {
     $daysSince = if ($lastUpdate) { [int]((Get-Date) - $lastUpdate).TotalDays } else { $null }
     $isStale = ($null -eq $lastUpdate) -or ($daysSince -gt $StaleDays)
 
+    # Cross-check the running revision against what Windows itself reports as installed. If a newer
+    # cumulative-update revision (UBR) is present in the component store than the one the system is running,
+    # the last update installed but is not active yet (restart pending, or it did not commit) - so the
+    # machine is effectively behind even though an update was installed.
+    $installed = if ($runningBuild) { Get-InstalledUpdateUbr -RunningBuild $runningBuild } else { $null }
+    $installedUbr = if ($installed) { $installed.Ubr } else { $null }
+    $installedUbrState = if ($installed) { $installed.State } else { $null }
+    $updatePending = ($null -ne $installedUbr -and $null -ne $runningUbr -and $installedUbr -gt $runningUbr)
+
     return [pscustomobject]@{
-        Caption        = $caption
-        BuildUbr       = $buildUbr
-        LastUpdate     = $lastUpdate
-        DaysSincePatch = $daysSince
-        StaleThreshold = $StaleDays
-        IsStale        = $isStale
+        Caption           = $caption
+        BuildUbr          = $buildUbr
+        RunningBuild      = $runningBuild
+        RunningUbr        = $runningUbr
+        LastUpdate        = $lastUpdate
+        LastKb            = $lastKb
+        DaysSincePatch    = $daysSince
+        StaleThreshold    = $StaleDays
+        IsStale           = $isStale
+        InstalledUbr      = $installedUbr
+        InstalledUbrState = $installedUbrState
+        UpdatePending     = $updatePending
     }
 }
 
@@ -621,10 +687,25 @@ function Write-BuildCurrency {
     Write-Host ("  Build.UBR   : {0}" -f $(if ($Currency.BuildUbr) { $Currency.BuildUbr } else { 'Unknown' })) -ForegroundColor Gray
 
     if ($Currency.LastUpdate) {
-        Write-Host ("  Last update : {0} ({1} day(s) ago)" -f $Currency.LastUpdate.ToString('yyyy-MM-dd'), $Currency.DaysSincePatch) -ForegroundColor Gray
+        $kbNote = if ($Currency.LastKb) { " - $($Currency.LastKb)" } else { '' }
+        Write-Host ("  Last update : {0} ({1} day(s) ago){2}" -f $Currency.LastUpdate.ToString('yyyy-MM-dd'), $Currency.DaysSincePatch, $kbNote) -ForegroundColor Gray
     }
     else {
         Write-Host '  Last update : Unknown (no installed quality update found)' -ForegroundColor Yellow
+    }
+
+    # Newest cumulative-update revision Windows reports as installed, and whether it is active yet.
+    if ($null -ne $Currency.InstalledUbr) {
+        Write-Host ("  Installed   : revision .{0} ({1})" -f $Currency.InstalledUbr, $Currency.InstalledUbrState) -ForegroundColor Gray
+    }
+
+    if ($Currency.UpdatePending) {
+        Write-Host ''
+        Write-Host 'WARNING: An installed update has not taken effect - updates might be behind.' -ForegroundColor Red
+        Write-Host ("         Windows has cumulative-update revision .{0} installed, but the system is still running" -f $Currency.InstalledUbr) -ForegroundColor Yellow
+        Write-Host ("         revision .{0} (build {1}.{2}). The update is applied but not active - a restart is likely" -f $Currency.RunningUbr, $Currency.RunningBuild, $Currency.RunningUbr) -ForegroundColor Yellow
+        Write-Host '         pending, or the last update did not finish committing. Restart and re-check; if it persists,' -ForegroundColor Yellow
+        Write-Host '         resolve the servicing errors below and run Windows Update again.' -ForegroundColor Yellow
     }
 
     if ($Currency.IsStale) {
