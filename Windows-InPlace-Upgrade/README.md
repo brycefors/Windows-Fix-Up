@@ -5,6 +5,11 @@
 
 This PowerShell script automates the whole process: it detects your installed Windows version, **automatically obtains the matching official Microsoft ISO** (via the community [Fido](https://github.com/pbatard/Fido) helper, which queries Microsoft's own download servers), downloads it, mounts it, and launches Windows Setup in in-place-upgrade mode.
 
+> [!TIP]
+> **Try the built-in Windows 11 reinstall first.** Windows 11 (version 24H2 and newer) has a recovery option that does essentially the same repair install without downloading a full ISO: go to **Settings → System → Recovery → Fix problems using Windows Update** and click **Reinstall now**. It reinstalls the current version of Windows while keeping your files, apps, and settings, using Windows Update to pull the files. That is the cleanest, Microsoft-supported way to do a repair install, so **use it first if it is available**.
+>
+> Use **this script** when that option is missing (older Windows 10/11 builds), when it fails or is greyed out, or when the very Windows Update pipeline it relies on is too broken to run. In those cases this ISO-based in-place upgrade is the **next best option**.
+
 ## Table of Contents
 
 - [Important Notes](#important-notes)
