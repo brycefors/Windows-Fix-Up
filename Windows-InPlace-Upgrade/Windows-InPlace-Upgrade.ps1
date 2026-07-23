@@ -579,7 +579,7 @@ function Test-PendingReboot {
 # Returns a PSCustomObject: Progressed, RebootPending, LastProgress. Never throws.
 function Watch-SetupProgress {
     param(
-        [int]$TimeoutMinutes = 180,
+        [int]$TimeoutMinutes = 360,
         [int]$StartupGraceMinutes = 5
     )
 
