@@ -29,6 +29,44 @@ An unattended "Automated Windows Update Maintenance Engine". It detects the loca
 
 The easiest way to run this script is with the `Run-Windows-Update-Maintenance.bat` file, which handles administrator elevation and the PowerShell execution policy.
 
+### Quickest Method: Straight from GitHub
+
+Open **Terminal (Admin)** and paste one of these. Nothing has to be downloaded by hand — the script pulls itself from GitHub and runs in memory.
+
+**No parameters (defaults):**
+
+```powershell
+irm https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Update-Maintenance/Windows-Update-Maintenance.ps1 | iex
+```
+
+**With parameters** (`iex` cannot take arguments, so wrap the download in a script block):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Update-Maintenance/Windows-Update-Maintenance.ps1))) -ReportOnly
+```
+
+**Download then run** — preferred for scheduled tasks, Intune, and RMM, because the file persists for re-runs and the exit code is returned to the caller:
+
+```powershell
+$Url  = 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Update-Maintenance/Windows-Update-Maintenance.ps1'
+$Path = "$env:ProgramData\UpdateStaging\Windows-Update-Maintenance.ps1"
+New-Item -ItemType Directory -Path (Split-Path $Path) -Force | Out-Null
+Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing
+& $Path -AutoReboot -ComponentCleanup
+```
+
+**Single-line command for an RMM / Intune platform script:**
+
+```shell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; & ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/brycefors/Windows-Fix-Up/refs/heads/main/Windows-Update-Maintenance/Windows-Update-Maintenance.ps1'))) -AutoReboot; exit $LASTEXITCODE"
+```
+
+> [!NOTE]
+> Run these from an **elevated** session. If you start an in-memory run unelevated on an interactive desktop, the script writes itself to `%TEMP%\Windows-Update-Maintenance.ps1` and relaunches through UAC. In a non-interactive session (SYSTEM task, RMM) it throws instead of prompting.
+
+> [!TIP]
+> Piping any script from the internet straight into `iex` executes whatever that URL returns. Review the source, or pin the URL to a specific commit SHA instead of `refs/heads/main`, before using this in production.
+
 ### Recommended Method: Using the Batch File
 
 1.  **Download Files:** Save `Run-Windows-Update-Maintenance.bat` and `Windows-Update-Maintenance.ps1` in the **same folder**.

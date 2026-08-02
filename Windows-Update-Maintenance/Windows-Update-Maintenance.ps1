@@ -110,7 +110,14 @@ if (-not $IsAdmin) {
         throw 'Administrator privileges are required. Run this script as SYSTEM or from an elevated session.'
     }
 
-    $ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$($MyInvocation.MyCommand.Path)`"")
+    # When piped straight from GitHub (irm | iex) there is no file on disk, so persist the script text first.
+    $ScriptPath = $MyInvocation.MyCommand.Path
+    if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
+        $ScriptPath = Join-Path -Path $env:TEMP -ChildPath 'Windows-Update-Maintenance.ps1'
+        $MyInvocation.MyCommand.ScriptBlock.ToString() | Set-Content -LiteralPath $ScriptPath -Encoding UTF8 -Force
+    }
+
+    $ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$ScriptPath`"")
     foreach ($Parameter in $PSBoundParameters.GetEnumerator()) {
         if ($Parameter.Value -is [switch]) {
             if ($Parameter.Value.IsPresent) { $ArgumentList += "-$($Parameter.Key)" }
@@ -1064,5 +1071,7 @@ finally {
         & "$env:SystemRoot\System32\shutdown.exe" /r /t $RebootDelaySeconds /c 'Restarting to complete Windows Update servicing.' | Out-Null
     }
 
-    exit $Script:ExitCode
+    $global:LASTEXITCODE = $Script:ExitCode
+    # 'exit' would close the caller's console when the script is run from memory (irm | iex).
+    if ($MyInvocation.MyCommand.Path) { exit $Script:ExitCode }
 }
