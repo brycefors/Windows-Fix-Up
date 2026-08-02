@@ -117,10 +117,20 @@ Applies a version guardrail by comparing the build revision embedded in the cata
 Resolves the real `.msu` links from the catalog's `DownloadDialog.aspx` endpoint, rejecting any host that is not a Microsoft CDN and forcing HTTPS. Payloads download to `<StagingPath>\Payload` via `Start-BitsTransfer -Priority Foreground` under a known display name, falling back to a streamed `HttpClient` download if BITS is disabled or blocked by policy. When the catalog returns a prerequisite (checkpoint/SSU) package alongside the cumulative update, both are downloaded in order.
 
 ### Module 5 — Unattended MSU Installation
-* **DISM (default):** `expand.exe -f:*` extracts the MSU to `<StagingPath>\Extract`, `WSUSSCAN.cab` is discarded, any servicing stack CAB is applied first, then `Add-WindowsPackage -Online -NoRestart -LogPath <log>` installs the payload.
+* **DISM (default):** The MSU container is inspected first. Classic CAB-based MSUs (`MSCF` signature) are expanded with `expand.exe -f:*` into `<StagingPath>\Extract`, `WSUSSCAN.cab` is discarded, any servicing stack CAB is applied first, then `Add-WindowsPackage -Online -NoRestart -LogPath <log>` installs the payload.
 * **WUSA:** `wusa.exe "<file>.msu" /quiet /norestart`.
 
 Prerequisite packages that report "already installed" or "not applicable" are logged and skipped rather than failing the run.
+
+#### MSUs with no CAB inside
+
+Windows 11 23H2 and later publish cumulative updates in a newer MSU container (`MSWI` signature) that is **not** a cabinet file. `expand.exe` cannot open it, so the classic "expand, then install the CAB" approach finds nothing to install. The script handles this with a three-step chain:
+
+1. **Container check** — the first four bytes of the `.msu` are read. If the signature is not `MSCF`, expansion is skipped entirely and the `.msu` is handed straight to `Add-WindowsPackage -PackagePath <file>.msu`, which DISM supports natively.
+2. **PSF-based packages** — if a CAB-based MSU expands to `.mum`/`.manifest`/`.psf` files with no standalone CAB, the expanded folder itself is used as the DISM package path.
+3. **WUSA fallback** — if DISM still refuses the payload (and the failure is not simply "not applicable"), the original `.msu` is retried through `wusa.exe /quiet /norestart`, which understands both container formats.
+
+Each step is written to the execution log, so the report shows exactly which path was taken.
 
 ### Module 6 — Programmatic Diagnostic Logging & Error Parsing
 On a non-success exit code the script:

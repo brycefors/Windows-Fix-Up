@@ -572,39 +572,96 @@ function Install-UpdateWithWusa {
     }
 }
 
+function Test-MsuCabinetFormat {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # Classic MSUs are CAB containers ('MSCF'). Windows 11 23H2 and later ship the newer 'MSWI' MSU format,
+    # which expand.exe cannot open - those packages have to be handed to DISM/WUSA as the .msu itself.
+    $Buffer = New-Object byte[] 4
+    $Stream = [System.IO.File]::OpenRead($Path)
+    try { $null = $Stream.Read($Buffer, 0, 4) } finally { $Stream.Dispose() }
+
+    $Signature = [System.Text.Encoding]::ASCII.GetString($Buffer)
+    Write-Log -Level DEBUG -Message "MSU container signature: $Signature"
+    return ($Signature -eq 'MSCF')
+}
+
+function Get-DismPackageTarget {
+    param([Parameter(Mandatory = $true)][string]$MsuPath)
+
+    $Cabs = @(Get-ChildItem -LiteralPath $Script:ExtractPath -Filter '*.cab' -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notlike 'WSUSSCAN*' })
+
+    if ($Cabs.Count -gt 0) {
+        # A servicing stack update bundled inside the MSU must be applied before the cumulative payload.
+        $Ordered = @($Cabs | Where-Object { $_.Name -match 'SSU|ServicingStack' }) + @($Cabs | Where-Object { $_.Name -notmatch 'SSU|ServicingStack' })
+        return [pscustomobject]@{
+            Targets    = @($Ordered | Select-Object -ExpandProperty FullName)
+            IsFallback = $false
+        }
+    }
+
+    # PSF-based MSUs expand to .mum/.manifest/.psf with no standalone CAB; DISM accepts the expanded folder.
+    $Mum = Get-ChildItem -LiteralPath $Script:ExtractPath -Filter '*.mum' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($Mum) {
+        Write-Log -Level WARN -Message "The MSU contains no installable .cab. Applying the expanded package folder (found $($Mum.Name))."
+        return [pscustomobject]@{
+            Targets    = @($Script:ExtractPath)
+            IsFallback = $true
+        }
+    }
+
+    Write-Log -Level WARN -Message 'The MSU contains neither a .cab nor a .mum. Passing the .msu directly to DISM.'
+    return [pscustomobject]@{
+        Targets    = @($MsuPath)
+        IsFallback = $true
+    }
+}
+
 function Install-UpdateWithDism {
     param([Parameter(Mandatory = $true)][string]$MsuPath)
 
-    if (Test-Path -LiteralPath $Script:ExtractPath) {
-        Get-ChildItem -LiteralPath $Script:ExtractPath -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-MsuCabinetFormat -Path $MsuPath) {
+        if (Test-Path -LiteralPath $Script:ExtractPath) {
+            Get-ChildItem -LiteralPath $Script:ExtractPath -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        Write-Log -Message "Expanding MSU payload to $($Script:ExtractPath)"
+        $ExpandOutput = & "$env:SystemRoot\System32\expand.exe" -f:* "$MsuPath" "$Script:ExtractPath" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log -Level WARN -Message "expand.exe failed with exit code $LASTEXITCODE ($($ExpandOutput -join ' ')). Falling back to the .msu itself."
+        }
+
+        $Target = Get-DismPackageTarget -MsuPath $MsuPath
     }
-
-    Write-Log -Message "Expanding MSU payload to $($Script:ExtractPath)"
-    $ExpandOutput = & "$env:SystemRoot\System32\expand.exe" -f:* "$MsuPath" "$Script:ExtractPath" 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "expand.exe failed with exit code $LASTEXITCODE. $($ExpandOutput -join ' ')"
+    else {
+        Write-Log -Message 'Non-CAB MSU container detected (Windows 11 23H2+ format). Applying the .msu directly with DISM.'
+        $Target = [pscustomobject]@{
+            Targets    = @($MsuPath)
+            IsFallback = $true
+        }
     }
-
-    $Cabs = Get-ChildItem -LiteralPath $Script:ExtractPath -Filter '*.cab' -File -ErrorAction Stop |
-        Where-Object { $_.Name -notmatch '^(WSUSSCAN|WSUSSCAN\.cab)' -and $_.Name -notlike 'WSUSSCAN*' }
-
-    if (-not $Cabs) { throw 'No installable .cab package was found inside the expanded MSU payload.' }
-
-    # A servicing stack update bundled inside the MSU must be applied before the cumulative payload.
-    $Ordered = @($Cabs | Where-Object { $_.Name -match 'SSU|ServicingStack' }) + @($Cabs | Where-Object { $_.Name -notmatch 'SSU|ServicingStack' })
 
     $ExitCode = 0
     $Installed = New-Object System.Collections.Generic.List[string]
-    foreach ($Cab in $Ordered) {
-        Write-Log -Message "Applying package: $($Cab.Name)"
+    foreach ($PackagePath in $Target.Targets) {
+        $PackageName = Split-Path -Path $PackagePath -Leaf
+        Write-Log -Message "Applying package: $PackageName"
         try {
-            $Result = Add-WindowsPackage -Online -PackagePath $Cab.FullName -NoRestart -LogPath $Script:DismLogFile -ErrorAction Stop
-            $Installed.Add($Cab.Name)
+            $Result = Add-WindowsPackage -Online -PackagePath $PackagePath -NoRestart -LogPath $Script:DismLogFile -ErrorAction Stop
+            $Installed.Add($PackageName)
             if ($Result.RestartNeeded) { $ExitCode = 3010 }
         }
         catch {
             $HResult = $_.Exception.HResult
-            Write-Log -Level ERROR -Message "Add-WindowsPackage failed for $($Cab.Name): $($_.Exception.Message)"
+            Write-Log -Level ERROR -Message "Add-WindowsPackage failed for ${PackageName}: $($_.Exception.Message)"
+
+            # When DISM cannot consume the CAB-less payload, wusa.exe still understands the original .msu wrapper.
+            if ($Target.IsFallback -and $Script:NotApplicableCodes -notcontains $HResult) {
+                Write-Log -Level WARN -Message 'Retrying the package with wusa.exe.'
+                return Install-UpdateWithWusa -MsuPath $MsuPath
+            }
+
             return [pscustomobject]@{
                 Method   = 'DISM'
                 ExitCode = $HResult
