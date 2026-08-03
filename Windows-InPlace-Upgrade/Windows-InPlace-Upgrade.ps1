@@ -12,6 +12,7 @@
 #      supply your own with -IsoPath.
 #   3. Mounts the ISO and launches Windows Setup in in-place-upgrade mode, keeping apps and data by
 #      default (/auto upgrade), with the Setup GUI hidden (/quiet) and Dynamic Update disabled by default.
+#      Existing third-party drivers are carried over unless -NoMigrateDrivers is used.
 #   4. Dismounts the ISO when done.
 #
 # The ISO download is large (~8 GB) and the upgrade needs roughly 20 GB of free space to stage, so the
@@ -62,6 +63,9 @@ param(
 
     [Parameter(HelpMessage = 'Enable Dynamic Update so Setup pulls the latest fixes online before upgrading (disabled by default)')]
     [switch]$DynamicUpdate,
+
+    [Parameter(HelpMessage = 'Do not carry the existing third-party drivers over to the upgraded OS (/migratedrivers none). Setup installs its own in-box drivers instead, which clears a corrupt or incompatible driver that is breaking the upgrade')]
+    [switch]$NoMigrateDrivers,
 
     [Parameter(HelpMessage = 'Show the Windows Setup GUI. By default Setup runs with its GUI hidden (/quiet)')]
     [switch]$ShowUI,
@@ -339,10 +343,14 @@ function Get-WindowsIsoUrl {
 # keeps apps and data by default (/auto upgrade). The Setup GUI is hidden (/quiet) and Dynamic Update is
 # disabled by default; pass -ShowUI or -DynamicUpdate to change either.
 function Get-SetupArguments {
-    $SetupArgs = @('/auto', 'upgrade', '/eula', 'accept', '/compat', 'ignorewarning', '/migratedrivers', 'all', '/showoobe', 'none')
+    $DriverMode = 'all'
+    if ($NoMigrateDrivers) { $DriverMode = 'none' }
+
+    $SetupArgs = @('/auto', 'upgrade', '/eula', 'accept', '/compat', 'ignorewarning', '/migratedrivers', $DriverMode, '/showoobe', 'none')
 
     switch ($KeepMode) {
         'KeepAll'     { }  # /auto upgrade already keeps apps + data
+        # A clean install has no drivers to migrate, so /migratedrivers is omitted entirely.
         'KeepNothing' { $SetupArgs = @('/auto', 'clean', '/eula', 'accept', '/compat', 'ignorewarning', '/showoobe', 'none') }
     }
 
@@ -849,6 +857,7 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $DownloadOnly) {
         'KeepNothing' { Write-Host "      -> CLEAN install: apps, settings, and files are NOT kept" -ForegroundColor Red }
     }
     if ($DynamicUpdate) { Write-Host "  - Let Setup pull the latest fixes online first (Dynamic Update)" }
+    if ($NoMigrateDrivers -and $KeepMode -eq 'KeepAll') { Write-Host "  - NOT carry your existing third-party drivers over (-NoMigrateDrivers); Setup installs its own in-box drivers" -ForegroundColor Yellow }
     if ($BypassCompatChecks) { Write-Host "  - Bypass the Windows 11 hardware compatibility checks (/product server) - for incompatible PCs" -ForegroundColor Yellow }
     Write-Host ""
     Write-Host "The upgrade takes 20-90 minutes and WILL RESTART the computer several times." -ForegroundColor Yellow
