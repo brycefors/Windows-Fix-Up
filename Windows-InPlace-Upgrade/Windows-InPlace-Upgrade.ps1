@@ -698,6 +698,13 @@ function Watch-SetupProgress {
     $Progressed = ($SawSetup -or $LastProgress -ge 0)
     if (-not $RebootPending) { $RebootPending = (Test-PendingReboot) }
 
+    # Setup only reports 100% once the down-level phase is complete, and the pending-reboot flag is not always
+    # written before setup.exe exits - so treat 100% itself as the signal that a restart has to be scheduled.
+    if (-not $RebootPending -and $LastProgress -ge 100) {
+        Write-HostTimestamp '  Setup reported 100% without a pending-reboot flag - assuming a restart is required to continue the upgrade.' -ForegroundColor Yellow
+        $RebootPending = $true
+    }
+
     if ($SawSetup) {
         Write-HostTimestamp "  Setup has finished running$(if ($LastProgress -ge 0) { " (last reported progress: $LastProgress%)" })." -ForegroundColor Green
     }
@@ -1135,11 +1142,12 @@ else {
     # (blocking compat issue, driver/app hold, media/space problem, etc.), not that it succeeded silently.
     # Treat it as a probable failure and point at the diagnostics.
 
-    # BUT: if Setup reached ~100% the machine may simply be in the middle of triggering its restart, and the
-    # pending-reboot flag can lag a little behind setup.exe exiting. Give it a minute or two to either show
-    # the pending reboot (success) or actually start restarting before we call it a failure.
-    if ($SetupOutcome -and $SetupOutcome.LastProgress -ge 100) {
-        Write-HostTimestamp 'Windows Setup reached 100% - it may be preparing to restart. Waiting up to 2 minutes to confirm...' -ForegroundColor Cyan
+    # BUT: if Setup got close to the end the machine may simply be in the middle of triggering its restart, and
+    # the pending-reboot flag can lag a little behind setup.exe exiting. Give it a minute or two to either show
+    # the pending reboot (success) or actually start restarting before we call it a failure. (A run that reached
+    # a full 100% has already been treated as reboot-pending by Watch-SetupProgress.)
+    if ($SetupOutcome -and $SetupOutcome.LastProgress -ge 90) {
+        Write-HostTimestamp "Windows Setup reached $($SetupOutcome.LastProgress)% - it may be preparing to restart. Waiting up to 2 minutes to confirm..." -ForegroundColor Cyan
         $ConfirmDeadline = (Get-Date).AddMinutes(2)
         while ((Get-Date) -lt $ConfirmDeadline) {
             if (Test-PendingReboot) { $SetupOutcome.RebootPending = $true; break }
