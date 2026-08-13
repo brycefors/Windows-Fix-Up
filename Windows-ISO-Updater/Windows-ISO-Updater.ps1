@@ -21,8 +21,10 @@
 #   4. Integrates the update(s) offline with DISM into install.wim (by default only the highest edition
 #      present - e.g. Pro over Home - is kept and serviced; use -KeepAllEditions or -KeepEditions to
 #      change this), boot.wim (Windows Setup / WinPE), and optionally winre.wim (recovery).
-#   5. Cleans up the component store (/StartComponentCleanup /ResetBase) and re-exports install.wim to
-#      shrink it.
+#   5. Refreshes the loose Setup files on the media (sources\setup.exe, sources\setuphost.exe and the
+#      boot managers) from the serviced boot.wim - Windows Setup fails if those binaries don't match the
+#      version inside boot.wim - then cleans up the component store (/StartComponentCleanup /ResetBase)
+#      and re-exports install.wim to shrink it.
 #   6. Recompiles a new bootable ISO with oscdimg (from the Windows ADK), preserving both the BIOS and
 #      UEFI boot sectors so the new ISO boots on legacy and modern PCs alike.
 #
@@ -1401,6 +1403,10 @@ if ($UpdateGroups.Count -gt 0) {
     # 2) Service boot.wim (Windows Setup / WinPE). Index 2 is the Setup environment; index 1 is WinPE.
     if (Test-Path -LiteralPath $BootWim) {
         Set-ItemProperty -LiteralPath $BootWim -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+        # Staging folder for the serviced Setup/boot-manager binaries pulled out of boot.wim index 2.
+        $SetupStage = Join-Path -Path $WorkRoot -ChildPath 'SetupFiles'
+        if (Test-Path -LiteralPath $SetupStage) { Remove-Item -LiteralPath $SetupStage -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Path $SetupStage -Force -ErrorAction SilentlyContinue | Out-Null
         $BootImages = Get-WindowsImage -ImagePath $BootWim -ErrorAction SilentlyContinue
         foreach ($BootImg in $BootImages) {
             Invoke-Task -Description "Servicing boot.wim index $($BootImg.ImageIndex) ($($BootImg.ImageName))..." -ScriptBlock {
@@ -1409,6 +1415,31 @@ if ($UpdateGroups.Count -gt 0) {
                     Mount-WindowsImage -ImagePath $BootWim -Index $BootImg.ImageIndex -Path $MountDir -ErrorAction Stop | Out-Null
                     foreach ($Group in $UpdateGroups) { Add-UpdateGroup -MountDir $MountDir -Group $Group | Out-Null }
                     & dism.exe /Image:"$MountDir" /Cleanup-Image /StartComponentCleanup | Out-Null
+
+                    # Index 2 is the Windows Setup image. The cumulative update raises the version of the
+                    # Setup and boot-manager binaries INSIDE this image, so the copies sitting loose on the
+                    # media must be replaced with them. If they don't match, Windows Setup fails when it is
+                    # launched from the media (e.g. "A media driver your computer needs is missing").
+                    if ([int]$BootImg.ImageIndex -eq 2) {
+                        Write-HostTimestamp '    Saving the serviced Setup and boot manager files for the media...'
+                        $Grab = @(
+                            @{ From = 'sources\setup.exe';                To = 'setup.exe';     Required = $true }
+                            @{ From = 'sources\setuphost.exe';            To = 'setuphost.exe'; Required = $false } # Windows 11 24H2+
+                            @{ From = 'Windows\boot\efi\bootmgfw.efi';    To = 'bootmgfw.efi';  Required = $false }
+                            @{ From = 'Windows\boot\efi\bootmgr.efi';     To = 'bootmgr.efi';   Required = $false }
+                            @{ From = 'Windows\boot\efi\boot.stl';        To = 'boot.stl';      Required = $false }
+                        )
+                        foreach ($Item in $Grab) {
+                            $Src = Join-Path $MountDir $Item.From
+                            if (Test-Path -LiteralPath $Src) {
+                                Copy-Item -LiteralPath $Src -Destination (Join-Path $SetupStage $Item.To) -Force -ErrorAction SilentlyContinue
+                            }
+                            elseif ($Item.Required) {
+                                Write-HostTimestamp "      $($Item.From) was not found in boot.wim index 2." -ForegroundColor Yellow
+                            }
+                        }
+                    }
+
                     Dismount-WindowsImage -Path $MountDir -Save -ErrorAction Stop | Out-Null
                     Write-HostTimestamp "    boot.wim index $($BootImg.ImageIndex) done." -ForegroundColor Green
                 }
@@ -1418,6 +1449,50 @@ if ($UpdateGroups.Count -gt 0) {
                 }
             }
         }
+
+        # Push the serviced binaries onto the media so their versions match the serviced boot.wim.
+        Invoke-Task -Description 'Updating the media Setup and boot manager files to match the serviced boot.wim...' -ScriptBlock {
+            $StagedSetup = Join-Path $SetupStage 'setup.exe'
+            if (-not (Test-Path -LiteralPath $StagedSetup)) {
+                Write-HostTimestamp '  No serviced Setup files were captured; the media files are left as they are.' -ForegroundColor Yellow
+                return
+            }
+            $MediaSources = Join-Path $ExtractDir 'sources'
+            foreach ($Name in @('setup.exe', 'setuphost.exe')) {
+                $Staged = Join-Path $SetupStage $Name
+                if (Test-Path -LiteralPath $Staged) {
+                    $Dest = Join-Path $MediaSources $Name
+                    if (Test-Path -LiteralPath $Dest) { Set-ItemProperty -LiteralPath $Dest -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue }
+                    Copy-Item -LiteralPath $Staged -Destination $Dest -Force -ErrorAction SilentlyContinue
+                    Write-HostTimestamp "  Replaced sources\$Name." -ForegroundColor Green
+                }
+            }
+
+            # The media's boot managers live under several names (bootmgfw.efi, bootx64.efi, ...); each is
+            # the same binary, so every copy is refreshed from the serviced one.
+            $StagedMgfw = Join-Path $SetupStage 'bootmgfw.efi'
+            $StagedMgr  = Join-Path $SetupStage 'bootmgr.efi'
+            foreach ($File in (Get-ChildItem -LiteralPath $ExtractDir -Force -Recurse -Filter 'b*.efi' -ErrorAction SilentlyContinue)) {
+                $Source = switch -Regex ($File.Name) {
+                    '^(bootmgfw|bootx64|bootia32|bootaa64)\.efi$' { $StagedMgfw }
+                    '^bootmgr\.efi$' { $StagedMgr }
+                    default { $null }
+                }
+                if ($Source -and (Test-Path -LiteralPath $Source)) {
+                    Set-ItemProperty -LiteralPath $File.FullName -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+                    Copy-Item -LiteralPath $Source -Destination $File.FullName -Force -ErrorAction SilentlyContinue
+                    Write-HostTimestamp "  Replaced $($File.FullName.Substring($ExtractDir.Length).TrimStart('\'))." -ForegroundColor Green
+                }
+            }
+
+            $StagedStl = Join-Path $SetupStage 'boot.stl'
+            if (Test-Path -LiteralPath $StagedStl) {
+                $StlDest = Join-Path $ExtractDir 'efi\microsoft\boot\boot.stl'
+                if (Test-Path -LiteralPath $StlDest) { Set-ItemProperty -LiteralPath $StlDest -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue }
+                Copy-Item -LiteralPath $StagedStl -Destination $StlDest -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Remove-Item -LiteralPath $SetupStage -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     # 3) Re-export install.wim below (outside this block) to reclaim the space freed by the cleanup.

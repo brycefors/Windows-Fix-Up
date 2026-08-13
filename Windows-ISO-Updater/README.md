@@ -117,9 +117,10 @@ The script supports the following optional parameters:
 3.  **Extract the ISO** — Mounts the ISO and mirrors its contents into the working folder with `robocopy`, then dismounts. If the media ships `install.esd`, it is converted to an editable `install.wim`.
 4.  **Find the updates** — Detects the feature update (e.g. `24H2`) and architecture from the image, then downloads the latest combined Servicing Stack + Cumulative Update (and, by default, the .NET cumulative update — disable with `-SkipDotNet`) from the Microsoft Update Catalog. `-UpdatePath` uses your own packages instead.
 5.  **Integrate the updates** — Uses offline DISM to apply the package(s) to `install.wim` (by default only the highest edition present — override with `-KeepAllEditions` or `-KeepEditions`/`-Edition`), to `boot.wim` (Windows Setup / WinPE), and optionally to `winre.wim`.
-6.  **Clean up and shrink** — Runs `DISM /Cleanup-Image /StartComponentCleanup /ResetBase` and re-exports `install.wim` to reclaim space.
-7.  **Recompile the ISO** — Uses `oscdimg` to build a new bootable ISO, preserving both the **BIOS (`etfsboot.com`)** and **UEFI (`efisys.bin`)** boot sectors so the media boots on legacy and modern PCs alike.
-8.  **Clean up** — Removes the extracted working files, leaving the finished ISO.
+6.  **Refresh the media Setup files** — Copies the serviced `setup.exe`, `setuphost.exe` (Windows 11 24H2+) and boot manager files out of `boot.wim` index 2 onto the media. Windows Setup **fails during installation** if these loose binaries do not match the version inside `boot.wim`.
+7.  **Clean up and shrink** — Runs `DISM /Cleanup-Image /StartComponentCleanup /ResetBase` and re-exports `install.wim` to reclaim space.
+8.  **Recompile the ISO** — Uses `oscdimg` to build a new bootable ISO, preserving both the **BIOS (`etfsboot.com`)** and **UEFI (`efisys.bin`)** boot sectors so the media boots on legacy and modern PCs alike.
+9.  **Clean up** — Removes the extracted working files, leaving the finished ISO.
 
 ## How Files Are Downloaded
 
