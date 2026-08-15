@@ -105,8 +105,8 @@ param(
     [Parameter(HelpMessage = 'Override the URL used to download the Windows ADK setup bootstrapper (Deployment Tools)')]
     [string]$AdkSetupUrl = 'https://go.microsoft.com/fwlink/?linkid=2289980',
 
-    [Parameter(HelpMessage = 'Directory to write log files to (defaults to C:\temp\Windows-ISO-Updater)')]
-    [string]$LogPath = 'C:\temp\Windows-ISO-Updater',
+    [Parameter(HelpMessage = 'Directory to write log files to. Defaults to a "Logs" folder inside the working folder, so everything the script writes stays in one place')]
+    [string]$LogPath,
 
     [switch]$SkipInteractive # Skips the interactive confirmation prompt
 )
@@ -153,20 +153,33 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 # Add a Window Title
 $Host.UI.RawUI.WindowTitle = "Windows ISO Updater - Running as Administrator - $env:COMPUTERNAME"
 
+# --- Resolve working folders ---
+# Everything this script writes lives under the working folder, so a single -WorkPath moves the whole
+# build (downloads, extracted media, DISM mount, logs) to another drive. These MUST be on a local, fixed
+# disk: cloud-synced folders (Google Drive, OneDrive, Dropbox, etc.) turn files into on-demand
+# placeholders and sync them in the background, which makes DISM unable to read the .msu/.wim reliably
+# ("An error occurred applying the Unattend.xml file from the .msu package"). They also need lots of free
+# space and, ideally, no spaces in the path (oscdimg's -bootdata dislikes spaces; short paths are used to
+# work around it regardless).
+$WorkRoot   = if ($WorkPath) { $WorkPath } else { Join-Path -Path $env:SystemDrive -ChildPath 'WISO-Work' }
+$ExtractDir = Join-Path -Path $WorkRoot -ChildPath 'ISO'
+$MountDir   = Join-Path -Path $WorkRoot -ChildPath 'Mount'
+# Downloads and logs default under the work root - NOT the script folder, which may sit on a cloud-synced
+# drive (this repo, for example, lives under a Google Drive "My Drive" path).
+$DlDir      = if ($DownloadPath) { $DownloadPath } else { Join-Path -Path $WorkRoot -ChildPath 'Downloads' }
+$LogDirWanted = if ($LogPath) { $LogPath } else { Join-Path -Path $WorkRoot -ChildPath 'Logs' }
+
 # --- Start Logging ---
-# Resolve the log directory: use -LogPath (defaults to C:\temp\Windows-ISO-Updater), creating it if
-# needed; fall back to the script folder if that path cannot be used.
+# Create the log folder, falling back to the script folder if it cannot be used.
 $LogDir = $PSScriptRoot
-if ($LogPath) {
-    try {
-        if (-not (Test-Path $LogPath)) {
-            New-Item -ItemType Directory -Path $LogPath -Force -ErrorAction Stop | Out-Null
-        }
-        $LogDir = $LogPath
+try {
+    if (-not (Test-Path $LogDirWanted)) {
+        New-Item -ItemType Directory -Path $LogDirWanted -Force -ErrorAction Stop | Out-Null
     }
-    catch {
-        Write-Warning "Could not use -LogPath '$LogPath': $($_.Exception.Message). Falling back to script folder."
-    }
+    $LogDir = $LogDirWanted
+}
+catch {
+    Write-Warning "Could not use the log folder '$LogDirWanted': $($_.Exception.Message). Falling back to the script folder."
 }
 $LogFile = Join-Path -Path $LogDir -ChildPath "Windows-ISO-Updater_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss').log"
 Start-Transcript -Path $LogFile | Out-Null
@@ -839,22 +852,9 @@ Write-Host $LineBreak
 
 $WinInfo = Get-InstalledWindowsInfo
 
-# --- Resolve working folders ---
-# The working and download folders MUST live on a local, fixed disk. Cloud-synced folders (Google Drive,
-# OneDrive, Dropbox, etc.) turn files into on-demand placeholders and sync them in the background, which
-# makes DISM unable to read the .msu/.wim reliably ("An error occurred applying the Unattend.xml file from
-# the .msu package"). They should also have lots of free space and, ideally, no spaces in the path
-# (oscdimg's -bootdata dislikes spaces; short paths are used to work around it regardless).
-$WorkRoot = if ($WorkPath) { $WorkPath } else { Join-Path -Path $env:SystemDrive -ChildPath 'WISO-Work' }
-$ExtractDir = Join-Path -Path $WorkRoot -ChildPath 'ISO'
-$MountDir   = Join-Path -Path $WorkRoot -ChildPath 'Mount'
-# Default downloads to a LOCAL folder under the work root - NOT the script folder, which may sit on a
-# cloud-synced drive (this repo, for example, lives under a Google Drive "My Drive" path).
-$DlDir = if ($DownloadPath) { $DownloadPath } else { Join-Path -Path $WorkRoot -ChildPath 'Downloads' }
-
-# Warn if a working/download path looks like a cloud-synced folder - servicing from there is unreliable.
+# Warn if a working/download/log path looks like a cloud-synced folder - servicing from there is unreliable.
 $CloudPattern = '(?i)[\\/](My Drive|Google Drive|GoogleDrive|OneDrive|OneDrive - |Dropbox|iCloudDrive|Box)[\\/]'
-foreach ($Pair in @(@{ Name = 'Working folder'; Path = $WorkRoot }, @{ Name = 'Download folder'; Path = $DlDir })) {
+foreach ($Pair in @(@{ Name = 'Working folder'; Path = $WorkRoot }, @{ Name = 'Download folder'; Path = $DlDir }, @{ Name = 'Log folder'; Path = $LogDir })) {
     if ($Pair.Path -match $CloudPattern -or $Pair.Path -match '(?i)OneDrive') {
         Write-HostTimestamp "WARNING: The $($Pair.Name.ToLower()) is on a cloud-synced path ($($Pair.Path))." -ForegroundColor Yellow
         Write-HostTimestamp "         DISM cannot reliably service files that a cloud client streams/dehydrates. Use -WorkPath and -DownloadPath to point at a LOCAL disk (e.g. C:\WISO-Work)." -ForegroundColor Yellow
@@ -874,8 +874,17 @@ foreach ($Dir in @($WorkRoot, $DlDir)) {
 
 Write-HostTimestamp "Architecture   : $($WinInfo.Architecture)"
 Write-HostTimestamp "Target         : Windows $WindowsVersion ($Release, $Language)"
-Write-HostTimestamp "Working folder : $WorkRoot"
-Write-HostTimestamp "Download folder: $DlDir"
+Write-Host $LineBreak
+Write-Host 'Everything this run writes goes under the working folder:' -ForegroundColor Cyan
+Write-Host "  Working folder   : $WorkRoot"
+Write-Host "    Extracted media: $ExtractDir"
+Write-Host "    DISM mount     : $MountDir"
+Write-Host "  Downloads        : $DlDir"
+Write-Host "  Logs             : $LogDir"
+Write-Host "  Finished ISO     : $(if ($OutputIsoPath) { $OutputIsoPath } else { Join-Path $DlDir '<source ISO name>-Updated_<date>.iso' })"
+Write-Host ''
+Write-Host '  Nothing outside these folders is changed. -WorkPath moves all of it; -DownloadPath, -LogPath' -ForegroundColor DarkGray
+Write-Host '  and -OutputIsoPath override the individual folders.' -ForegroundColor DarkGray
 Write-Host $LineBreak
 
 # --- Disk space check ---

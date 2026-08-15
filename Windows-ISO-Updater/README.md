@@ -16,6 +16,7 @@ This PowerShell script automates the whole process. A clean install or in-place 
 - [What the Script Does](#what-the-script-does)
 - [How Files Are Downloaded](#how-files-are-downloaded)
 - [Disk Space Requirements](#disk-space-requirements)
+- [Where Files Are Written](#where-files-are-written)
 - [Logging](#logging)
 
 ## Important Notes
@@ -108,7 +109,7 @@ The script supports the following optional parameters:
 | `-InstallAdk` | If `oscdimg.exe` is not found, download and silently install the ADK Deployment Tools from Microsoft. |
 | `-FidoUrl` | Override the URL used to fetch the Fido download helper. |
 | `-AdkSetupUrl` | Override the URL used to download the Windows ADK setup bootstrapper. |
-| `-LogPath` | Directory to write log files to. Defaults to `C:\temp\Windows-ISO-Updater`. |
+| `-LogPath` | Directory to write log files to. Defaults to a `Logs` folder inside the working folder. |
 | `-SkipInteractive` | Skips the interactive confirmation prompt (still shows output). |
 
 ## What the Script Does
@@ -133,6 +134,20 @@ The script supports the following optional parameters:
 
 Because the download, the extracted media, the mounted image, and the re-exported image all coexist, the working drive should have at least **40 GB free**. The script checks this up front and stops if the working drive is too small — choose a larger drive with `-WorkPath` if needed.
 
+## Where Files Are Written
+
+Everything the script writes lives under a single working folder, which defaults to `<SystemDrive>\WISO-Work`. The script prints this layout before it asks for confirmation, so you can see exactly what it will touch:
+
+```text
+C:\WISO-Work\              <- -WorkPath (moves everything below it)
+  ISO\                     <- extracted media, deleted when the build finishes
+  Mount\                   <- DISM mount point
+  Downloads\               <- -DownloadPath (source ISO, updates, and the finished ISO)
+  Logs\                    <- -LogPath
+```
+
+`-DownloadPath`, `-LogPath` and `-OutputIsoPath` override the individual folders if you want them elsewhere. Nothing outside these folders is changed — all servicing happens against files in the working folder, never against the running system.
+
 ## Logging
 
-Each run writes a timestamped transcript to `C:\temp\Windows-ISO-Updater` (or `-LogPath`) named `Windows-ISO-Updater_<date>_<time>.log`. The 30 most recent logs are kept and older ones are pruned automatically.
+Each run writes a timestamped transcript to `<WorkPath>\Logs` (or `-LogPath`) named `Windows-ISO-Updater_<date>_<time>.log`. The 30 most recent logs are kept and older ones are pruned automatically.
