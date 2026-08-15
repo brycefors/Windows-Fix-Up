@@ -205,8 +205,19 @@ $LineBreak = $null
     $LineBreak += $LineBreakCharacter
 }
 
+# Wall-clock start of the run plus the per-step durations collected by Invoke-Task, reported at the end.
+$script:ScriptStartTime = Get-Date
+$script:StepTimings = [System.Collections.Generic.List[psobject]]::new()
+
 function Get-TimeStamp {
     return (Get-Date -Format '[MM/dd/yyyy|HH:mm:ss]')
+}
+
+function Format-Duration {
+    param([TimeSpan]$Duration)
+    if ($Duration.TotalHours -ge 1) { return ('{0}h {1:00}m {2:00}s' -f [int]$Duration.TotalHours, $Duration.Minutes, $Duration.Seconds) }
+    if ($Duration.TotalMinutes -ge 1) { return ('{0}m {1:00}s' -f $Duration.Minutes, $Duration.Seconds) }
+    return ('{0:N1}s' -f $Duration.TotalSeconds)
 }
 
 function Write-HostTimestamp {
@@ -227,7 +238,16 @@ function Invoke-Task {
     )
 
     Write-HostTimestamp $Description
-    & $ScriptBlock
+    $StepStart = Get-Date
+    try {
+        & $ScriptBlock
+    }
+    finally {
+        # Recorded in a finally block so a step that throws still contributes to the timing summary.
+        $Elapsed = (Get-Date) - $StepStart
+        $script:StepTimings.Add([pscustomobject]@{ Description = $Description; Duration = $Elapsed })
+        Write-HostTimestamp "  Step finished in $(Format-Duration $Elapsed)." -ForegroundColor DarkGray
+    }
     Write-Host $LineBreak
 }
 
@@ -1816,6 +1836,23 @@ Invoke-Task -Description 'Cleaning up the working extraction folder...' -ScriptB
         Write-HostTimestamp "  Could not fully remove $ExtractDir : $($_.Exception.Message). You can delete it manually." -ForegroundColor Yellow
     }
 }
+Write-Host $LineBreak
+
+# --- Timing summary ---
+$TotalElapsed = (Get-Date) - $script:ScriptStartTime
+if ($script:StepTimings.Count -gt 0) {
+    Write-HostTimestamp 'Time spent on each step:' -ForegroundColor Cyan
+    $NameWidth = ($script:StepTimings | ForEach-Object { $_.Description.Length } | Measure-Object -Maximum).Maximum
+    if ($NameWidth -gt 70) { $NameWidth = 70 }
+    foreach ($Step in $script:StepTimings) {
+        $Label = if ($Step.Description.Length -gt $NameWidth) { $Step.Description.Substring(0, $NameWidth - 3) + '...' } else { $Step.Description }
+        Write-Host ("  {0,-$NameWidth}  {1,10}" -f $Label, (Format-Duration $Step.Duration))
+    }
+    $Slowest = $script:StepTimings | Sort-Object -Property Duration -Descending | Select-Object -First 1
+    Write-Host ''
+    Write-HostTimestamp "Longest step: $($Slowest.Description) ($(Format-Duration $Slowest.Duration))" -ForegroundColor DarkGray
+}
+Write-HostTimestamp "Total run time: $(Format-Duration $TotalElapsed) (started $($script:ScriptStartTime.ToString('HH:mm:ss')), finished $((Get-Date).ToString('HH:mm:ss')))" -ForegroundColor Cyan
 Write-Host $LineBreak
 
 Write-HostTimestamp 'Done. Your updated Windows installation ISO is ready:' -ForegroundColor Green
