@@ -31,7 +31,10 @@ This PowerShell script automates the whole process. A clean install or in-place 
 > This is a **disk- and time-intensive** operation. The downloaded ISO, the extracted media, the mounted image, and the re-exported image all coexist during the build, and offline DISM servicing plus component-store cleanup can take a long time. Nothing on the machine running the script is changed — all servicing happens against files in the working folder.
 
 > [!TIP]
-> **It is recommended to download the ISO yourself and pass it with `-IsoPath`.** The automatic download relies on the community Fido helper, which queries Microsoft's software-download servers on your behalf. Microsoft rate-limits and can temporarily block IP addresses that make repeated ISO requests — this shows up as *"Error: Sentinel marked this request as rejected"* or a *715-123130* error, which the script now prints verbatim (add `-Verbose` for Fido's full request log). Downloading the ISO once from [microsoft.com/software-download](https://www.microsoft.com/software-download) (or with the Media Creation Tool) and reusing it with `-IsoPath` avoids this entirely.
+> **It is recommended to download the ISO yourself and pass it with `-IsoPath`.** The automatic download relies on the community Fido helper, which queries Microsoft's software-download servers on your behalf. Microsoft rate-limits and can temporarily block IP addresses that make repeated ISO requests — this shows up as *"Error: Sentinel marked this request as rejected"* or a *715-123130* error, which the script now prints verbatim (add `-Verbose` for Fido's full request log). The script automatically retries a few times with a growing delay (`-FidoRetryCount`, default 2 extra attempts), because the block is often transient. Downloading the ISO once from [microsoft.com/software-download](https://www.microsoft.com/software-download) (or with the Media Creation Tool) and reusing it with `-IsoPath` avoids this entirely.
+
+> [!TIP]
+> **If the link request stays blocked, the script can fall back to Microsoft's Media Creation Tool (`-UseMct`).** MCT talks to different Microsoft servers, so it usually still works when Fido is blocked. It is downloaded from Microsoft's official `go.microsoft.com` link and its **Authenticode signature is verified as validly signed by Microsoft** before it runs. Microsoft provides **no headless switch** for choosing ISO output or a save path, so this is *semi*-automated: the script launches MCT with the version, architecture, language and edition already selected (`-MctEdition`, `-MctLangCode`), then you click "Create installation media" → "ISO file" and save it into the download folder. The script waits for MCT to close, picks up the new ISO automatically, and carries on. In an interactive run it offers this for you when Fido fails; pass `-UseMct` to skip Fido altogether.
 
 > [!TIP]
 > **You don't have to pass `-IsoPath` at all — you can just drop your ISO in the download folder.** If `-IsoPath` is not given, the script looks in the download folder (`<SystemDrive>\WISO-Work\Downloads` by default, or wherever `-DownloadPath` points) and reuses the **largest `.iso` file over 3 GB** it finds there instead of downloading one. This is the easiest route when double-clicking the batch file: create the folder, drop the ISO in, and run. It is also why a previously downloaded ISO is never re-downloaded.
@@ -124,6 +127,11 @@ The script supports the following optional parameters:
 | `-InstallAdk` | If `oscdimg.exe` is not found and cannot be downloaded, download and silently install the ADK Deployment Tools from Microsoft. |
 | `-FidoUrl` | Override the URL used to fetch the Fido download helper. Must still point at the official `github.com/pbatard/Fido` repository. |
 | `-FidoSha256` | Pin the expected SHA-256 of `Fido.ps1` so only that reviewed version is ever run. |
+| `-FidoRetryCount` | Extra attempts to make when Fido cannot resolve a download link (Microsoft's anti-bot check is often transient). Defaults to `2`; `0` disables retrying. |
+| `-UseMct` | Skip Fido and get the ISO with Microsoft's Media Creation Tool instead. MCT has no headless mode, so you click through its last few pages and save the ISO into the download folder. |
+| `-MctUrl` | Override the URL used to download the Media Creation Tool. Must still be an official Microsoft URL. |
+| `-MctEdition` | Edition passed to MCT's `/MediaEdition` switch (e.g. `Professional`, `Enterprise`, `Education`). Defaults to `Professional`. |
+| `-MctLangCode` | Locale code passed to MCT's `/MediaLangCode` switch (e.g. `en-US`). Derived from `-Language` when not set. |
 | `-AdkSetupUrl` | Override the URL used to download the Windows ADK setup bootstrapper. |
 | `-OscdimgUrl` | Override the Microsoft symbol server URL used to download the standalone `oscdimg.exe`. |
 | `-OscdimgSha256` | Expected SHA-256 of the downloaded `oscdimg.exe`. Pass an empty string to skip the hash check when overriding `-OscdimgUrl`. |
@@ -168,7 +176,7 @@ The file was produced with [schneegans.de/windows/unattend-generator](https://sc
 ## What the Script Does
 
 1.  **Locate `oscdimg.exe`** — Downloads a standalone copy from Microsoft's symbol server if it is not already installed (or installs the ADK with `-InstallAdk`), and otherwise fails fast so the build cannot get most of the way through and then be unable to recompile the ISO.
-2.  **Obtain the ISO** — Uses `-IsoPath` if given, otherwise reuses the largest `.iso` over 3 GB already sitting in the download folder, and only if neither is available downloads the matching official Microsoft ISO via the community [Fido](https://github.com/pbatard/Fido) helper (verified and sandboxed in its own process — see [Important Notes](#important-notes)).
+2.  **Obtain the ISO** — Uses `-IsoPath` if given, otherwise reuses the largest `.iso` over 3 GB already sitting in the download folder, and only if neither is available downloads the matching official Microsoft ISO via the community [Fido](https://github.com/pbatard/Fido) helper (verified and sandboxed in its own process — see [Important Notes](#important-notes)). Blocked link requests are retried with a growing delay, and Microsoft's signature-verified Media Creation Tool can be used as a guided fallback (`-UseMct`).
 3.  **Extract the ISO** — Mounts the ISO and mirrors its contents into the working folder with `robocopy`, then dismounts. If the media ships `install.esd`, it is converted to an editable `install.wim`.
 4.  **Find the updates** — Detects the feature update (e.g. `24H2`) and architecture from the image, then downloads the latest combined Servicing Stack + Cumulative Update (and, by default, the .NET cumulative update — disable with `-SkipDotNet`, and the Setup Dynamic Update — disable with `-SkipSetupDU`) from the Microsoft Update Catalog. `-UpdatePath` uses your own packages instead.
 5.  **Integrate the updates** — Uses offline DISM to apply the package(s) to `install.wim` (by default only the highest edition present — override with `-KeepAllEditions` or `-KeepEditions`/`-Edition`), to `boot.wim` (Windows Setup / WinPE), and optionally to `winre.wim`.
@@ -180,7 +188,7 @@ The file was produced with [schneegans.de/windows/unattend-generator](https://sc
 
 ## How Files Are Downloaded
 
-- The **ISO** link is resolved by the third-party **Fido** helper, which queries Microsoft's own software-download servers. If you prefer not to run external code, supply your own ISO with `-IsoPath`.
+- The **ISO** link is resolved by the third-party **Fido** helper, which queries Microsoft's own software-download servers. If you prefer not to run external code, supply your own ISO with `-IsoPath`, or use `-UseMct` to get the ISO from Microsoft's own signature-verified Media Creation Tool instead.
 - The **updates** are located by parsing the Microsoft Update Catalog search results and its download dialog (the same technique community tools use), then downloaded directly from Microsoft's update servers.
 - Downloads prefer **BITS** (resumable) and fall back to `Invoke-WebRequest`. Every resolved URL is verified to point at an official Microsoft host (`microsoft.com`, `windowsupdate.com`) over HTTPS before it is downloaded.
 

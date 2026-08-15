@@ -10,6 +10,9 @@
 # It performs the following actions:
 #   1. Obtains the matching official Microsoft ISO (via the community "Fido" helper, which queries
 #      Microsoft's own software-download servers) and downloads it - unless you supply one with -IsoPath.
+#      Blocked link requests are retried with a backoff (-FidoRetryCount), and if they still fail the
+#      script can open Microsoft's Media Creation Tool for you instead (-UseMct) - MCT talks to different
+#      servers, but it has no headless mode, so you click through its last few pages yourself.
 #      RECOMMENDED: download the ISO yourself and pass it with -IsoPath. Microsoft rate-limits and can
 #      temporarily block IPs that make repeated ISO requests, which breaks the automatic download; using
 #      your own ISO avoids this (the script also reuses any ISO already in the download folder).
@@ -116,6 +119,22 @@ param(
 
     [Parameter(HelpMessage = 'Expected SHA-256 of Fido.ps1. Set this to pin one reviewed version; by default the script only verifies its source and contents')]
     [string]$FidoSha256,
+
+    [Parameter(HelpMessage = 'How many extra attempts to make if Fido cannot resolve a download link (Microsoft''s anti-bot check often clears on a later attempt). Defaults to 2')]
+    [ValidateRange(0, 10)]
+    [int]$FidoRetryCount = 2,
+
+    [Parameter(HelpMessage = 'Skip Fido and get the ISO with Microsoft''s Media Creation Tool instead. MCT cannot run headless, so you click through its wizard and save the ISO into the download folder')]
+    [switch]$UseMct,
+
+    [Parameter(HelpMessage = 'Override the URL used to download the Media Creation Tool')]
+    [string]$MctUrl,
+
+    [Parameter(HelpMessage = 'Edition passed to the Media Creation Tool''s /MediaEdition switch (e.g. Professional, Enterprise, Education). Defaults to Professional')]
+    [string]$MctEdition = 'Professional',
+
+    [Parameter(HelpMessage = 'Language code passed to the Media Creation Tool''s /MediaLangCode switch (e.g. en-US). Derived from -Language when not set')]
+    [string]$MctLangCode,
 
     [Parameter(HelpMessage = 'Override the URL used to download the Windows ADK setup bootstrapper (Deployment Tools)')]
     [string]$AdkSetupUrl = 'https://go.microsoft.com/fwlink/?linkid=2289980',
@@ -483,44 +502,63 @@ function Get-WindowsIsoUrl {
     $Url = $null
     $Output = $null
     $FidoExit = $null
+    $Attempts = $FidoRetryCount + 1
     try {
-        # -GetUrl makes Fido print only the resolved download URL and exit, without downloading anything.
-        $FidoArgs = @{
-            Win    = $Version
-            Rel    = $Release
-            Lang   = $Language
-            Arch   = $Architecture
-            GetUrl = $true
-        }
-        if ($VerbosePreference -ne 'SilentlyContinue') { $FidoArgs['Verbose'] = $true }
+        for ($Attempt = 1; $Attempt -le $Attempts; $Attempt++) {
+            if ($Attempt -gt 1) {
+                # Microsoft's anti-bot check ("Sentinel") rejects bursts of requests but usually lets a
+                # later one through, and Fido starts a fresh session each time, so backing off is worth it.
+                $Wait = [Math]::Min(120, 20 * [Math]::Pow(3, $Attempt - 2))
+                Write-HostTimestamp "  Attempt $($Attempt - 1) of $Attempts failed. Waiting $Wait seconds before retrying..." -ForegroundColor Yellow
+                Start-Sleep -Seconds $Wait
+                Write-HostTimestamp "  Retrying (attempt $Attempt of $Attempts)..."
+            }
 
-        # Prefer running Fido in its own Windows PowerShell process: it keeps third-party code out of this
-        # session, and Fido targets Windows PowerShell.
-        $WinPs = Join-Path -Path $env:SystemRoot -ChildPath 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        if (Test-Path -LiteralPath $WinPs) {
-            $ChildArgs = @(
-                '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $FidoScript,
-                '-Win', $Version, '-Rel', $Release, '-Lang', $Language, '-Arch', $Architecture, '-GetUrl'
-            )
-            if ($VerbosePreference -ne 'SilentlyContinue') { $ChildArgs += '-Verbose' }
-            $Output = & $WinPs @ChildArgs 2>&1
-            $FidoExit = $LASTEXITCODE
+            $Output = $null
+            $FidoExit = $null
+            try {
+                # -GetUrl makes Fido print only the resolved download URL and exit, without downloading anything.
+                $FidoArgs = @{
+                    Win    = $Version
+                    Rel    = $Release
+                    Lang   = $Language
+                    Arch   = $Architecture
+                    GetUrl = $true
+                }
+                if ($VerbosePreference -ne 'SilentlyContinue') { $FidoArgs['Verbose'] = $true }
+
+                # Prefer running Fido in its own Windows PowerShell process: it keeps third-party code out of
+                # this session, and Fido targets Windows PowerShell.
+                $WinPs = Join-Path -Path $env:SystemRoot -ChildPath 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                if (Test-Path -LiteralPath $WinPs) {
+                    $ChildArgs = @(
+                        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $FidoScript,
+                        '-Win', $Version, '-Rel', $Release, '-Lang', $Language, '-Arch', $Architecture, '-GetUrl'
+                    )
+                    if ($VerbosePreference -ne 'SilentlyContinue') { $ChildArgs += '-Verbose' }
+                    $Output = & $WinPs @ChildArgs 2>&1
+                    $FidoExit = $LASTEXITCODE
+                }
+                else {
+                    $Output = & $FidoScript @FidoArgs 2>&1
+                }
+                $Url = ($Output | Where-Object { $_ -match '^https?://' } | Select-Object -Last 1)
+                if ($Url) { $Url = $Url.ToString().Trim(); break }
+            }
+            catch {
+                Write-HostTimestamp "  Fido could not resolve a download URL: $($_.Exception.Message)" -ForegroundColor Red
+            }
+
+            $Reason = @($Output | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '(?i)^error' }) | Select-Object -Last 1
+            if ($Reason) { Write-HostTimestamp "  Fido: $Reason" -ForegroundColor Yellow }
         }
-        else {
-            $Output = & $FidoScript @FidoArgs 2>&1
-        }
-        $Url = ($Output | Where-Object { $_ -match '^https?://' } | Select-Object -Last 1)
-        if ($Url) { $Url = $Url.ToString().Trim() }
-    }
-    catch {
-        Write-HostTimestamp "  Fido could not resolve a download URL: $($_.Exception.Message)" -ForegroundColor Red
     }
     finally {
         Remove-Item -LiteralPath $FidoScript -Force -ErrorAction SilentlyContinue
     }
 
     if (-not $Url) {
-        Write-HostTimestamp '  Fido did not return a download URL. Microsoft may have changed its download page, throttled this IP address, or the requested release/language is unavailable.' -ForegroundColor Red
+        Write-HostTimestamp "  Fido did not return a download URL after $Attempts attempt(s). Microsoft may have changed its download page, throttled this IP address, or the requested release/language is unavailable." -ForegroundColor Red
 
         # Fido explains the real reason on its own output (rate limiting, unknown release, HTTP errors), so
         # show it rather than leaving the user with only the generic message above.
@@ -535,6 +573,7 @@ function Get-WindowsIsoUrl {
 
         Write-HostTimestamp '  Re-run this script with -Verbose to get Fido''s full diagnostics.' -ForegroundColor Yellow
         Write-HostTimestamp '  "Sentinel marked this request as rejected" or a "715-123130" error means Microsoft''s anti-bot check refused the request - usually because this IP address has asked for ISO links too often. Wait a while, try a different network, or just download the ISO yourself.' -ForegroundColor Yellow
+        Write-HostTimestamp '  Microsoft''s Media Creation Tool uses different servers and usually still works - re-run with -UseMct to have this script open it for you.' -ForegroundColor Yellow
         Write-HostTimestamp '  Download an ISO yourself and re-run with -IsoPath "C:\path\to\Windows.iso".' -ForegroundColor Yellow
         return $null
     }
@@ -546,6 +585,129 @@ function Get-WindowsIsoUrl {
     }
     Write-HostTimestamp "  Verified the ISO download comes from an official Microsoft host: $(([Uri]$Url).Host)" -ForegroundColor Green
     return $Url
+}
+
+# Translates the Fido-style language name (-Language) into the locale code the Media Creation Tool wants
+# for /MediaLangCode. Falls back to en-US when the name cannot be matched.
+function Get-MctLanguageCode {
+    param([Parameter(Mandatory)][string]$Name)
+
+    if ($MctLangCode) { return $MctLangCode }
+
+    # Names where Microsoft's ISO list and .NET's culture names disagree, or where the generic lookup
+    # below would pick the wrong region.
+    switch -Regex ($Name) {
+        '(?i)^english international$'          { return 'en-GB' }
+        '(?i)^english$'                        { return 'en-US' }
+        '(?i)^chinese.*simplified'             { return 'zh-CN' }
+        '(?i)^chinese.*traditional'            { return 'zh-TW' }
+        '(?i)^(brazilian portuguese|portuguese \(brazil\))$' { return 'pt-BR' }
+        '(?i)^portuguese( \(portugal\))?$'     { return 'pt-PT' }
+        '(?i)^spanish \(mexico\)$'             { return 'es-MX' }
+        '(?i)^serbian latin$'                  { return 'sr-Latn-RS' }
+    }
+
+    # Otherwise resolve the language name to its neutral culture and take that culture's default region
+    # (e.g. French -> fr -> fr-FR), which matches how Microsoft names its media.
+    $Neutral = [System.Globalization.CultureInfo]::GetCultures('NeutralCultures') |
+        Where-Object { $_.EnglishName -eq $Name } | Select-Object -First 1
+    if ($Neutral) {
+        try { return [System.Globalization.CultureInfo]::CreateSpecificCulture($Neutral.Name).Name } catch { }
+    }
+
+    Write-HostTimestamp "  Could not map the language '$Name' to a Media Creation Tool locale code; using en-US. Override it with -MctLangCode." -ForegroundColor Yellow
+    return 'en-US'
+}
+
+# Fallback for when Fido cannot get a link (usually because Microsoft's anti-bot check blocked this IP):
+# downloads Microsoft's own Media Creation Tool and launches it with the version, architecture, language
+# and edition already selected. MCT has no switch to choose ISO output or a target path, so it cannot be
+# driven headlessly - the user clicks through the last few pages and saves the ISO into the download
+# folder, which this function then picks up. Returns the ISO path, or $null.
+function Get-IsoViaMct {
+    param(
+        [Parameter(Mandatory)][string]$Version,        # 10 or 11
+        [Parameter(Mandatory)][string]$Language,
+        [Parameter(Mandatory)][string]$Architecture,
+        [Parameter(Mandatory)][string]$DownloadDir
+    )
+
+    # Microsoft's permanent fwlinks for the Media Creation Tool on the software-download pages.
+    $Url = if ($MctUrl) { $MctUrl } elseif ($Version -eq '10') { 'https://go.microsoft.com/fwlink/?LinkId=691209' } else { 'https://go.microsoft.com/fwlink/?linkid=2156295' }
+    if (-not (Test-MicrosoftDownloadUrl -Url $Url)) {
+        Write-HostTimestamp "  The Media Creation Tool URL is not an official Microsoft URL. Refusing to download it: $Url" -ForegroundColor Red
+        return $null
+    }
+
+    $Mct = Join-Path -Path $DownloadDir -ChildPath "MediaCreationTool_$(Get-Date -Format 'yyyyMMdd_HHmmss').exe"
+    Write-HostTimestamp '  Downloading the Media Creation Tool from Microsoft...'
+    if (-not (Get-FileDownload -Url $Url -Destination $Mct)) {
+        Write-HostTimestamp '  Could not download the Media Creation Tool.' -ForegroundColor Red
+        return $null
+    }
+
+    # Unlike Fido and oscdimg, MCT is Authenticode signed, so require a valid Microsoft signature.
+    $Signature = Get-AuthenticodeSignature -LiteralPath $Mct -ErrorAction SilentlyContinue
+    if ($Signature.Status -ne 'Valid' -or $Signature.SignerCertificate.Subject -notmatch '(?i)O=Microsoft Corporation') {
+        Write-HostTimestamp "  The downloaded Media Creation Tool is not validly signed by Microsoft (status: $($Signature.Status)). Discarding it." -ForegroundColor Red
+        Remove-Item -LiteralPath $Mct -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    Write-HostTimestamp '  Verified the Media Creation Tool''s Microsoft signature.' -ForegroundColor Green
+
+    $MctArch = switch ($Architecture) { 'arm64' { 'ARM64' } 'x86' { 'x86' } default { 'x64' } }
+    $LangCode = Get-MctLanguageCode -Name $Language
+    $MctArgs = @('/Eula', 'Accept', '/Retail', '/MediaArch', $MctArch, '/MediaLangCode', $LangCode, '/MediaEdition', $MctEdition)
+
+    Write-Host ''
+    Write-Host 'The Media Creation Tool is about to open with your choices pre-selected:' -ForegroundColor Cyan
+    Write-Host "  Windows $Version, $MctArch, $LangCode, $MctEdition"
+    Write-Host ''
+    Write-Host 'It cannot be automated any further - Microsoft provides no switch to pick ISO output or a' -ForegroundColor Yellow
+    Write-Host 'save location - so in its window please:' -ForegroundColor Yellow
+    Write-Host '  1. Accept the licence terms if prompted.'
+    Write-Host '  2. Choose "Create installation media (USB flash drive, DVD, or ISO file) for another PC".'
+    Write-Host '  3. Choose "ISO file".'
+    Write-Host "  4. Save it into this folder: $DownloadDir" -ForegroundColor Green
+    Write-Host '  5. Let the download finish, then click Finish.'
+    Write-Host ''
+    Write-Host 'This script waits until the Media Creation Tool closes, then continues on its own.' -ForegroundColor Cyan
+    Write-Host ''
+    if ($Unattended -or $SkipInteractive) {
+        Write-HostTimestamp '  Note: the Media Creation Tool has no unattended ISO mode, so this step needs someone at the keyboard.' -ForegroundColor Yellow
+    }
+
+    $Existing = @(Get-ChildItem -Path $DownloadDir -Filter '*.iso' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    try {
+        Write-HostTimestamp '  Waiting for the Media Creation Tool to finish...'
+        Start-Process -FilePath $Mct -ArgumentList $MctArgs -Wait -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Write-HostTimestamp "  The Media Creation Tool could not be started: $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+    finally {
+        Remove-Item -LiteralPath $Mct -Force -ErrorAction SilentlyContinue
+    }
+
+    # Prefer an ISO that was not there before MCT ran; otherwise take the largest one in the folder.
+    $Iso = Get-ChildItem -Path $DownloadDir -Filter '*.iso' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Length -gt 3GB -and $Existing -notcontains $_.FullName } |
+        Sort-Object -Property LastWriteTime -Descending | Select-Object -First 1
+    if (-not $Iso) {
+        $Iso = Get-ChildItem -Path $DownloadDir -Filter '*.iso' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -gt 3GB } | Sort-Object -Property Length -Descending | Select-Object -First 1
+    }
+    if ($Iso) {
+        Write-HostTimestamp "  Found the ISO the Media Creation Tool produced: $($Iso.FullName) ($([math]::Round($Iso.Length / 1GB, 2)) GB)" -ForegroundColor Green
+        return $Iso.FullName
+    }
+
+    Write-HostTimestamp "  No ISO turned up in $DownloadDir." -ForegroundColor Yellow
+    if ($Unattended -or $SkipInteractive) { return $null }
+    $Answer = Read-Host 'If you saved it somewhere else, enter the full path to the ISO now (or press Enter to cancel)'
+    if ($Answer -and (Test-Path -LiteralPath $Answer.Trim('"'))) { return (Resolve-Path -LiteralPath $Answer.Trim('"')).Path }
+    return $null
 }
 
 # Maps a Windows build number to its marketing feature-update name (used to build catalog search queries).
@@ -1277,8 +1439,9 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $ListEditions) {
     Write-Host "This tool builds an updated Windows installation ISO. It will:"
     if (-not $IsoPath) {
         Write-Host "  - Download the matching official Windows $WindowsVersion ISO from Microsoft (~8 GB)"
-        Write-Host "      TIP: Microsoft can rate-limit/block repeated ISO downloads. If the download fails," -ForegroundColor Yellow
-        Write-Host "           download the ISO yourself and re-run with -IsoPath to avoid this." -ForegroundColor Yellow
+        Write-Host "      TIP: Microsoft can rate-limit/block repeated ISO downloads. The script retries, and can" -ForegroundColor Yellow
+        Write-Host "           then offer Microsoft's Media Creation Tool instead. To skip all that, download the" -ForegroundColor Yellow
+        Write-Host "           ISO yourself and re-run with -IsoPath." -ForegroundColor Yellow
     }
     else {
         Write-Host "  - Use the ISO you provided: $IsoPath"
@@ -1407,38 +1570,68 @@ else {
         Write-HostTimestamp "An ISO is already downloaded - reusing it: $ResolvedIso ($([math]::Round($ExistingIso.Length / 1GB, 2)) GB)" -ForegroundColor Green
     }
     else {
-        Invoke-Task -Description 'Obtaining the Windows ISO download link from Microsoft...' -ScriptBlock {
-            $script:IsoUrl = Get-WindowsIsoUrl -Version $WindowsVersion -Release $Release -Language $Language -Architecture $WinInfo.Architecture
-        }
-        if (-not $script:IsoUrl) {
-            Write-HostTimestamp 'Could not obtain a download link. Microsoft may be rate-limiting/blocking your IP for repeated ISO requests.' -ForegroundColor Yellow
-            Write-HostTimestamp 'Download the ISO yourself from https://www.microsoft.com/software-download, then either re-run with -IsoPath "C:\path\to\Windows.iso"' -ForegroundColor Yellow
-            Write-HostTimestamp "or simply drop the .iso into the download folder and re-run - it is picked up automatically: $DlDir" -ForegroundColor Yellow
-            Stop-Transcript | Out-Null
-            exit 1
-        }
-
-        $FileName = $null
-        try { $FileName = [System.IO.Path]::GetFileName(([Uri]$script:IsoUrl).AbsolutePath) } catch { }
-        if (-not $FileName -or $FileName -notmatch '\.iso$') {
-            $FileName = "Windows$WindowsVersion`_$Language`_$($WinInfo.Architecture).iso"
-        }
-        $ResolvedIso = Join-Path -Path $DlDir -ChildPath $FileName
-
-        Invoke-Task -Description "Downloading the Windows $WindowsVersion ISO to $ResolvedIso ..." -ScriptBlock {
-            if (-not (Get-FileDownload -Url $script:IsoUrl -Destination $ResolvedIso)) {
-                Write-HostTimestamp 'ISO download failed. Microsoft may be rate-limiting/blocking your IP for repeated ISO requests.' -ForegroundColor Red
-                Write-HostTimestamp 'Download the ISO yourself from https://www.microsoft.com/software-download and re-run with -IsoPath "C:\path\to\Windows.iso".' -ForegroundColor Yellow
+        # -UseMct skips Fido entirely; otherwise Fido is tried first and MCT is offered if it is blocked.
+        if ($UseMct) {
+            $ResolvedIso = Get-IsoViaMct -Version $WindowsVersion -Language $Language -Architecture $WinInfo.Architecture -DownloadDir $DlDir
+            if (-not $ResolvedIso) {
+                Write-HostTimestamp 'No ISO was produced with the Media Creation Tool. Cannot continue.' -ForegroundColor Red
                 Stop-Transcript | Out-Null
                 exit 1
             }
-            $SizeGB = [math]::Round((Get-Item -LiteralPath $ResolvedIso).Length / 1GB, 2)
-            if ($SizeGB -lt 3) {
-                Write-HostTimestamp "The downloaded file is only $SizeGB GB - that is too small to be a Windows ISO. The download likely failed." -ForegroundColor Red
-                Stop-Transcript | Out-Null
-                exit 1
+        }
+        else {
+            Invoke-Task -Description 'Obtaining the Windows ISO download link from Microsoft...' -ScriptBlock {
+                $script:IsoUrl = Get-WindowsIsoUrl -Version $WindowsVersion -Release $Release -Language $Language -Architecture $WinInfo.Architecture
             }
-            Write-HostTimestamp "  Download complete ($SizeGB GB)." -ForegroundColor Green
+            if (-not $script:IsoUrl) {
+                Write-HostTimestamp 'Could not obtain a download link. Microsoft may be rate-limiting/blocking your IP for repeated ISO requests.' -ForegroundColor Yellow
+
+                # The Media Creation Tool uses different Microsoft endpoints, so it usually still works when
+                # the download-link API is blocked - but it needs someone to click through its wizard.
+                $CanPrompt = -not ($Unattended -or $SkipInteractive)
+                if ($CanPrompt) {
+                    Write-Host ''
+                    $Answer = Read-Host "Microsoft's Media Creation Tool uses different servers and usually still works. Open it now? (Y/N)"
+                    if ($Answer -match '(?i)^\s*(y|yes)\s*$') {
+                        $ResolvedIso = Get-IsoViaMct -Version $WindowsVersion -Language $Language -Architecture $WinInfo.Architecture -DownloadDir $DlDir
+                    }
+                }
+                else {
+                    Write-HostTimestamp 'Re-run interactively (without -Unattended/-SkipInteractive) and this script can open the Media Creation Tool for you, or pass -UseMct.' -ForegroundColor Yellow
+                }
+
+                if (-not $ResolvedIso) {
+                    Write-HostTimestamp 'Download the ISO yourself from https://www.microsoft.com/software-download, then either re-run with -IsoPath "C:\path\to\Windows.iso"' -ForegroundColor Yellow
+                    Write-HostTimestamp "or simply drop the .iso into the download folder and re-run - it is picked up automatically: $DlDir" -ForegroundColor Yellow
+                    Stop-Transcript | Out-Null
+                    exit 1
+                }
+            }
+        }
+
+        if (-not $ResolvedIso) {
+            $FileName = $null
+            try { $FileName = [System.IO.Path]::GetFileName(([Uri]$script:IsoUrl).AbsolutePath) } catch { }
+            if (-not $FileName -or $FileName -notmatch '\.iso$') {
+                $FileName = "Windows$WindowsVersion`_$Language`_$($WinInfo.Architecture).iso"
+            }
+            $ResolvedIso = Join-Path -Path $DlDir -ChildPath $FileName
+
+            Invoke-Task -Description "Downloading the Windows $WindowsVersion ISO to $ResolvedIso ..." -ScriptBlock {
+                if (-not (Get-FileDownload -Url $script:IsoUrl -Destination $ResolvedIso)) {
+                    Write-HostTimestamp 'ISO download failed. Microsoft may be rate-limiting/blocking your IP for repeated ISO requests.' -ForegroundColor Red
+                    Write-HostTimestamp 'Download the ISO yourself from https://www.microsoft.com/software-download and re-run with -IsoPath "C:\path\to\Windows.iso".' -ForegroundColor Yellow
+                    Stop-Transcript | Out-Null
+                    exit 1
+                }
+                $SizeGB = [math]::Round((Get-Item -LiteralPath $ResolvedIso).Length / 1GB, 2)
+                if ($SizeGB -lt 3) {
+                    Write-HostTimestamp "The downloaded file is only $SizeGB GB - that is too small to be a Windows ISO. The download likely failed." -ForegroundColor Red
+                    Stop-Transcript | Out-Null
+                    exit 1
+                }
+                Write-HostTimestamp "  Download complete ($SizeGB GB)." -ForegroundColor Green
+            }
         }
     }
 }
