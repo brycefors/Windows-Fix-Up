@@ -133,7 +133,7 @@ This repository includes several specialized companion scripts for jobs the main
 | [Windows Clean-Up](Windows-Clean-Up/README.md) | Reclaims disk space on the system drive using escalating cleanup levels, with optional adaptive scaling based on how little free space remains. |
 | [Windows Update Fix](Windows-Update-Fix/README.md) | Repairs a Windows Update experience broken by leftover or misconfigured Local Group Policy, with an adaptive remediation mode. |
 | [Windows In-Place Upgrade](Windows-InPlace-Upgrade/README.md) | Performs an in-place upgrade (repair install) that re-lays the OS while keeping apps and files — the most reliable fix for deep servicing-stack corruption. |
-| [Windows ISO Updater](Windows-ISO-Updater/README.md) | Downloads the latest official Windows ISO, slipstreams the latest cumulative update into it, and recompiles a fresh, fully-patched bootable ISO. |
+| [Windows ISO Updater](https://github.com/brycefors/Windows-ISO-Updater) | **Now in its own repository.** Downloads the latest official Windows ISO, slipstreams the latest cumulative update into it, and recompiles a fresh, fully-patched bootable ISO. |
 | [Windows Update Maintenance](Windows-Update-Maintenance/README.md) | Unattended engine that pulls the latest applicable cumulative update straight from the Microsoft Update Catalog, installs it silently, diagnoses failures, and cleans up its staging files and logs. |
 
 ## Additional Information
