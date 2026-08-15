@@ -481,6 +481,8 @@ function Get-WindowsIsoUrl {
 
     Write-HostTimestamp "  Asking Microsoft (via Fido) for the Windows $Version ($Release, $Language, $Architecture) ISO link..."
     $Url = $null
+    $Output = $null
+    $FidoExit = $null
     try {
         # -GetUrl makes Fido print only the resolved download URL and exit, without downloading anything.
         $FidoArgs = @{
@@ -490,12 +492,19 @@ function Get-WindowsIsoUrl {
             Arch   = $Architecture
             GetUrl = $true
         }
+        if ($VerbosePreference -ne 'SilentlyContinue') { $FidoArgs['Verbose'] = $true }
+
         # Prefer running Fido in its own Windows PowerShell process: it keeps third-party code out of this
         # session, and Fido targets Windows PowerShell.
         $WinPs = Join-Path -Path $env:SystemRoot -ChildPath 'System32\WindowsPowerShell\v1.0\powershell.exe'
         if (Test-Path -LiteralPath $WinPs) {
-            $Output = & $WinPs -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $FidoScript `
-                -Win $Version -Rel $Release -Lang $Language -Arch $Architecture -GetUrl 2>&1
+            $ChildArgs = @(
+                '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $FidoScript,
+                '-Win', $Version, '-Rel', $Release, '-Lang', $Language, '-Arch', $Architecture, '-GetUrl'
+            )
+            if ($VerbosePreference -ne 'SilentlyContinue') { $ChildArgs += '-Verbose' }
+            $Output = & $WinPs @ChildArgs 2>&1
+            $FidoExit = $LASTEXITCODE
         }
         else {
             $Output = & $FidoScript @FidoArgs 2>&1
@@ -511,7 +520,21 @@ function Get-WindowsIsoUrl {
     }
 
     if (-not $Url) {
-        Write-HostTimestamp '  Fido did not return a download URL. Microsoft may have changed its download page, or the requested release/language is unavailable.' -ForegroundColor Red
+        Write-HostTimestamp '  Fido did not return a download URL. Microsoft may have changed its download page, throttled this IP address, or the requested release/language is unavailable.' -ForegroundColor Red
+
+        # Fido explains the real reason on its own output (rate limiting, unknown release, HTTP errors), so
+        # show it rather than leaving the user with only the generic message above.
+        $Lines = @($Output | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+        if ($Lines.Count -gt 0) {
+            Write-HostTimestamp "  Fido reported$(if ($null -ne $FidoExit) { " (exit code $FidoExit)" }):" -ForegroundColor Yellow
+            $Lines | Select-Object -Last 25 | ForEach-Object { Write-HostTimestamp "    $_" -ForegroundColor Gray }
+        }
+        else {
+            Write-HostTimestamp "  Fido produced no output$(if ($null -ne $FidoExit) { " (exit code $FidoExit)" })." -ForegroundColor Yellow
+        }
+
+        Write-HostTimestamp '  Re-run this script with -Verbose to get Fido''s full diagnostics.' -ForegroundColor Yellow
+        Write-HostTimestamp '  "Sentinel marked this request as rejected" or a "715-123130" error means Microsoft''s anti-bot check refused the request - usually because this IP address has asked for ISO links too often. Wait a while, try a different network, or just download the ISO yourself.' -ForegroundColor Yellow
         Write-HostTimestamp '  Download an ISO yourself and re-run with -IsoPath "C:\path\to\Windows.iso".' -ForegroundColor Yellow
         return $null
     }
@@ -1192,6 +1215,7 @@ Write-Host "  Working folder   : $WorkRoot"
 Write-Host "    Extracted media: $ExtractDir"
 Write-Host "    DISM mount     : $MountDir"
 Write-Host "  Downloads        : $DlDir"
+if (-not $IsoPath) { Write-Host '                     (drop your own .iso here and it is used instead of downloading one)' -ForegroundColor DarkGray }
 Write-Host "  Logs             : $LogDir"
 Write-Host "  Finished ISO     : $(if ($OutputIsoPath) { $OutputIsoPath } else { Join-Path $DlDir '<source ISO name>-Updated_<date>.iso' })"
 Write-Host ''
@@ -1388,7 +1412,8 @@ else {
         }
         if (-not $script:IsoUrl) {
             Write-HostTimestamp 'Could not obtain a download link. Microsoft may be rate-limiting/blocking your IP for repeated ISO requests.' -ForegroundColor Yellow
-            Write-HostTimestamp 'Download the ISO yourself from https://www.microsoft.com/software-download and re-run with -IsoPath "C:\path\to\Windows.iso".' -ForegroundColor Yellow
+            Write-HostTimestamp 'Download the ISO yourself from https://www.microsoft.com/software-download, then either re-run with -IsoPath "C:\path\to\Windows.iso"' -ForegroundColor Yellow
+            Write-HostTimestamp "or simply drop the .iso into the download folder and re-run - it is picked up automatically: $DlDir" -ForegroundColor Yellow
             Stop-Transcript | Out-Null
             exit 1
         }

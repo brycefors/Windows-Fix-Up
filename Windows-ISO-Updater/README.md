@@ -31,7 +31,10 @@ This PowerShell script automates the whole process. A clean install or in-place 
 > This is a **disk- and time-intensive** operation. The downloaded ISO, the extracted media, the mounted image, and the re-exported image all coexist during the build, and offline DISM servicing plus component-store cleanup can take a long time. Nothing on the machine running the script is changed — all servicing happens against files in the working folder.
 
 > [!TIP]
-> **It is recommended to download the ISO yourself and pass it with `-IsoPath`.** The automatic download relies on the community Fido helper, which queries Microsoft's software-download servers on your behalf. Microsoft rate-limits and can temporarily block IP addresses that make repeated ISO requests, which causes the automatic download to fail. Downloading the ISO once from [microsoft.com/software-download](https://www.microsoft.com/software-download) (or with the Media Creation Tool) and reusing it with `-IsoPath` avoids this entirely — and the script also reuses any ISO already sitting in the download folder.
+> **It is recommended to download the ISO yourself and pass it with `-IsoPath`.** The automatic download relies on the community Fido helper, which queries Microsoft's software-download servers on your behalf. Microsoft rate-limits and can temporarily block IP addresses that make repeated ISO requests — this shows up as *"Error: Sentinel marked this request as rejected"* or a *715-123130* error, which the script now prints verbatim (add `-Verbose` for Fido's full request log). Downloading the ISO once from [microsoft.com/software-download](https://www.microsoft.com/software-download) (or with the Media Creation Tool) and reusing it with `-IsoPath` avoids this entirely.
+
+> [!TIP]
+> **You don't have to pass `-IsoPath` at all — you can just drop your ISO in the download folder.** If `-IsoPath` is not given, the script looks in the download folder (`<SystemDrive>\WISO-Work\Downloads` by default, or wherever `-DownloadPath` points) and reuses the **largest `.iso` file over 3 GB** it finds there instead of downloading one. This is the easiest route when double-clicking the batch file: create the folder, drop the ISO in, and run. It is also why a previously downloaded ISO is never re-downloaded.
 
 - The Microsoft Update Catalog has **no public API**, so the script parses its search pages to find the latest cumulative update. If Microsoft changes the catalog layout the lookup may need adjustment; you can always supply your own `.msu`/`.cab` packages with `-UpdatePath`.- Recompiling the ISO requires **`oscdimg.exe`**, part of the **Windows ADK "Deployment Tools"** feature. If it is not already installed, the script downloads a **standalone `oscdimg.exe` (~140 KB) straight from Microsoft's public symbol server** ([how this works](https://pete.akeo.ie/2025/06/downloading-oscdimgexe-from-microsoft.html)) and caches it under `<WorkPath>\Tools`, so the multi-hundred-MB ADK is not needed. The download is verified against a pinned SHA-256. Use `-SkipOscdimgDownload` to disable this, and `-InstallAdk` to fall back to installing the ADK Deployment Tools instead.
 - Every download URL (ISO, updates, oscdimg, ADK) is validated to point at an **official Microsoft host over HTTPS** before anything is downloaded.
@@ -98,7 +101,7 @@ The script supports the following optional parameters:
 | Parameter | Description |
 |---|---|
 | `-Unattended` | Runs the script without any confirmation prompts. |
-| `-IsoPath` | Path to an existing Windows ISO to update instead of downloading one from Microsoft. |
+| `-IsoPath` | Path to an existing Windows ISO to update instead of downloading one from Microsoft. Omit it and the script reuses the largest `.iso` over 3 GB found in the download folder. |
 | `-WindowsVersion` | Windows version to download/update: `10` or `11`. Defaults to `11`. |
 | `-Release` | Fido release to request (e.g. `24H2`, `23H2`) or `Latest`. Defaults to `Latest`. |
 | `-Language` | ISO language as named by Microsoft/Fido (e.g. `English`, `"English International"`). Defaults to `English`. |
@@ -165,7 +168,7 @@ The file was produced with [schneegans.de/windows/unattend-generator](https://sc
 ## What the Script Does
 
 1.  **Locate `oscdimg.exe`** — Downloads a standalone copy from Microsoft's symbol server if it is not already installed (or installs the ADK with `-InstallAdk`), and otherwise fails fast so the build cannot get most of the way through and then be unable to recompile the ISO.
-2.  **Obtain the ISO** — Downloads the matching official Microsoft ISO via the community [Fido](https://github.com/pbatard/Fido) helper (verified and sandboxed in its own process — see [Important Notes](#important-notes)), or reuses an ISO already in the download folder, or uses `-IsoPath`.
+2.  **Obtain the ISO** — Uses `-IsoPath` if given, otherwise reuses the largest `.iso` over 3 GB already sitting in the download folder, and only if neither is available downloads the matching official Microsoft ISO via the community [Fido](https://github.com/pbatard/Fido) helper (verified and sandboxed in its own process — see [Important Notes](#important-notes)).
 3.  **Extract the ISO** — Mounts the ISO and mirrors its contents into the working folder with `robocopy`, then dismounts. If the media ships `install.esd`, it is converted to an editable `install.wim`.
 4.  **Find the updates** — Detects the feature update (e.g. `24H2`) and architecture from the image, then downloads the latest combined Servicing Stack + Cumulative Update (and, by default, the .NET cumulative update — disable with `-SkipDotNet`, and the Setup Dynamic Update — disable with `-SkipSetupDU`) from the Microsoft Update Catalog. `-UpdatePath` uses your own packages instead.
 5.  **Integrate the updates** — Uses offline DISM to apply the package(s) to `install.wim` (by default only the highest edition present — override with `-KeepAllEditions` or `-KeepEditions`/`-Edition`), to `boot.wim` (Windows Setup / WinPE), and optionally to `winre.wim`.
@@ -217,7 +220,7 @@ C:\WISO-Work\              <- -WorkPath (moves everything below it)
   Logs\                    <- -LogPath
 ```
 
-`-DownloadPath`, `-LogPath` and `-OutputIsoPath` override the individual folders if you want them elsewhere. Nothing outside these folders is changed — all servicing happens against files in the working folder, never against the running system.
+Dropping your own `.iso` into `Downloads\` is all it takes to skip the Microsoft download — no `-IsoPath` needed. `-DownloadPath`, `-LogPath` and `-OutputIsoPath` override the individual folders if you want them elsewhere. Nothing outside these folders is changed — all servicing happens against files in the working folder, never against the running system.
 
 ## Logging
 
