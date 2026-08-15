@@ -143,7 +143,7 @@ The file was produced with [schneegans.de/windows/unattend-generator](https://sc
 > That example produces a deliberately insecure machine: a well-known Administrator password stored in plain text in the answer file and on the finished ISO, an automatic first sign-in as Administrator, Remote Desktop reachable on all firewall profiles, and a first boot that downloads and silently runs an installer from the internet. It is for throwaway VMs on a trusted network only — change the password in both places in the file, and never reuse it anywhere that matters.
 
 > [!WARNING]
-> **This example partitions and formats disk 0 without asking which disk to use.** A generated WinPE script first asserts that disk 0 exists and is between 100 and 4000 GiB, aborting if not. If disk 0 already holds partitions it stops and asks: you must type `WIPE` to erase it, and any other answer aborts without touching the disk. Once past that, it cleans disk 0, applies image index 1, and reboots, with one further keypress prompt before `diskpart` runs.
+> **This example partitions and formats disk 0 without asking which disk to use.** A generated WinPE script first asserts that disk 0 exists and is between 100 and 4000 GiB, aborting if not. If disk 0 is **empty it proceeds with no prompt at all** — clean, partition, apply image index 1, reboot. If disk 0 **already holds partitions** it stops and asks: you must type `WIPE` to erase it, and any other answer aborts without touching the disk.
 >
 > Because it applies **index 1**, it pairs with the default edition handling, which leaves a single edition at index 1. If you build with `-KeepAllEditions`, index 1 is whichever edition came first in the original ISO — usually Home, not the one you probably want.
 
