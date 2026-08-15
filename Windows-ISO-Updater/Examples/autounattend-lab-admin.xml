@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-	<!--https://schneegans.de/windows/unattend-generator/?LanguageMode=Unattended&UILanguage=en-US&Locale=en-US&Keyboard=00000409&GeoLocation=244&PEMode=Generated&Disable8Dot3Names=true&PauseBeforeFormatting=true&InstallFromMode=Interactive&PartitionMode=Unattended&TargetDisk=0&PartitionLayout=Automatic&SystemSize=300&RecoveryMode=Partition&RecoverySize=1000&DiskAssertionMode=Generated&AssertMinSize=100&AssertMaxSize=4000&AssertNoPartitions=true&ProcessorArchitecture=amd64&BypassRequirementsCheck=true&ComputerNameMode=Random&TimeZoneMode=Implicit&UserAccountMode=Unattended&AccountName0=Admin&AccountDisplayName0=&AccountPassword0=&AccountGroup0=Administrators&AutoLogonMode=Builtin&BuiltinAdministratorPassword=Password123&PasswordExpirationMode=Unlimited&LockoutMode=Default&HideFiles=Hidden&TaskbarSearch=Box&TaskbarIconsMode=Default&StartTilesMode=Default&StartPinsMode=Default&EnableLongPaths=true&AllowPowerShellScripts=true&DisableLastAccess=true&HideEdgeFre=true&DeleteWindowsOld=true&EffectsMode=Default&DesktopIconsMode=Default&StartFoldersMode=Default&CoreIsolationMode=Enabled&WifiMode=Interactive&ExpressSettings=DisableAll&LockKeysMode=Skip&StickyKeysMode=Default&ColorMode=Default&WallpaperMode=Default&LockScreenMode=Default&AppLockerMode=Skip-->
+	<!--https://schneegans.de/windows/unattend-generator/?LanguageMode=Unattended&UILanguage=en-US&Locale=en-US&Keyboard=00000409&GeoLocation=244&PEMode=Generated&Disable8Dot3Names=true&PauseBeforeFormatting=true&InstallFromMode=Interactive&PartitionMode=Unattended&TargetDisk=0&PartitionLayout=Automatic&SystemSize=300&RecoveryMode=Partition&RecoverySize=1000&DiskAssertionMode=Generated&AssertMinSize=100&AssertMaxSize=4000&AssertNoPartitions=true&ProcessorArchitecture=amd64&BypassRequirementsCheck=true&ComputerNameMode=Random&TimeZoneMode=Implicit&UserAccountMode=Unattended&AutoLogonMode=Builtin&BuiltinAdministratorPassword=Password123&PasswordExpirationMode=Unlimited&LockoutMode=Default&HideFiles=Hidden&TaskbarSearch=Box&TaskbarIconsMode=Default&StartTilesMode=Default&StartPinsMode=Default&EnableLongPaths=true&EnableRemoteDesktop=true&AllowPowerShellScripts=true&DisableLastAccess=true&HideEdgeFre=true&DeleteWindowsOld=true&EffectsMode=Default&DesktopIconsMode=Default&StartFoldersMode=Default&CoreIsolationMode=Enabled&WifiMode=Interactive&ExpressSettings=DisableAll&LockKeysMode=Skip&StickyKeysMode=Default&ColorMode=Default&WallpaperMode=Default&LockScreenMode=Default&AppLockerMode=Skip-->
 	<settings pass="offlineServicing"></settings>
 	<settings pass="windowsPE">
 		<component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
@@ -170,17 +170,6 @@
 					<Value>Password123</Value>
 					<PlainText>true</PlainText>
 				</AdministratorPassword>
-				<LocalAccounts>
-					<LocalAccount wcm:action="add">
-						<Name>Admin</Name>
-						<DisplayName></DisplayName>
-						<Group>Administrators</Group>
-						<Password>
-							<Value></Value>
-							<PlainText>true</PlainText>
-						</Password>
-					</LocalAccount>
-				</LocalAccounts>
 			</UserAccounts>
 			<AutoLogon>
 				<Username>Administrator</Username>
@@ -236,6 +225,10 @@ $scripts = @(
 	};
 	{
 		reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f
+	};
+	{
+		netsh.exe advfirewall firewall set rule group="@FirewallAPI.dll,-28752" new enable=Yes;
+		reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f;
 	};
 	{
 		Set-ExecutionPolicy -Scope 'LocalMachine' -ExecutionPolicy 'RemoteSigned' -Force;
