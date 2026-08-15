@@ -21,10 +21,11 @@
 #   4. Integrates the update(s) offline with DISM into install.wim (by default only the highest edition
 #      present - e.g. Pro over Home - is kept and serviced; use -KeepAllEditions or -KeepEditions to
 #      change this), boot.wim (Windows Setup / WinPE), and optionally winre.wim (recovery).
-#   5. Refreshes the loose Setup files on the media (sources\setup.exe, sources\setuphost.exe and the
-#      boot managers) from the serviced boot.wim - Windows Setup fails if those binaries don't match the
-#      version inside boot.wim - then cleans up the component store (/StartComponentCleanup /ResetBase)
-#      and re-exports install.wim to shrink it.
+#   5. Refreshes the loose Setup files on the media: first applies the Setup Dynamic Update to the
+#      sources folder (on by default; disable with -SkipSetupDU), then overwrites sources\setup.exe,
+#      sources\setuphost.exe and the boot managers from the serviced boot.wim - Windows Setup fails if
+#      those binaries don't match the version inside boot.wim - then cleans up the component store
+#      (/StartComponentCleanup /ResetBase) and re-exports install.wim to shrink it.
 #   6. Recompiles a new bootable ISO with oscdimg (from the Windows ADK), preserving both the BIOS and
 #      UEFI boot sectors so the new ISO boots on legacy and modern PCs alike.
 #
@@ -73,6 +74,9 @@ param(
 
     [Parameter(HelpMessage = 'Skip downloading and integrating the latest .NET cumulative update. The .NET update is included by default; use this switch to leave it out')]
     [switch]$SkipDotNet,
+
+    [Parameter(HelpMessage = 'Skip the Setup Dynamic Update that refreshes the loose Windows Setup files on the media. It is included by default; without it the Windows 11 24H2+ Setup engine can fail with "Windows 11 installation has failed"')]
+    [switch]$SkipSetupDU,
 
     [Parameter(HelpMessage = 'Also service the recovery image (winre.wim). Off by default; the correct component for WinRE is the Safe OS Dynamic Update, which is fetched when available')]
     [switch]$ServiceWinRE,
@@ -919,6 +923,7 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $ListEditions) {
         }
         else {
             Write-Host "  - Download the latest cumulative update(s)$(if (-not $SkipDotNet) { ' and the latest .NET cumulative update' }) from the Microsoft Update Catalog"
+            if (-not $SkipSetupDU) { Write-Host "  - Download the latest Setup Dynamic Update and apply it to the media's sources folder" }
         }
         Write-Host "  - Integrate the update(s) into install.wim ($Edition), boot.wim$(if ($ServiceWinRE) { ', and winre.wim' })"
         Write-Host "  - Clean up and re-export the images to shrink them"
@@ -1193,6 +1198,7 @@ Write-Host $LineBreak
 # group is [checkpoint..., LCU]). Groups are applied independently with the documented sole-target method.
 $UpdateGroups = New-Object System.Collections.Generic.List[object]
 $SafeOsGroup = $null
+$script:SetupDu = $null
 
 if ($SkipUpdates) {
     Write-HostTimestamp 'Skipping update integration (-SkipUpdates was specified).' -ForegroundColor Yellow
@@ -1252,6 +1258,20 @@ else {
         }
         if ($script:DotNet) { $UpdateGroups.Add(@($script:DotNet)) }
         else { Write-HostTimestamp '  No .NET cumulative update was integrated (none found).' -ForegroundColor Yellow }
+        Write-Host $LineBreak
+    }
+
+    # The Setup Dynamic Update is NOT applied to an image - it is expanded over the media's sources
+    # folder, which is what keeps the loose Setup binaries, compatibility database and component
+    # manifests in step with the serviced boot.wim. It is therefore kept out of $UpdateGroups.
+    if (-not $SkipSetupDU) {
+        Invoke-Task -Description 'Downloading the latest Setup Dynamic Update from the Microsoft Update Catalog...' -ScriptBlock {
+            $VerPart = if ($FeatureName) { "Version $FeatureName " } else { '' }
+            $script:SetupDu = Get-LatestCatalogPackage -Query "Setup Dynamic Update Windows $WindowsVersion $VerPart$CatalogArch" -DownloadDir $DlDir -TitleInclude '(?i)setup dynamic update'
+        }
+        if (-not $script:SetupDu) {
+            Write-HostTimestamp '  No Setup Dynamic Update was found. The media Setup files will only be refreshed from boot.wim, which can make Windows Setup fail on the finished ISO.' -ForegroundColor Yellow
+        }
         Write-Host $LineBreak
     }
 
@@ -1333,6 +1353,15 @@ else {
     $ServiceIndexes = @($EdIndexes | Where-Object { $KeepIndexes -contains $_ })
 }
 
+# Any edition that ships in the ISO but is not serviced installs at the ORIGINAL patch level, so warn.
+$UnservicedKept = @($KeepIndexes | Where-Object { $ServiceIndexes -notcontains $_ })
+if ($UnservicedKept.Count -gt 0 -and -not $SkipUpdates) {
+    $UnservicedNames = $InstallImages | Where-Object { $UnservicedKept -contains [int]$_.ImageIndex } | ForEach-Object { $_.ImageName }
+    Write-HostTimestamp "Warning: these editions stay in the ISO but will NOT be updated, so installing them gives an unpatched Windows: $($UnservicedNames -join ', ')" -ForegroundColor Yellow
+    Write-HostTimestamp '  Drop -Edition (or add them to -KeepEditions) so every edition left in the ISO is serviced.' -ForegroundColor Yellow
+    Write-Host $LineBreak
+}
+
 # --- Service the images ---
 if ($UpdateGroups.Count -gt 0) {
     # Tracks editions whose update set failed to apply, so we can warn loudly at the end.
@@ -1400,7 +1429,28 @@ if ($UpdateGroups.Count -gt 0) {
         }
     }
 
-    # 2) Service boot.wim (Windows Setup / WinPE). Index 2 is the Setup environment; index 1 is WinPE.
+    # 2) Apply the Setup Dynamic Update to the media's sources folder. This refreshes the loose Windows
+    # Setup binaries, the compatibility database and replacement component manifests. Step 3 then
+    # overwrites setup.exe/setuphost.exe from the serviced boot.wim, matching Microsoft's documented order.
+    if ($script:SetupDu) {
+        Invoke-Task -Description 'Applying the Setup Dynamic Update to the media sources folder...' -ScriptBlock {
+            $MediaSources = Join-Path $ExtractDir 'sources'
+            Get-ChildItem -LiteralPath $MediaSources -File -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.IsReadOnly } |
+                ForEach-Object { $_.IsReadOnly = $false }
+            foreach ($Cab in $script:SetupDu) {
+                & "$env:SystemRoot\System32\expand.exe" $Cab '-F:*' $MediaSources | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-HostTimestamp "  expand.exe returned $LASTEXITCODE for $(Split-Path -Leaf $Cab); the media Setup files were not fully refreshed." -ForegroundColor Yellow
+                }
+                else {
+                    Write-HostTimestamp "  Applied $(Split-Path -Leaf $Cab) to sources\." -ForegroundColor Green
+                }
+            }
+        }
+    }
+
+    # 3) Service boot.wim (Windows Setup / WinPE). Index 2 is the Setup environment; index 1 is WinPE.
     if (Test-Path -LiteralPath $BootWim) {
         Set-ItemProperty -LiteralPath $BootWim -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
         # Staging folder for the serviced Setup/boot-manager binaries pulled out of boot.wim index 2.
@@ -1495,7 +1545,7 @@ if ($UpdateGroups.Count -gt 0) {
         Remove-Item -LiteralPath $SetupStage -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # 3) Re-export install.wim below (outside this block) to reclaim the space freed by the cleanup.
+    # 4) Re-export install.wim below (outside this block) to reclaim the space freed by the cleanup.
     Remove-Item -LiteralPath $MountDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
