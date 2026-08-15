@@ -30,8 +30,9 @@ This PowerShell script automates the whole process. A clean install or in-place 
 > [!TIP]
 > **It is recommended to download the ISO yourself and pass it with `-IsoPath`.** The automatic download relies on the community Fido helper, which queries Microsoft's software-download servers on your behalf. Microsoft rate-limits and can temporarily block IP addresses that make repeated ISO requests, which causes the automatic download to fail. Downloading the ISO once from [microsoft.com/software-download](https://www.microsoft.com/software-download) (or with the Media Creation Tool) and reusing it with `-IsoPath` avoids this entirely — and the script also reuses any ISO already sitting in the download folder.
 
-- The Microsoft Update Catalog has **no public API**, so the script parses its search pages to find the latest cumulative update. If Microsoft changes the catalog layout the lookup may need adjustment; you can always supply your own `.msu`/`.cab` packages with `-UpdatePath`.- Recompiling the ISO requires **`oscdimg.exe`**, part of the **Windows ADK "Deployment Tools"** feature. If it is not installed, pass `-InstallAdk` to have the script download and install it from Microsoft, or install the ADK manually first.
-- Every download URL (ISO, updates, ADK) is validated to point at an **official Microsoft host over HTTPS** before anything is downloaded.
+- The Microsoft Update Catalog has **no public API**, so the script parses its search pages to find the latest cumulative update. If Microsoft changes the catalog layout the lookup may need adjustment; you can always supply your own `.msu`/`.cab` packages with `-UpdatePath`.- Recompiling the ISO requires **`oscdimg.exe`**, part of the **Windows ADK "Deployment Tools"** feature. If it is not already installed, the script downloads a **standalone `oscdimg.exe` (~140 KB) straight from Microsoft's public symbol server** ([how this works](https://pete.akeo.ie/2025/06/downloading-oscdimgexe-from-microsoft.html)) and caches it under `<WorkPath>\Tools`, so the multi-hundred-MB ADK is not needed. The download is verified against a pinned SHA-256. Use `-SkipOscdimgDownload` to disable this, and `-InstallAdk` to fall back to installing the ADK Deployment Tools instead.
+- Every download URL (ISO, updates, oscdimg, ADK) is validated to point at an **official Microsoft host over HTTPS** before anything is downloaded.
+- The **Fido helper is downloaded and executed**, so it is validated first: the URL must point at the official `github.com/pbatard/Fido` repository over HTTPS, and the downloaded script must be a plausible size, parse as PowerShell, carry Fido's header and `-GetUrl` parameter, and contain no code-execution, persistence or security-tampering commands (Fido is not code-signed, so there is no signature to verify). It is then run **in a separate PowerShell process** so it cannot touch this script's session. Its SHA-256 is logged on every run, and you can pin a version you have reviewed yourself with `-FidoSha256`.
 
 > [!IMPORTANT]
 > The working and download folders **must be on a local, fixed disk**. Cloud-synced folders (Google Drive, OneDrive, Dropbox, etc.) turn files into on-demand placeholders and sync them in the background, which makes DISM unable to read the `.msu`/`.wim` reliably — this shows up as *"An error occurred applying the Unattend.xml file from the .msu package"*. By default the script works and downloads under `<SystemDrive>\WISO-Work`; if you run it from a cloud-synced folder, keep `-WorkPath`/`-DownloadPath` pointed at a local disk (and preferably pass your ISO with `-IsoPath` from a local copy).
@@ -40,7 +41,7 @@ This PowerShell script automates the whole process. A clean install or in-place 
 
 - **PowerShell 5.0+** and **Windows 10 / Server 2016** or newer, run **as Administrator**.
 - An internet connection (unless you supply both the ISO with `-IsoPath` and updates with `-UpdatePath`).
-- The **Windows ADK Deployment Tools** (`oscdimg.exe`) — installed automatically with `-InstallAdk`.
+- **`oscdimg.exe`** — downloaded automatically from Microsoft if it is not already present (or installed with the ADK via `-InstallAdk`).
 - Plenty of free disk space on a **local** working drive — see [Disk Space Requirements](#disk-space-requirements).
 
 ## How to Run This Script
@@ -111,9 +112,13 @@ The script supports the following optional parameters:
 | `-WorkPath` | Working folder used to extract and service the media. Defaults to `<SystemDrive>\WISO-Work`. |
 | `-OutputIsoPath` | Full path for the recompiled ISO. Defaults to the download folder with an `-Updated` suffix. |
 | `-OscdimgPath` | Full path to `oscdimg.exe` if the Windows ADK is installed in a non-standard location. |
-| `-InstallAdk` | If `oscdimg.exe` is not found, download and silently install the ADK Deployment Tools from Microsoft. |
-| `-FidoUrl` | Override the URL used to fetch the Fido download helper. |
+| `-SkipOscdimgDownload` | Do not download a standalone `oscdimg.exe` from Microsoft's symbol server; require the Windows ADK instead. |
+| `-InstallAdk` | If `oscdimg.exe` is not found and cannot be downloaded, download and silently install the ADK Deployment Tools from Microsoft. |
+| `-FidoUrl` | Override the URL used to fetch the Fido download helper. Must still point at the official `github.com/pbatard/Fido` repository. |
+| `-FidoSha256` | Pin the expected SHA-256 of `Fido.ps1` so only that reviewed version is ever run. |
 | `-AdkSetupUrl` | Override the URL used to download the Windows ADK setup bootstrapper. |
+| `-OscdimgUrl` | Override the Microsoft symbol server URL used to download the standalone `oscdimg.exe`. |
+| `-OscdimgSha256` | Expected SHA-256 of the downloaded `oscdimg.exe`. Pass an empty string to skip the hash check when overriding `-OscdimgUrl`. |
 | `-LogPath` | Directory to write log files to. Defaults to a `Logs` folder inside the working folder. |
 | `-SkipInteractive` | Skips the interactive confirmation prompt (still shows output). |
 
@@ -154,8 +159,8 @@ The file was produced with [schneegans.de/windows/unattend-generator](https://sc
 
 ## What the Script Does
 
-1.  **Locate `oscdimg.exe`** — Fails fast (or installs the ADK with `-InstallAdk`) so the build cannot get most of the way through and then be unable to recompile the ISO.
-2.  **Obtain the ISO** — Downloads the matching official Microsoft ISO via the community [Fido](https://github.com/pbatard/Fido) helper, or reuses an ISO already in the download folder, or uses `-IsoPath`.
+1.  **Locate `oscdimg.exe`** — Downloads a standalone copy from Microsoft's symbol server if it is not already installed (or installs the ADK with `-InstallAdk`), and otherwise fails fast so the build cannot get most of the way through and then be unable to recompile the ISO.
+2.  **Obtain the ISO** — Downloads the matching official Microsoft ISO via the community [Fido](https://github.com/pbatard/Fido) helper (verified and sandboxed in its own process — see [Important Notes](#important-notes)), or reuses an ISO already in the download folder, or uses `-IsoPath`.
 3.  **Extract the ISO** — Mounts the ISO and mirrors its contents into the working folder with `robocopy`, then dismounts. If the media ships `install.esd`, it is converted to an editable `install.wim`.
 4.  **Find the updates** — Detects the feature update (e.g. `24H2`) and architecture from the image, then downloads the latest combined Servicing Stack + Cumulative Update (and, by default, the .NET cumulative update — disable with `-SkipDotNet`, and the Setup Dynamic Update — disable with `-SkipSetupDU`) from the Microsoft Update Catalog. `-UpdatePath` uses your own packages instead.
 5.  **Integrate the updates** — Uses offline DISM to apply the package(s) to `install.wim` (by default only the highest edition present — override with `-KeepAllEditions` or `-KeepEditions`/`-Edition`), to `boot.wim` (Windows Setup / WinPE), and optionally to `winre.wim`.

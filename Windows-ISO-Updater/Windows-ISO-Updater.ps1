@@ -26,7 +26,8 @@
 #      sources\setuphost.exe and the boot managers from the serviced boot.wim - Windows Setup fails if
 #      those binaries don't match the version inside boot.wim - then cleans up the component store
 #      (/StartComponentCleanup /ResetBase) and re-exports install.wim to shrink it.
-#   6. Recompiles a new bootable ISO with oscdimg (from the Windows ADK), preserving both the BIOS and
+#   6. Recompiles a new bootable ISO with oscdimg (downloaded from Microsoft if not already installed
+#      with the Windows ADK), preserving both the BIOS and
 #      UEFI boot sectors so the new ISO boots on legacy and modern PCs alike. An answer file supplied with
 #      -UnattendPath is placed at the root of the media as autounattend.xml, which Windows Setup reads
 #      automatically when the ISO is booted.
@@ -107,11 +108,23 @@ param(
     [Parameter(HelpMessage = 'If oscdimg.exe (Windows ADK Deployment Tools) is not found, download and silently install it from Microsoft')]
     [switch]$InstallAdk,
 
+    [Parameter(HelpMessage = 'Skip the standalone oscdimg.exe download from the Microsoft symbol server and require the Windows ADK instead')]
+    [switch]$SkipOscdimgDownload,
+
     [Parameter(HelpMessage = 'Override the URL used to fetch the Fido download helper')]
     [string]$FidoUrl = 'https://github.com/pbatard/Fido/raw/master/Fido.ps1',
 
+    [Parameter(HelpMessage = 'Expected SHA-256 of Fido.ps1. Set this to pin one reviewed version; by default the script only verifies its source and contents')]
+    [string]$FidoSha256,
+
     [Parameter(HelpMessage = 'Override the URL used to download the Windows ADK setup bootstrapper (Deployment Tools)')]
     [string]$AdkSetupUrl = 'https://go.microsoft.com/fwlink/?linkid=2289980',
+
+    [Parameter(HelpMessage = 'Override the Microsoft symbol server URL used to download a standalone oscdimg.exe')]
+    [string]$OscdimgUrl = 'https://msdl.microsoft.com/download/symbols/oscdimg.exe/688CABB065000/oscdimg.exe',
+
+    [Parameter(HelpMessage = 'Expected SHA-256 of the downloaded oscdimg.exe. Pass an empty string to skip the hash check (needed if you override -OscdimgUrl)')]
+    [string]$OscdimgSha256 = '2000160B2C5044691B2F9A0AC308E5207F273D4880A572457AF16D05886BA861',
 
     [Parameter(HelpMessage = 'Directory to write log files to. Defaults to a "Logs" folder inside the working folder, so everything the script writes stays in one place')]
     [string]$LogPath,
@@ -172,6 +185,8 @@ $Host.UI.RawUI.WindowTitle = "Windows ISO Updater - Running as Administrator - $
 $WorkRoot   = if ($WorkPath) { $WorkPath } else { Join-Path -Path $env:SystemDrive -ChildPath 'WISO-Work' }
 $ExtractDir = Join-Path -Path $WorkRoot -ChildPath 'ISO'
 $MountDir   = Join-Path -Path $WorkRoot -ChildPath 'Mount'
+# Where a standalone oscdimg.exe is cached if it has to be downloaded, so later runs reuse it.
+$OscdimgLocalPath = Join-Path -Path $WorkRoot -ChildPath 'Tools\oscdimg.exe'
 # Downloads and logs default under the work root - NOT the script folder, which may sit on a cloud-synced
 # drive (this repo, for example, lives under a Google Drive "My Drive" path).
 $DlDir      = if ($DownloadPath) { $DownloadPath } else { Join-Path -Path $WorkRoot -ChildPath 'Downloads' }
@@ -345,10 +360,97 @@ function Test-MicrosoftDownloadUrl {
     return ($Uri.Host -match '(?i)(^|\.)(microsoft\.com|windowsupdate\.com)$')
 }
 
+# Verifies the Fido helper is being fetched from the official pbatard/Fido repository on GitHub over
+# HTTPS. Fido is downloaded and then executed, so a URL pointing anywhere else is arbitrary code
+# execution; the parsed Host and path are checked (not a substring of the raw URL) so lookalikes such as
+# "github.com.evil.example" or "/evil/pbatard/Fido/" are rejected.
+function Test-FidoUrl {
+    param([string]$Url)
+    if (-not $Url) { return $false }
+    try { $Uri = [Uri]$Url } catch { return $false }
+    if ($Uri.Scheme -ne 'https') { return $false }
+    if ($Uri.Host -notin @('github.com', 'raw.githubusercontent.com', 'objects.githubusercontent.com', 'codeload.github.com')) { return $false }
+    return ($Uri.AbsolutePath -match '(?i)^/pbatard/Fido/')
+}
+
+# Validates a downloaded Fido.ps1 BEFORE it is executed. Fido is not code-signed, so there is no
+# signature to check; instead this confirms the file really is Fido and contains nothing that Fido has
+# any business doing. Checks, in order: an optional pinned SHA-256 (-FidoSha256), a sane file size, that
+# it parses as PowerShell, that it carries Fido's header and -GetUrl parameter, and that it invokes no
+# code-execution, persistence or security-tampering commands. Parsing only builds an AST - it never runs
+# the script. Returns $true if the file passes.
+function Test-FidoScript {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $Hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+    Write-HostTimestamp "  Fido SHA-256: $Hash"
+    if ($FidoSha256) {
+        if ($Hash -ne $FidoSha256.Trim()) {
+            Write-HostTimestamp "  Fido does not match the pinned SHA-256 ($($FidoSha256.Trim())). Refusing to run it." -ForegroundColor Red
+            return $false
+        }
+        Write-HostTimestamp '  Fido matches the pinned SHA-256.' -ForegroundColor Green
+    }
+
+    # A 404/HTML error page or a truncated download is nothing like the real ~55 KB script.
+    $Size = (Get-Item -LiteralPath $Path).Length
+    if ($Size -lt 20KB -or $Size -gt 1MB) {
+        Write-HostTimestamp "  The downloaded Fido helper is $Size bytes, which is not a plausible size for Fido.ps1. Refusing to run it." -ForegroundColor Red
+        return $false
+    }
+
+    $ParseErrors = $null
+    $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$ParseErrors)
+    if ($ParseErrors) {
+        Write-HostTimestamp "  The downloaded Fido helper is not valid PowerShell ($($ParseErrors.Count) parse error(s)). Refusing to run it." -ForegroundColor Red
+        return $false
+    }
+
+    $Text = Get-Content -LiteralPath $Path -Raw
+    if ($Text -notmatch '(?im)^#\s*Fido\s+v[\d.]+' -or $Text -notmatch '(?i)Copyright[^\r\n]*Pete Batard') {
+        Write-HostTimestamp '  The downloaded file does not look like Fido (its header and copyright notice are missing). Refusing to run it.' -ForegroundColor Red
+        return $false
+    }
+
+    $ParamNames = @($Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    if ('GetUrl' -notin $ParamNames) {
+        Write-HostTimestamp '  The downloaded Fido helper does not declare the -GetUrl parameter this script relies on. Refusing to run it.' -ForegroundColor Red
+        return $false
+    }
+
+    # Fido resolves and downloads ISOs; it never needs to run generated code, spawn shells, install
+    # services or scheduled tasks, or touch the registry, boot configuration or Defender.
+    $Banned = @(
+        'Invoke-Expression', 'iex', 'Set-ExecutionPolicy', 'Register-ScheduledTask', 'schtasks', 'schtasks.exe',
+        'New-Service', 'Set-Service', 'sc.exe', 'Add-MpPreference', 'Set-MpPreference', 'New-LocalUser',
+        'Add-LocalGroupMember', 'reg', 'reg.exe', 'regedit', 'regedit.exe', 'regsvr32', 'regsvr32.exe',
+        'bcdedit', 'bcdedit.exe', 'certutil', 'certutil.exe', 'bitsadmin', 'bitsadmin.exe', 'mshta', 'mshta.exe',
+        'rundll32', 'rundll32.exe', 'wmic', 'wmic.exe', 'vssadmin', 'vssadmin.exe', 'diskpart', 'diskpart.exe',
+        'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'
+    )
+    $Used = $Ast.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.CommandAst] }, $true) |
+        ForEach-Object { $_.GetCommandName() } | Where-Object { $_ }
+    $Hits = @($Used | Where-Object { $Banned -contains $_ } | Sort-Object -Unique)
+    if ($Hits.Count -gt 0) {
+        Write-HostTimestamp "  The downloaded Fido helper calls commands Fido has no reason to use: $($Hits -join ', '). Refusing to run it." -ForegroundColor Red
+        return $false
+    }
+
+    # Catch the same thing hidden behind obfuscation rather than a plain command call.
+    if ($Text -match '(?i)FromBase64String|-\s*Encoded\s*Command|\benc\b\s+[A-Za-z0-9+/=]{40,}') {
+        Write-HostTimestamp '  The downloaded Fido helper contains encoded/obfuscated code. Refusing to run it.' -ForegroundColor Red
+        return $false
+    }
+
+    return $true
+}
+
 # Uses the community "Fido" helper (which queries Microsoft's own software-download servers) to resolve
-# the official, matching Windows ISO download URL. Downloads Fido to a temp file, runs it with -GetUrl,
-# and returns the resulting URL string, or $null on failure. The resolved URL is verified to point at an
-# official Microsoft host before being returned. Fido: https://github.com/pbatard/Fido
+# the official, matching Windows ISO download URL. The helper is fetched only from the official GitHub
+# repository, validated before it runs (see Test-FidoScript), then run out-of-process with -GetUrl so it
+# cannot touch this script's session. Returns the resulting URL string, or $null on failure. The
+# resolved URL is verified to point at an official Microsoft host before being returned.
+# Fido: https://github.com/pbatard/Fido
 function Get-WindowsIsoUrl {
     param(
         [Parameter(Mandatory)][string]$Version,       # 10 or 11
@@ -357,12 +459,25 @@ function Get-WindowsIsoUrl {
         [Parameter(Mandatory)][string]$Architecture    # x64 / arm64 / x86
     )
 
+    if (-not (Test-FidoUrl -Url $FidoUrl)) {
+        Write-HostTimestamp "  The Fido URL does not point at the official https://github.com/pbatard/Fido repository. Refusing to download and run it: $FidoUrl" -ForegroundColor Red
+        Write-HostTimestamp '  Download an ISO yourself and re-run with -IsoPath "C:\path\to\Windows.iso".' -ForegroundColor Yellow
+        return $null
+    }
+
     $FidoScript = Join-Path -Path $env:TEMP -ChildPath "Fido_$(Get-Date -Format 'yyyyMMdd_HHmmss').ps1"
     Write-HostTimestamp '  Fetching the Fido download helper from GitHub...'
     if (-not (Get-FileDownload -Url $FidoUrl -Destination $FidoScript)) {
         Write-HostTimestamp '  Could not download the Fido helper. Provide an ISO manually with -IsoPath instead.' -ForegroundColor Red
         return $null
     }
+
+    if (-not (Test-FidoScript -Path $FidoScript)) {
+        Remove-Item -LiteralPath $FidoScript -Force -ErrorAction SilentlyContinue
+        Write-HostTimestamp '  Download an ISO yourself and re-run with -IsoPath "C:\path\to\Windows.iso".' -ForegroundColor Yellow
+        return $null
+    }
+    Write-HostTimestamp '  Verified the Fido helper came from the official repository and passed its content checks.' -ForegroundColor Green
 
     Write-HostTimestamp "  Asking Microsoft (via Fido) for the Windows $Version ($Release, $Language, $Architecture) ISO link..."
     $Url = $null
@@ -375,7 +490,16 @@ function Get-WindowsIsoUrl {
             Arch   = $Architecture
             GetUrl = $true
         }
-        $Output = & $FidoScript @FidoArgs 2>&1
+        # Prefer running Fido in its own Windows PowerShell process: it keeps third-party code out of this
+        # session, and Fido targets Windows PowerShell.
+        $WinPs = Join-Path -Path $env:SystemRoot -ChildPath 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (Test-Path -LiteralPath $WinPs) {
+            $Output = & $WinPs -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $FidoScript `
+                -Win $Version -Rel $Release -Lang $Language -Arch $Architecture -GetUrl 2>&1
+        }
+        else {
+            $Output = & $FidoScript @FidoArgs 2>&1
+        }
         $Url = ($Output | Where-Object { $_ -match '^https?://' } | Select-Object -Last 1)
         if ($Url) { $Url = $Url.ToString().Trim() }
     }
@@ -623,9 +747,12 @@ function Get-LatestCatalogPackage {
 }
 
 # Locates oscdimg.exe (from the Windows ADK Deployment Tools), which is required to recompile the ISO.
-# Checks -OscdimgPath, then PATH, then the standard ADK install locations. Returns the full path or $null.
+# Checks -OscdimgPath, a previously downloaded copy in the work folder, then PATH, then the standard ADK
+# install locations. Returns the full path or $null.
 function Find-Oscdimg {
     if ($OscdimgPath -and (Test-Path -LiteralPath $OscdimgPath)) { return (Resolve-Path -LiteralPath $OscdimgPath).Path }
+
+    if (Test-Path -LiteralPath $OscdimgLocalPath) { return (Resolve-Path -LiteralPath $OscdimgLocalPath).Path }
 
     $OnPath = Get-Command 'oscdimg.exe' -ErrorAction SilentlyContinue
     if ($OnPath) { return $OnPath.Source }
@@ -643,6 +770,96 @@ function Find-Oscdimg {
         }
     }
     return $null
+}
+
+# Downloads a standalone oscdimg.exe from Microsoft's public symbol server (msdl.microsoft.com), which
+# hosts the binary indexed by its PE TimeDateStamp + SizeOfImage - the technique described at
+# https://pete.akeo.ie/2025/06/downloading-oscdimgexe-from-microsoft.html. This avoids installing the
+# multi-hundred-MB Windows ADK just to get one ~140 KB executable. The symbol server only returns the
+# file when the request carries a symbol-client User-Agent, so one is set explicitly. Because the URL
+# pins one exact build, the download is verified against a known SHA-256 (the binary itself is not
+# Authenticode signed) as well as its Microsoft version resource.
+# Returns the path to the downloaded oscdimg.exe, or $null on failure.
+function Get-OscdimgDownload {
+    if (-not (Test-MicrosoftDownloadUrl -Url $OscdimgUrl)) {
+        Write-HostTimestamp "  The oscdimg URL is not an official Microsoft URL. Refusing to download it: $OscdimgUrl" -ForegroundColor Red
+        return $null
+    }
+
+    $ToolsDir = Split-Path -Parent $OscdimgLocalPath
+    try {
+        if (-not (Test-Path -LiteralPath $ToolsDir)) { New-Item -ItemType Directory -Path $ToolsDir -Force -ErrorAction Stop | Out-Null }
+    }
+    catch {
+        Write-HostTimestamp "  Could not create the tools folder '$ToolsDir': $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+
+    $Temp = "$OscdimgLocalPath.download"
+    Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
+    Write-HostTimestamp "  Downloading oscdimg.exe from the Microsoft symbol server: $OscdimgUrl"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $OscdimgUrl -OutFile $Temp -UseBasicParsing -UserAgent 'Microsoft-Symbol-Server/10.0.0.0' -ErrorAction Stop
+    }
+    catch {
+        Write-HostTimestamp "  Download failed: $($_.Exception.Message)" -ForegroundColor Red
+        Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+
+    if (-not (Test-Path -LiteralPath $Temp)) {
+        Write-HostTimestamp '  The symbol server did not return a file.' -ForegroundColor Red
+        return $null
+    }
+
+    # The symbol server answers a miss with a small HTML/text body, so confirm this really is a PE image.
+    # Read the two "MZ" header bytes directly - Get-Content's byte switch differs between PS 5 and 7.
+    $IsExe = $false
+    try {
+        $Stream = [System.IO.File]::OpenRead($Temp)
+        try {
+            $Header = New-Object byte[] 2
+            $IsExe = ($Stream.Read($Header, 0, 2) -eq 2 -and $Header[0] -eq 0x4D -and $Header[1] -eq 0x5A)
+        }
+        finally { $Stream.Dispose() }
+    }
+    catch { }
+    if (-not $IsExe) {
+        Write-HostTimestamp '  The downloaded file is not a Windows executable. Discarding it.' -ForegroundColor Red
+        Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+
+    # Only trust a binary that matches the pinned hash for this exact build. If the URL was overridden
+    # (so the hash cannot match), fall back to checking the file's Microsoft version resource.
+    if ($OscdimgSha256) {
+        $Hash = (Get-FileHash -LiteralPath $Temp -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+        if ($Hash -ne $OscdimgSha256) {
+            Write-HostTimestamp "  The downloaded oscdimg.exe does not match the expected SHA-256 (got $Hash). Discarding it." -ForegroundColor Red
+            Write-HostTimestamp '  If you deliberately pointed -OscdimgUrl at a different build, pass the matching -OscdimgSha256 (or an empty string to skip this check).' -ForegroundColor Yellow
+            Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
+            return $null
+        }
+    }
+    elseif ((Get-Item -LiteralPath $Temp).VersionInfo.CompanyName -notmatch '(?i)Microsoft') {
+        Write-HostTimestamp '  The downloaded file is not a Microsoft binary. Discarding it.' -ForegroundColor Red
+        Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+
+    try {
+        Move-Item -LiteralPath $Temp -Destination $OscdimgLocalPath -Force -ErrorAction Stop
+    }
+    catch {
+        Write-HostTimestamp "  Could not save oscdimg.exe to '$OscdimgLocalPath': $($_.Exception.Message)" -ForegroundColor Red
+        Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+
+    # Clear the Mark of the Web so the downloaded binary is not blocked when it runs.
+    Unblock-File -LiteralPath $OscdimgLocalPath -ErrorAction SilentlyContinue
+    return $OscdimgLocalPath
 }
 
 # Downloads the Windows ADK bootstrapper and silently installs ONLY the Deployment Tools feature (which
@@ -1093,16 +1310,25 @@ if (-not $ListEditions) {
         if ($script:Oscdimg) {
             Write-HostTimestamp "  Found oscdimg: $($script:Oscdimg)" -ForegroundColor Green
         }
-        elseif ($InstallAdk) {
-            Write-HostTimestamp '  oscdimg was not found. Installing the Windows ADK Deployment Tools...' -ForegroundColor Yellow
-            $script:Oscdimg = Install-AdkDeploymentTools
-            if ($script:Oscdimg) { Write-HostTimestamp "  Installed. Found oscdimg: $($script:Oscdimg)" -ForegroundColor Green }
+        else {
+            # Grab the single ~150 KB executable straight from Microsoft's symbol server first; only fall
+            # back to the full ADK install (which is hundreds of MB) if that fails.
+            if (-not $SkipOscdimgDownload) {
+                Write-HostTimestamp '  oscdimg was not found. Downloading a standalone copy from Microsoft...' -ForegroundColor Yellow
+                $script:Oscdimg = Get-OscdimgDownload
+                if ($script:Oscdimg) { Write-HostTimestamp "  Downloaded oscdimg: $($script:Oscdimg)" -ForegroundColor Green }
+            }
+            if (-not $script:Oscdimg -and $InstallAdk) {
+                Write-HostTimestamp '  Installing the Windows ADK Deployment Tools...' -ForegroundColor Yellow
+                $script:Oscdimg = Install-AdkDeploymentTools
+                if ($script:Oscdimg) { Write-HostTimestamp "  Installed. Found oscdimg: $($script:Oscdimg)" -ForegroundColor Green }
+            }
         }
     }
     $Oscdimg = $script:Oscdimg
     if (-not $Oscdimg) {
-        Write-HostTimestamp 'oscdimg.exe was not found. It is part of the Windows ADK "Deployment Tools" feature and is required to recompile the ISO.' -ForegroundColor Red
-        Write-HostTimestamp 'Re-run with -InstallAdk to have this script download and install it automatically, or install the Windows ADK (Deployment Tools) manually from Microsoft and re-run.' -ForegroundColor Yellow
+        Write-HostTimestamp 'oscdimg.exe was not found and could not be downloaded. It is part of the Windows ADK "Deployment Tools" feature and is required to recompile the ISO.' -ForegroundColor Red
+        Write-HostTimestamp 'Re-run with -InstallAdk to have this script download and install the ADK automatically, or install the Windows ADK (Deployment Tools) manually from Microsoft and re-run.' -ForegroundColor Yellow
         Stop-Transcript | Out-Null
         exit 1
     }
