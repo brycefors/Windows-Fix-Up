@@ -37,6 +37,11 @@
 		   The generator's unconditional pause before diskpart was also removed, so an empty disk installs
 		   with no keypress at all; the only remaining prompt is the WIPE confirmation on a disk that
 		   already holds data.
+
+		5. C:\Windows\Setup\Scripts\Specialize.ps1
+		   Three tweaks the generator does not offer were added: hibernation is turned off everywhere,
+		   virtual machines get a never-sleep high performance power plan, and the CloudContent policies
+		   that suppress suggested app installs are set on every machine.
 	-->
 	<!--https://schneegans.de/windows/unattend-generator/?LanguageMode=Unattended&UILanguage=en-US&Locale=en-US&Keyboard=00000409&GeoLocation=244&PEMode=Generated&Disable8Dot3Names=true&PauseBeforeFormatting=true&InstallFromMode=Interactive&PartitionMode=Unattended&TargetDisk=0&PartitionLayout=Automatic&SystemSize=300&RecoveryMode=Partition&RecoverySize=1000&DiskAssertionMode=Generated&AssertMinSize=100&AssertMaxSize=4000&AssertNoPartitions=true&ProcessorArchitecture=amd64&BypassRequirementsCheck=true&ComputerNameMode=Random&TimeZoneMode=Implicit&UserAccountMode=Unattended&AutoLogonMode=Builtin&BuiltinAdministratorPassword=Password123&PasswordExpirationMode=Unlimited&LockoutMode=Default&HideFiles=Hidden&TaskbarSearch=Box&TaskbarIconsMode=Default&StartTilesMode=Default&StartPinsMode=Default&EnableLongPaths=true&EnableRemoteDesktop=true&AllowPowerShellScripts=true&DisableLastAccess=true&PreventDeviceEncryption=true&HideEdgeFre=true&DeleteWindowsOld=true&EffectsMode=Default&DesktopIconsMode=Default&StartFoldersMode=Default&CoreIsolationMode=Enabled&VMwareTools=true&WifiMode=Skip&ExpressSettings=EnableAll&LockKeysMode=Skip&StickyKeysMode=Default&ColorMode=Default&WallpaperMode=Default&LockScreenMode=Default&AppLockerMode=Skip-->
 	<!-- offlineServicing: would apply packages/drivers to the image before it boots. Unused here. -->
@@ -396,6 +401,10 @@ foreach( $file in $Document.unattend.Extensions.File ) {
 		</File>
 		<!-- System wide tweaks applied during the specialize pass. Each scriptblock runs in order and is logged to Specialize.log. -->
 		<File path="C:\Windows\Setup\Scripts\Specialize.ps1">
+# Matched on SMBIOS identity rather than HypervisorPresent, which is also true on physical hosts running Hyper-V or VBS.
+$cs = Get-CimInstance -ClassName 'Win32_ComputerSystem';
+$isVirtualMachine = "$($cs.Manufacturer) $($cs.Model)" -match 'virtual|vmware|vbox|kvm|qemu|xen|bochs|parallels';
+
 $scripts = @(
 	{
 		# Passwords never expire.
@@ -419,10 +428,30 @@ $scripts = @(
 		fsutil.exe behavior set disableLastAccess 1;
 	};
 	{
+		# Reclaims a hiberfil.sys the size of installed RAM, and turns off Fast Startup with it.
+		powercfg.exe /hibernate off;
+	};
+	{
+		# A VM that sleeps or blanks mid task is only friction; physical machines keep their normal power behaviour.
+		if( $isVirtualMachine ) {
+			powercfg.exe /setactive SCHEME_MIN;
+			powercfg.exe /change standby-timeout-ac 0;
+			powercfg.exe /change monitor-timeout-ac 0;
+			powercfg.exe /change disk-timeout-ac 0;
+		}
+		else {
+			'Physical machine; leaving the power plan alone.';
+		}
+	};
+	{
+		# Blocks the suggested app installs (games, trials) that otherwise arrive on first network connect.
+		# Must be set before OOBE completes, which is why it lives in specialize.
+		reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent" /v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f;
+		reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent" /v DisableConsumerAccountStateContent /t REG_DWORD /d 1 /f;
+	};
+	{
 		# MODIFIED (change 2): only VMs skip automatic BitLocker device encryption; physical machines still encrypt.
-		# Matched on SMBIOS identity rather than HypervisorPresent, which is also true on physical hosts running Hyper-V or VBS.
-		$cs = Get-CimInstance -ClassName 'Win32_ComputerSystem';
-		if( "$($cs.Manufacturer) $($cs.Model)" -match 'virtual|vmware|vbox|kvm|qemu|xen|bochs|parallels' ) {
+		if( $isVirtualMachine ) {
 			reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\BitLocker" /v "PreventDeviceEncryption" /t REG_DWORD /d 1 /f;
 		}
 		else {
