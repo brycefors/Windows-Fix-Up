@@ -5,6 +5,9 @@
 
 This PowerShell script automates the whole process. A clean install or in-place upgrade started from the resulting ISO begins already patched, instead of spending a long time downloading and installing the same cumulative update after Setup finishes.
 
+> [!TIP]
+> **No PowerShell knowledge is required — just double-click `Run-Windows-ISO-Updater.bat`.** Everything is designed to run safely with its defaults: the batch file handles the UAC prompt and the execution policy for you (without changing any system-wide setting), the script explains what it is about to do and waits for your confirmation, and **nothing on the machine you run it from is modified** — the build happens entirely against files in a working folder. Every file it fetches (the ISO, the updates, `oscdimg.exe`, and the Fido helper) is verified to come from an official Microsoft or GitHub source before it is used — see [Important Notes](#important-notes).
+
 ## Table of Contents
 
 - [Important Notes](#important-notes)
@@ -47,6 +50,8 @@ This PowerShell script automates the whole process. A clean install or in-place 
 ## How to Run This Script
 
 The easiest and recommended way to run this script is by using the `Run-Windows-ISO-Updater.bat` file. It automatically handles administrator elevation and PowerShell execution policies, and will download the latest `Windows-ISO-Updater.ps1` from GitHub if it is missing.
+
+**As long as you use the batch file, no setup or PowerShell experience is needed.** It requests administrator rights through the normal UAC prompt, downloads the script over HTTPS from the official [Windows-Fix-Up](https://github.com/brycefors/Windows-Fix-Up) repository if it is not already next to it, and runs it with `-ExecutionPolicy Bypass` scoped to that single run — your system-wide execution policy is never changed. Running the `.ps1` by hand works too, but then elevation and execution policy are on you.
 
 ### Recommended Method: Using the Batch File
 
