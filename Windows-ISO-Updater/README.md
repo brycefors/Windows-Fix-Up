@@ -16,6 +16,8 @@ This PowerShell script automates the whole process. A clean install or in-place 
 - [Unattended Installs](#unattended-installs)
 - [What the Script Does](#what-the-script-does)
 - [How Files Are Downloaded](#how-files-are-downloaded)
+- [Design Notes](#design-notes)
+  - [Why Updates Are Not Pre-Checked Against the ISO](#why-updates-are-not-pre-checked-against-the-iso)
 - [Disk Space Requirements](#disk-space-requirements)
 - [Where Files Are Written](#where-files-are-written)
 - [Logging](#logging)
@@ -160,6 +162,24 @@ The script validates that the file exists and is well-formed XML before starting
 - The **ISO** link is resolved by the third-party **Fido** helper, which queries Microsoft's own software-download servers. If you prefer not to run external code, supply your own ISO with `-IsoPath`.
 - The **updates** are located by parsing the Microsoft Update Catalog search results and its download dialog (the same technique community tools use), then downloaded directly from Microsoft's update servers.
 - Downloads prefer **BITS** (resumable) and fall back to `Invoke-WebRequest`. Every resolved URL is verified to point at an official Microsoft host (`microsoft.com`, `windowsupdate.com`) over HTTPS before it is downloaded.
+
+## Design Notes
+
+### Why Updates Are Not Pre-Checked Against the ISO
+
+The script does not inspect the image's patch level before downloading and applying an update. It downloads the latest cumulative update and hands it to DISM regardless. This is deliberate.
+
+Re-applying an update that is already present is safe. Cumulative updates supersede one another, and DISM returns `0x800f081e` ("not applicable") when the package is already in the image. The script treats that as success and moves on, so the only cost of a redundant apply is time.
+
+A pre-check would have to answer "is this KB already in this image?", and that is harder than it looks:
+
+- The image reports a **build and UBR** (for example `26100.4946`), read from the `SOFTWARE` hive of a mounted image. The Microsoft Update Catalog reports a **KB number**. Nothing in either source maps one to the other, so the check needs a separate KB-to-UBR table scraped from Microsoft's release-health pages — a new dependency on HTML that Microsoft is free to restructure.
+- The `SPBuild` value in the WIM header is the only patch level available without mounting, and it is frequently stale on Microsoft-published media. Trusting it would produce wrong answers; not trusting it means paying for a read-only mount before the check is worth anything.
+- Out-of-band releases and newly published updates are missing from the table until it is re-synced, so the lookup has to **fail open** and apply the update anyway. The code would therefore do nothing in exactly the cases where certainty matters most.
+
+The payoff is small as well. Official Microsoft media usually lags the current cumulative update by months, so "already up to date" is the rare case rather than the common one — and even when it happens, only the update download and one mount are skipped. The Setup Dynamic Update, `boot.wim` servicing, component cleanup, re-export and `oscdimg` rebuild all still run.
+
+Weighed together, the current behaviour risks **wasted minutes in an uncommon case**, while the pre-check would risk **shipping an unpatched ISO because a lookup went stale**. The second failure is far worse and much quieter, so the check is intentionally left out.
 
 ## Disk Space Requirements
 
