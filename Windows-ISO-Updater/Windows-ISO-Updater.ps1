@@ -718,33 +718,56 @@ function Get-EditionRank {
 
 # Ensures a mount directory is clean and ready to receive a fresh WIM mount. A previous run that crashed
 # or was killed can leave an image still mounted (or a corrupt mount point) there, which makes the next
-# Mount-WindowsImage fail with "attempted to mount to a directory that is not empty". This discards any
-# image still mounted at the path, clears stale/corrupt mount state, then recreates the empty directory.
+# Mount-WindowsImage fail. DISM tracks a mount by WIM file + index as well as by directory, so a mount
+# left over at some other path still blocks the same index with "the specified image in the specified wim
+# is already mounted for read/write access". Pass -ImagePath so both are released.
 function Reset-MountDirectory {
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ImagePath
+    )
 
     $Normalized = $Path.TrimEnd('\')
-    try {
-        $Mounted = Get-WindowsImage -Mounted -ErrorAction SilentlyContinue
-        foreach ($M in $Mounted) {
-            if ($M.Path -and ($M.Path.TrimEnd('\') -ieq $Normalized)) {
-                Write-HostTimestamp "    A previous run left an image mounted here - discarding it: $Path" -ForegroundColor Yellow
-                Dismount-WindowsImage -Path $Path -Discard -ErrorAction SilentlyContinue | Out-Null
-            }
+    $TargetWim = if ($ImagePath) {
+        try { (Get-Item -LiteralPath $ImagePath -ErrorAction Stop).FullName } catch { $ImagePath }
+    }
+    else { $null }
+
+    $FindStale = {
+        try {
+            @(Get-WindowsImage -Mounted -ErrorAction SilentlyContinue | Where-Object {
+                    ($_.Path -and $_.Path.TrimEnd('\') -ieq $Normalized) -or
+                    ($TargetWim -and $_.ImagePath -and $_.ImagePath -ieq $TargetWim)
+                })
+        }
+        catch { @() }
+    }
+
+    foreach ($M in (& $FindStale)) {
+        $Leaf = if ($M.ImagePath) { Split-Path $M.ImagePath -Leaf } else { 'image' }
+        Write-HostTimestamp "    A previous run left $Leaf index $($M.ImageIndex) mounted at $($M.Path) - discarding it..." -ForegroundColor Yellow
+        if ($M.Path) {
+            try { Dismount-WindowsImage -Path $M.Path -Discard -ErrorAction Stop | Out-Null }
+            catch { Write-HostTimestamp "      Discard failed: $($_.Exception.Message)" -ForegroundColor Yellow }
         }
     }
-    catch { }
 
-    # Clear any stale/corrupt mount points DISM is still tracking.
+    # Releases mounts whose directory was deleted from under DISM; the only way back from an orphaned mount.
     try { Clear-WindowsCorruptMountPoint -ErrorAction SilentlyContinue | Out-Null } catch { }
 
-    if (Test-Path -LiteralPath $Path) {
-        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+    $Stale = & $FindStale
+    if ($Stale) {
+        $Detail = ($Stale | ForEach-Object { "$(if ($_.ImagePath) { Split-Path $_.ImagePath -Leaf } else { 'image' }) index $($_.ImageIndex)" }) -join ', '
+        throw "An image is still mounted ($Detail) and DISM will reject the next mount. Run 'dism /Cleanup-Mountpoints' from an elevated prompt, or reboot, then start the build again."
     }
-    # If a discarded mount is still releasing, a short pause and retry usually clears it.
+
+    # Only safe once nothing is mounted here - deleting a tracked mount directory is what orphans it.
     if (Test-Path -LiteralPath $Path) {
-        Start-Sleep -Seconds 2
         Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $Path) {
+            Start-Sleep -Seconds 2
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
     New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
 }
@@ -849,7 +872,7 @@ function Show-FinalImageInfo {
     $Mnt = Join-Path -Path $WorkRoot -ChildPath 'BuildCheck'
     $Hive = 'HKLM\WISO_BUILD'
     try {
-        Reset-MountDirectory -Path $Mnt
+        Reset-MountDirectory -Path $Mnt -ImagePath $WimPath
         Mount-WindowsImage -ImagePath $WimPath -Index $Images[0].ImageIndex -Path $Mnt -ReadOnly -ErrorAction Stop | Out-Null
         & reg.exe load $Hive "$Mnt\Windows\System32\config\SOFTWARE" *> $null
         try {
@@ -866,7 +889,11 @@ function Show-FinalImageInfo {
         Dismount-WindowsImage -Path $Mnt -Discard -ErrorAction SilentlyContinue | Out-Null
     }
     finally {
-        Remove-Item -LiteralPath $Mnt -Recurse -Force -ErrorAction SilentlyContinue
+        # Removing a directory DISM still tracks as mounted is what orphans a mount point, so leave it alone
+        # if the discard above did not take.
+        if (-not (Get-WindowsImage -Mounted -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.TrimEnd('\') -ieq $Mnt.TrimEnd('\') })) {
+            Remove-Item -LiteralPath $Mnt -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     if ($BuildStr) { Write-HostTimestamp "Final OS build: $BuildStr" -ForegroundColor Cyan }
@@ -1440,14 +1467,14 @@ if ($UpdateGroups.Count -gt 0) {
     # Tracks editions whose update set failed to apply, so we can warn loudly at the end.
     $script:ServicingFailures = 0
     # Start from a clean mount directory, discarding any stale mount a previous crashed run left behind.
-    Reset-MountDirectory -Path $MountDir
+    Reset-MountDirectory -Path $MountDir -ImagePath $InstallWimExtracted
 
     # 1) Service install.wim (each targeted edition).
     foreach ($Index in $ServiceIndexes) {
         $EditionName = ($InstallImages | Where-Object { $_.ImageIndex -eq $Index }).ImageName
         Invoke-Task -Description "Servicing install.wim index $Index ($EditionName)..." -ScriptBlock {
             try {
-                Reset-MountDirectory -Path $MountDir
+                Reset-MountDirectory -Path $MountDir -ImagePath $InstallWimExtracted
                 Write-HostTimestamp '    Mounting the image...'
                 Mount-WindowsImage -ImagePath $InstallWimExtracted -Index $Index -Path $MountDir -ErrorAction Stop | Out-Null
 
@@ -1456,7 +1483,7 @@ if ($UpdateGroups.Count -gt 0) {
                     $WinReWim = Join-Path $MountDir 'Windows\System32\Recovery\winre.wim'
                     if (Test-Path -LiteralPath $WinReWim) {
                         $WinReMount = Join-Path $WorkRoot 'WinREMount'
-                        Reset-MountDirectory -Path $WinReMount
+                        Reset-MountDirectory -Path $WinReMount -ImagePath $WinReWim
                         try {
                             Set-ItemProperty -LiteralPath $WinReWim -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
                             Write-HostTimestamp '    Servicing the recovery image (winre.wim)...'
@@ -1534,7 +1561,7 @@ if ($UpdateGroups.Count -gt 0) {
         foreach ($BootImg in $BootImages) {
             Invoke-Task -Description "Servicing boot.wim index $($BootImg.ImageIndex) ($($BootImg.ImageName))..." -ScriptBlock {
                 try {
-                    Reset-MountDirectory -Path $MountDir
+                    Reset-MountDirectory -Path $MountDir -ImagePath $BootWim
                     Mount-WindowsImage -ImagePath $BootWim -Index $BootImg.ImageIndex -Path $MountDir -ErrorAction Stop | Out-Null
                     foreach ($Group in $UpdateGroups) { Add-UpdateGroup -MountDir $MountDir -Group $Group | Out-Null }
                     & dism.exe /Image:"$MountDir" /Cleanup-Image /StartComponentCleanup | Out-Null
