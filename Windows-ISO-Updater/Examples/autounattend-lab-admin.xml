@@ -21,7 +21,9 @@
 		2. C:\Windows\Setup\Scripts\Specialize.ps1
 		   The generator writes PreventDeviceEncryption unconditionally. It is now gated on SMBIOS
 		   manufacturer and model, so only virtual machines skip automatic BitLocker encryption and
-		   physical machines built from the same ISO still encrypt normally.
+		   physical machines built from the same ISO still encrypt normally. Those machines also get the
+		   FVE encryption method policy set to AES 256 first, so anything BitLocker encrypts later uses
+		   XTS-AES 256 rather than the 128-bit default.
 
 		3. windowsPE pass, RunSynchronousCommand orders 23 and 24
 		   The generator prompts for the image index to install. It now applies index 1 without asking,
@@ -426,6 +428,13 @@ $scripts = @(
 		else {
 			'Physical machine ({0} {1}); leaving automatic device encryption enabled.' -f $cs.Manufacturer, $cs.Model;
 		}
+
+		# Set unconditionally, and before any volume is encrypted, so BitLocker uses AES 256 whenever it does run
+		# (automatic device encryption on a physical machine, or someone enabling it by hand later).
+		# 7 = XTS-AES 256 for the OS and fixed data drives; removable drives get 4 (AES-CBC 256), which older Windows can still read.
+		reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\FVE" /v EncryptionMethodWithXtsOs /t REG_DWORD /d 7 /f;
+		reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\FVE" /v EncryptionMethodWithXtsFdv /t REG_DWORD /d 7 /f;
+		reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\FVE" /v EncryptionMethodWithXtsRdv /t REG_DWORD /d 4 /f;
 	};
 	{
 		# Skip Microsoft Edge's first run / welcome experience.
