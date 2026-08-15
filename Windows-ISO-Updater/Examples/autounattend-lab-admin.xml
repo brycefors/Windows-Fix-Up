@@ -1,6 +1,39 @@
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-	<!--https://schneegans.de/windows/unattend-generator/?LanguageMode=Unattended&UILanguage=en-US&Locale=en-US&Keyboard=00000409&GeoLocation=244&PEMode=Generated&Disable8Dot3Names=true&PauseBeforeFormatting=true&InstallFromMode=Interactive&PartitionMode=Unattended&TargetDisk=0&PartitionLayout=Automatic&SystemSize=300&RecoveryMode=Partition&RecoverySize=1000&DiskAssertionMode=Generated&AssertMinSize=100&AssertMaxSize=4000&AssertNoPartitions=true&ProcessorArchitecture=amd64&BypassRequirementsCheck=true&ComputerNameMode=Random&TimeZoneMode=Implicit&UserAccountMode=Unattended&AutoLogonMode=Builtin&BuiltinAdministratorPassword=Password123&PasswordExpirationMode=Unlimited&LockoutMode=Default&HideFiles=Hidden&TaskbarSearch=Box&TaskbarIconsMode=Default&StartTilesMode=Default&StartPinsMode=Default&EnableLongPaths=true&EnableRemoteDesktop=true&AllowPowerShellScripts=true&DisableLastAccess=true&HideEdgeFre=true&DeleteWindowsOld=true&EffectsMode=Default&DesktopIconsMode=Default&StartFoldersMode=Default&CoreIsolationMode=Enabled&WifiMode=Interactive&ExpressSettings=DisableAll&LockKeysMode=Skip&StickyKeysMode=Default&ColorMode=Default&WallpaperMode=Default&LockScreenMode=Default&AppLockerMode=Skip-->
+	<!--
+		MANUALLY MODIFIED. Do not treat this as generator output.
+
+		This file started as output from the unattend generator at https://schneegans.de/windows/unattend-generator/
+		(the URL in the comment below reproduces the options that were selected), and was then hand edited.
+		Regenerating from that URL will silently discard every change listed here.
+
+		Changes made after generation:
+
+		1. C:\Windows\Setup\Scripts\VMwareTools.ps1
+		   The generator only installs VMware Tools from a Tools ISO mounted by the hypervisor, and gives up
+		   if none is attached. It now falls back to downloading the installer from packages.vmware.com.
+		   The fallback is gated on Win32_ComputerSystem.Manufacturer matching VMware, because the drive scan
+		   also finds nothing on physical hardware and would otherwise install Tools there. It retries the
+		   listing for about three minutes (first logon regularly starts before DHCP settles) and refuses to
+		   run the download unless its Authenticode signature is valid and signed by VMware or Broadcom.
+		   Install arguments were also corrected to VMware's documented form: /S /v"/qn REBOOT=R".
+
+		2. C:\Windows\Setup\Scripts\Specialize.ps1
+		   The generator writes PreventDeviceEncryption unconditionally. It is now gated on SMBIOS
+		   manufacturer and model, so only virtual machines skip automatic BitLocker encryption and
+		   physical machines built from the same ISO still encrypt normally.
+
+		3. windowsPE pass, RunSynchronousCommand orders 23 and 24
+		   The generator prompts for the image index to install. It now applies index 1 without asking,
+		   and the :choice label that existed only to retry that prompt was removed.
+
+		4. windowsPE pass, RunSynchronousCommand orders 13 and 15
+		   The generator's disk assertions abort outright when disk 0 already holds partitions, which makes
+		   the media useless for reinstalling over an existing system. That assertion now exits with code 2
+		   instead, and pe.cmd turns it into a prompt: you must type WIPE to erase disk 0, and anything else
+		   aborts without touching it. The size assertions still abort outright, as before.
+	-->
+	<!--https://schneegans.de/windows/unattend-generator/?LanguageMode=Unattended&UILanguage=en-US&Locale=en-US&Keyboard=00000409&GeoLocation=244&PEMode=Generated&Disable8Dot3Names=true&PauseBeforeFormatting=true&InstallFromMode=Interactive&PartitionMode=Unattended&TargetDisk=0&PartitionLayout=Automatic&SystemSize=300&RecoveryMode=Partition&RecoverySize=1000&DiskAssertionMode=Generated&AssertMinSize=100&AssertMaxSize=4000&AssertNoPartitions=true&ProcessorArchitecture=amd64&BypassRequirementsCheck=true&ComputerNameMode=Random&TimeZoneMode=Implicit&UserAccountMode=Unattended&AutoLogonMode=Builtin&BuiltinAdministratorPassword=Password123&PasswordExpirationMode=Unlimited&LockoutMode=Default&HideFiles=Hidden&TaskbarSearch=Box&TaskbarIconsMode=Default&StartTilesMode=Default&StartPinsMode=Default&EnableLongPaths=true&EnableRemoteDesktop=true&AllowPowerShellScripts=true&DisableLastAccess=true&PreventDeviceEncryption=true&HideEdgeFre=true&DeleteWindowsOld=true&EffectsMode=Default&DesktopIconsMode=Default&StartFoldersMode=Default&CoreIsolationMode=Enabled&VMwareTools=true&WifiMode=Skip&ExpressSettings=EnableAll&LockKeysMode=Skip&StickyKeysMode=Default&ColorMode=Default&WallpaperMode=Default&LockScreenMode=Default&AppLockerMode=Skip-->
 	<settings pass="offlineServicing"></settings>
 	<settings pass="windowsPE">
 		<component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
@@ -55,7 +88,7 @@
 				</RunSynchronousCommand>
 				<RunSynchronousCommand wcm:action="add">
 					<Order>13</Order>
-					<Path>cmd.exe /c &gt;&gt;X:\pe.cmd (echo:echo:actual = drive.Partitions&amp;echo:echo:If actual ^^^&gt; 0 Then&amp;echo:echo:Fail ^^^"There are already ^^^" ^^^&amp; actual ^^^&amp; ^^^" partitions on disk 0.^^^"&amp;echo:echo:End If)</Path>
+					<Path>cmd.exe /c &gt;&gt;X:\pe.cmd (echo:echo:actual = drive.Partitions&amp;echo:echo:If actual ^^^&gt; 0 Then&amp;echo:echo:WScript.Echo ^^^"Disk 0 already holds ^^^" ^^^&amp; actual ^^^&amp; ^^^" partitions.^^^"&amp;echo:echo:WScript.Quit 2&amp;echo:echo:End If)</Path>
 				</RunSynchronousCommand>
 				<RunSynchronousCommand wcm:action="add">
 					<Order>14</Order>
@@ -63,7 +96,7 @@
 				</RunSynchronousCommand>
 				<RunSynchronousCommand wcm:action="add">
 					<Order>15</Order>
-					<Path>cmd.exe /c &gt;&gt;X:\pe.cmd (echo:cscript.exe //E:vbscript ^"X:\assert.vbs^" //Nologo ^|^| call :fail ^"Disk assertion failed. Windows Setup will halt to avoid potential data loss.^"&amp;echo:^&gt;X:\GPT.txt (&amp;echo:echo:SELECT DISK=0&amp;echo:echo:CLEAN)</Path>
+					<Path>cmd.exe /c &gt;&gt;X:\pe.cmd (echo:cscript.exe //E:vbscript ^"X:\assert.vbs^" //Nologo&amp;echo:if errorlevel 2 goto :confirmwipe&amp;echo:if errorlevel 1 call :fail ^"Disk assertion failed. Windows Setup will halt to avoid potential data loss.^"&amp;echo:goto :assertok&amp;echo::confirmwipe&amp;echo:set ^"CONFIRM=^"&amp;echo:set /p ^"CONFIRM=Type WIPE to erase disk 0, or press Enter to abort: ^"&amp;echo:if /i not ^"^%CONFIRM^%^"==^"WIPE^" call :fail ^"Aborted. Disk 0 was not modified.^"&amp;echo::assertok&amp;echo:^&gt;X:\GPT.txt (&amp;echo:echo:SELECT DISK=0&amp;echo:echo:CLEAN)</Path>
 				</RunSynchronousCommand>
 				<RunSynchronousCommand wcm:action="add">
 					<Order>16</Order>
@@ -95,11 +128,11 @@
 				</RunSynchronousCommand>
 				<RunSynchronousCommand wcm:action="add">
 					<Order>23</Order>
-					<Path>cmd.exe /c &gt;&gt;X:\pe.cmd (echo:pause&amp;echo:diskpart.exe /s X:\^%LAYOUT^%.txt ^|^| call :fail ^"diskpart.exe encountered an error.^"&amp;echo:dism.exe /Get-WimInfo /WimFile:^"^%IMAGE_FILE^%^"&amp;echo:echo:&amp;echo::choice)</Path>
+					<Path>cmd.exe /c &gt;&gt;X:\pe.cmd (echo:pause&amp;echo:diskpart.exe /s X:\^%LAYOUT^%.txt ^|^| call :fail ^"diskpart.exe encountered an error.^"&amp;echo:dism.exe /Get-WimInfo /WimFile:^"^%IMAGE_FILE^%^"&amp;echo:echo:)</Path>
 				</RunSynchronousCommand>
 				<RunSynchronousCommand wcm:action="add">
 					<Order>24</Order>
-					<Path>cmd.exe /c &gt;&gt;X:\pe.cmd (echo:set /p ^"CHOICE=Enter index of the image you want to install: ^" ^|^| goto :choice&amp;echo:set ^"IMG_PARAM=/Index:^%CHOICE^%^"&amp;echo:call :print ^"Applying Windows image to target disk^")</Path>
+					<Path>cmd.exe /c &gt;&gt;X:\pe.cmd (echo:set ^"IMG_PARAM=/Index:1^"&amp;echo:call :print ^"Applying image index 1 to target disk^")</Path>
 				</RunSynchronousCommand>
 				<RunSynchronousCommand wcm:action="add">
 					<Order>25</Order>
@@ -181,9 +214,9 @@
 				</Password>
 			</AutoLogon>
 			<OOBE>
-				<ProtectYourPC>3</ProtectYourPC>
+				<ProtectYourPC>1</ProtectYourPC>
 				<HideEULAPage>true</HideEULAPage>
-				<HideWirelessSetupInOOBE>false</HideWirelessSetupInOOBE>
+				<HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
 				<HideOnlineAccountScreens>false</HideOnlineAccountScreens>
 			</OOBE>
 			<FirstLogonCommands>
@@ -218,6 +251,67 @@ foreach( $file in $Document.unattend.Extensions.File ) {
     [System.IO.File]::WriteAllBytes( $path, $bytes );
 }
 		</ExtractScript>
+		<File path="C:\Windows\Setup\Scripts\VMwareTools.ps1">
+&amp; {
+	$silent = '/S /v"/qn REBOOT=R"';
+
+	foreach( $letter in 'DEFGHIJKLMNOPQRSTUVWXYZ'.ToCharArray() ) {
+		$exe = "${letter}:\setup.exe";
+		if( ( Get-Item -LiteralPath $exe -ErrorAction 'SilentlyContinue' | Select-Object -ExpandProperty 'VersionInfo' | Select-Object -ExpandProperty 'ProductName' ) -eq 'VMware Tools' ) {
+			'Installing VMware Tools from {0}.' -f $exe;
+			Start-Process -FilePath $exe -ArgumentList $silent -Wait;
+			return;
+		}
+	}
+	'VMware Tools image (windows.iso) is not attached to this VM. Falling back to a direct download.';
+
+	if( ( Get-CimInstance -ClassName 'Win32_ComputerSystem' ).Manufacturer -notmatch 'VMware' ) {
+		'This is not a VMware virtual machine, so nothing will be downloaded.';
+		return;
+	}
+
+	$base = 'https://packages.vmware.com/tools/releases/latest/windows/x64/';
+	[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;
+	$ProgressPreference = 'SilentlyContinue';
+
+	# First logon can start before DHCP settles, so keep retrying the listing for about three minutes.
+	$name = $null;
+	for( $i = 1; $i -le 18 -and -not $name; $i++ ) {
+		try {
+			$name = @( ( Invoke-WebRequest -Uri $base -UseBasicParsing -TimeoutSec 15 ).Links.href | Where-Object { $_ -like '*.exe' -and $_ -notmatch '[\\/:]' } )[0];
+		}
+		catch {
+			'Attempt {0} to read {1} failed: {2}' -f $i, $base, $_.Exception.Message;
+		}
+		if( -not $name ) {
+			Start-Sleep -Seconds 10;
+		}
+	}
+	if( -not $name ) {
+		'Could not reach the VMware download site. VMware Tools was not installed.';
+		return;
+	}
+
+	$file = Join-Path -Path $env:TEMP -ChildPath $name;
+	try {
+		'Downloading {0}.' -f $name;
+		Invoke-WebRequest -Uri ( $base + $name ) -OutFile $file -UseBasicParsing;
+		$sig = Get-AuthenticodeSignature -LiteralPath $file;
+		if( $sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'VMware|Broadcom' ) {
+			'Refusing to run {0}: signature status is {1}, signer is {2}.' -f $name, $sig.Status, $sig.SignerCertificate.Subject;
+			return;
+		}
+		'Installing {0}.' -f $name;
+		Start-Process -FilePath $file -ArgumentList $silent -Wait;
+	}
+	catch {
+		'Download or installation failed: {0}' -f $_.Exception.Message;
+	}
+	finally {
+		Remove-Item -LiteralPath $file -Force -ErrorAction 'SilentlyContinue';
+	}
+} *&gt;&amp;1 | Out-String -Width 1KB -Stream &gt;&gt; 'C:\Windows\Setup\Scripts\VMwareTools.log';
+		</File>
 		<File path="C:\Windows\Setup\Scripts\Specialize.ps1">
 $scripts = @(
 	{
@@ -235,6 +329,16 @@ $scripts = @(
 	};
 	{
 		fsutil.exe behavior set disableLastAccess 1;
+	};
+	{
+		# Matched on SMBIOS identity rather than HypervisorPresent, which is also true on physical hosts running Hyper-V or VBS.
+		$cs = Get-CimInstance -ClassName 'Win32_ComputerSystem';
+		if( "$($cs.Manufacturer) $($cs.Model)" -match 'virtual|vmware|vbox|kvm|qemu|xen|bochs|parallels' ) {
+			reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\BitLocker" /v "PreventDeviceEncryption" /t REG_DWORD /d 1 /f;
+		}
+		else {
+			'Physical machine ({0} {1}); leaving automatic device encryption enabled.' -f $cs.Manufacturer, $cs.Model;
+		}
 	};
 	{
 		reg.exe add "HKLM\Software\Policies\Microsoft\Edge" /v HideFirstRunExperience /t REG_DWORD /d 1 /f;
@@ -261,6 +365,9 @@ $scripts = @(
 $scripts = @(
 	{
 		Set-ItemProperty -LiteralPath 'Registry::HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name 'AutoLogonCount' -Type 'DWord' -Force -Value 0;
+	};
+	{
+		&amp; 'C:\Windows\Setup\Scripts\VMwareTools.ps1';
 	};
 	{
 		cmd.exe /c "rmdir C:\Windows.old";

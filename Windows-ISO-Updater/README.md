@@ -131,7 +131,9 @@ The script validates that the file exists and is well-formed XML before starting
 
 ### Example: lab machine with no OOBE
 
-[`Examples/autounattend-lab-admin.xml`](Examples/autounattend-lab-admin.xml) skips OOBE entirely, signs in automatically as the built-in Administrator (password `Password123`), enables Remote Desktop, and sets `PreventDeviceEncryption` **only when the install detects it is running in a virtual machine**, so Windows 11 24H2 does not silently turn on BitLocker there. Physical machines built from the same ISO encrypt as normal. On VMware guests it also installs VMware Tools at first logon, using a Tools ISO mounted by the hypervisor if one is present and downloading from `packages.vmware.com` otherwise. The Setup pages before OOBE (language, disk, edition) stay interactive, so building with it cannot wipe a disk unattended.
+[`Examples/autounattend-lab-admin.xml`](Examples/autounattend-lab-admin.xml) skips OOBE entirely, signs in automatically as the built-in Administrator (password `Password123`), enables Remote Desktop, and sets `PreventDeviceEncryption` **only when the install detects it is running in a virtual machine**, so Windows 11 24H2 does not silently turn on BitLocker there. Physical machines built from the same ISO encrypt as normal. On VMware guests it also installs VMware Tools at first logon, using a Tools ISO mounted by the hypervisor if one is present and downloading from `packages.vmware.com` otherwise.
+
+The file was produced with [schneegans.de/windows/unattend-generator](https://schneegans.de/windows/unattend-generator/) and then **hand edited**; a comment at the top of the file records exactly what was changed and why. The generator URL preserved alongside it reproduces the original options only — regenerating from it discards the manual changes.
 
 ```shell
 .\Run-Windows-ISO-Updater.bat -UnattendPath ".\Examples\autounattend-lab-admin.xml"
@@ -139,6 +141,11 @@ The script validates that the file exists and is well-formed XML before starting
 
 > [!CAUTION]
 > That example produces a deliberately insecure machine: a well-known Administrator password stored in plain text in the answer file and on the finished ISO, an automatic first sign-in as Administrator, Remote Desktop reachable on all firewall profiles, and a first boot that downloads and silently runs an installer from the internet. It is for throwaway VMs on a trusted network only — change the password in both places in the file, and never reuse it anywhere that matters.
+
+> [!WARNING]
+> **This example partitions and formats disk 0 without asking which disk to use.** A generated WinPE script first asserts that disk 0 exists and is between 100 and 4000 GiB, aborting if not. If disk 0 already holds partitions it stops and asks: you must type `WIPE` to erase it, and any other answer aborts without touching the disk. Once past that, it cleans disk 0, applies image index 1, and reboots, with one further keypress prompt before `diskpart` runs.
+>
+> Because it applies **index 1**, it pairs with the default edition handling, which leaves a single edition at index 1. If you build with `-KeepAllEditions`, index 1 is whichever edition came first in the original ISO — usually Home, not the one you probably want.
 
 > [!WARNING]
 > Two things to watch for:
