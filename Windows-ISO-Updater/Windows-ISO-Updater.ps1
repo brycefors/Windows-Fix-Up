@@ -27,7 +27,9 @@
 #      those binaries don't match the version inside boot.wim - then cleans up the component store
 #      (/StartComponentCleanup /ResetBase) and re-exports install.wim to shrink it.
 #   6. Recompiles a new bootable ISO with oscdimg (from the Windows ADK), preserving both the BIOS and
-#      UEFI boot sectors so the new ISO boots on legacy and modern PCs alike.
+#      UEFI boot sectors so the new ISO boots on legacy and modern PCs alike. An answer file supplied with
+#      -UnattendPath is placed at the root of the media as autounattend.xml, which Windows Setup reads
+#      automatically when the ISO is booted.
 #
 # This is disk- and time-intensive: it needs a lot of free space (the download, the extracted media, the
 # mounted image, and the exported image all coexist) and DISM servicing/cleanup can take a long time.
@@ -83,6 +85,9 @@ param(
 
     [Parameter(HelpMessage = 'Skip integrating updates entirely and simply extract and recompile the ISO (useful for testing the build pipeline)')]
     [switch]$SkipUpdates,
+
+    [Parameter(HelpMessage = 'Path to an unattended answer file to place on the finished ISO as \autounattend.xml, so Windows Setup runs without prompting')]
+    [string]$UnattendPath,
 
     [Parameter(HelpMessage = 'Directory to download the ISO/updates into (defaults to the script folder). Needs several GB free')]
     [string]$DownloadPath,
@@ -905,6 +910,37 @@ else {
 }
 Write-Host $LineBreak
 
+# --- Validate the unattended answer file ---
+$ResolvedUnattend = $null
+$UnattendText = $null
+if ($UnattendPath) {
+    if (-not (Test-Path -LiteralPath $UnattendPath -PathType Leaf)) {
+        Write-HostTimestamp "The answer file '$UnattendPath' does not exist. Cannot continue." -ForegroundColor Red
+        Stop-Transcript | Out-Null
+        exit 1
+    }
+    $ResolvedUnattend = (Resolve-Path -LiteralPath $UnattendPath).Path
+    $UnattendDoc = New-Object System.Xml.XmlDocument
+    $UnattendDoc.XmlResolver = $null  # do not resolve external entities (XXE)
+    try {
+        $UnattendDoc.Load($ResolvedUnattend)
+    }
+    catch {
+        Write-HostTimestamp "The answer file '$ResolvedUnattend' is not valid XML: $($_.Exception.Message). Cannot continue." -ForegroundColor Red
+        Stop-Transcript | Out-Null
+        exit 1
+    }
+    $UnattendText = $UnattendDoc.OuterXml
+    Write-HostTimestamp "Answer file    : $ResolvedUnattend" -ForegroundColor Green
+    if ($UnattendDoc.DocumentElement.Name -ne 'unattend') {
+        Write-HostTimestamp "  Warning: the root element is <$($UnattendDoc.DocumentElement.Name)>, not <unattend>. Windows Setup will ignore this file." -ForegroundColor Yellow
+    }
+    if ($UnattendText -match '(?i)<(Password|AdministratorPassword|ProductKey)\b') {
+        Write-HostTimestamp '  NOTE: this answer file contains password/product key elements. Windows stores these in plain text or base64, and the finished ISO is not encrypted - anyone who can read the ISO can recover them.' -ForegroundColor Yellow
+    }
+    Write-Host $LineBreak
+}
+
 # --- Interactive confirmation ---
 if (-not $Unattended -and -not $SkipInteractive -and -not $ListEditions) {
     Write-Host "This tool builds an updated Windows installation ISO. It will:"
@@ -939,6 +975,9 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $ListEditions) {
     }
     else {
         Write-Host "  - Skip update integration (-SkipUpdates) and just recompile the ISO"
+    }
+    if ($ResolvedUnattend) {
+        Write-Host "  - Place your answer file on the media as autounattend.xml, so Setup runs unattended: $ResolvedUnattend" -ForegroundColor Yellow
     }
     Write-Host "  - Recompile a new bootable ISO with oscdimg"
     Write-Host ""
@@ -1580,6 +1619,22 @@ if (($UpdateGroups.Count -gt 0) -or $TrimNeeded) {
         catch {
             Write-HostTimestamp "  Re-export failed: $($_.Exception.Message). The original serviced install.wim will be used as-is." -ForegroundColor Yellow
             Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Host $LineBreak
+}
+
+# --- Add the unattended answer file to the media ---
+# Windows Setup implicitly reads \autounattend.xml from the root of read-only boot media during the
+# windowsPE pass, so no Setup switches are needed when the ISO is booted.
+if ($ResolvedUnattend) {
+    Invoke-Task -Description 'Adding the unattended answer file to the media...' -ScriptBlock {
+        $UnattendDest = Join-Path $ExtractDir 'autounattend.xml'
+        if (Test-Path -LiteralPath $UnattendDest) { Set-ItemProperty -LiteralPath $UnattendDest -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue }
+        Copy-Item -LiteralPath $ResolvedUnattend -Destination $UnattendDest -Force -ErrorAction Stop
+        Write-HostTimestamp '  Added autounattend.xml to the root of the media.' -ForegroundColor Green
+        if ($TrimNeeded -and $UnattendText -match '(?i)/IMAGE/INDEX') {
+            Write-HostTimestamp '  Warning: the answer file selects the edition by /IMAGE/INDEX, but install.wim was renumbered when the other editions were removed. Switch it to /IMAGE/NAME, or use -KeepAllEditions, if Setup cannot find the edition.' -ForegroundColor Yellow
         }
     }
     Write-Host $LineBreak

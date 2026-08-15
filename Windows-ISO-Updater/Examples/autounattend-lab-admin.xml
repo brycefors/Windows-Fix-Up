@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Lab answer file: skips OOBE and signs straight in as the built-in Administrator, enables Remote
+  Desktop, prevents Windows from automatically turning on BitLocker device encryption when it
+  detects the install is running in a virtual machine, and installs VMware Tools on VMware VMs.
+
+  Administrator password: Password123
+
+  ============================ READ THIS BEFORE USING ============================
+  This deliberately produces an INSECURE machine:
+    * The Administrator password is a well-known one, stored in plain text in this file
+      and in \autounattend.xml on the finished ISO. Anyone who can read either can read it.
+    * Windows signs into Administrator automatically once, straight after install. From the
+      next boot on it stops at the sign-in screen and the password above is what gets you in.
+    * Remote Desktop is open on all firewall profiles, so that password is usable from
+      the network by anyone who can reach port 3389.
+    * On a VM, the drive is left unencrypted, so anyone with access to the virtual disk
+      file can read it. Physical machines still encrypt as they normally would.
+    * On VMware, an installer is downloaded from the internet and run silently at first
+      logon, so the first boot trusts whatever packages.vmware.com serves.
+  Use it only for throwaway VMs and lab rebuilds on a trusted network. Never use it
+  for a machine that holds real data, faces the internet, or joins a domain.
+
+  Change the password in BOTH places below (<AdministratorPassword> and <AutoLogon>),
+  and do not reuse it anywhere that matters.
+  ===============================================================================
+
+  Usage:
+      .\Run-Windows-ISO-Updater.bat -UnattendPath ".\Examples\autounattend-lab-admin.xml"
+
+  Scope: this only automates OOBE. The earlier Setup pages (language, disk selection,
+  edition) stay interactive on purpose, so building an ISO with this file can never
+  silently wipe a disk. Locale is set to en-US; change the values below if needed.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <RunSynchronous>
+        <!-- specialize runs before OOBE, which is when 24H2 would otherwise start encrypting.
+             The manufacturer/model check means physical machines built from this ISO keep
+             automatic device encryption; only VMs opt out. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Prevent automatic BitLocker device encryption on virtual machines</Description>
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$s = Get-CimInstance Win32_ComputerSystem; if (($s.Manufacturer + ' ' + $s.Model) -match 'virtual|vmware|vbox|kvm|qemu|xen|bochs|parallels') { New-Item -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker' -Force | Out-Null; New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker' -Name PreventDeviceEncryption -PropertyType DWord -Value 1 -Force | Out-Null }"</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+
+    <component name="Microsoft-Windows-TerminalServices-LocalSessionManager"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <fDenyTSConnections>false</fDenyTSConnections>
+    </component>
+
+    <component name="Microsoft-Windows-TerminalServices-RDP-WinStationExtensions"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <!-- 1 = require Network Level Authentication. Leave this on. -->
+      <UserAuthentication>1</UserAuthentication>
+    </component>
+
+    <component name="Microsoft-Windows-Networking-MPSSVC-Svc"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <FirewallGroups>
+        <!-- Enabling the service alone is not enough; the firewall still blocks port 3389. -->
+        <FirewallGroup wcm:action="add" wcm:keyValue="RemoteDesktop">
+          <Active>true</Active>
+          <Group>@FirewallAPI.dll,-28752</Group>
+          <Profile>all</Profile>
+        </FirewallGroup>
+      </FirewallGroups>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <!-- Without these, OOBE still stops to ask for region and keyboard layout. -->
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <!-- 3 = do not turn on the recommended privacy/telemetry settings. -->
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+
+      <!-- Setting a password here also enables the built-in Administrator account. -->
+      <UserAccounts>
+        <AdministratorPassword>
+          <Value>Password123</Value>
+          <PlainText>true</PlainText>
+        </AdministratorPassword>
+      </UserAccounts>
+
+      <!-- LogonCount 1 spends the single automatic sign-in on the post-install logon, so the next
+           boot stops at the sign-in screen. Raise it to keep signing in automatically for longer. -->
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <LogonCount>1</LogonCount>
+        <Username>Administrator</Username>
+        <Password>
+          <Value>Password123</Value>
+          <PlainText>true</PlainText>
+        </Password>
+      </AutoLogon>
+
+      <FirstLogonCommands>
+        <!-- No-ops on anything that is not VMware. Prefers setup64.exe from a Tools ISO mounted by
+             the hypervisor, since that build matches the host, and only downloads (~135 MB) if none
+             is present. [char]34 supplies the quotes /v needs, so the line stays free of nested
+             double quotes. First logon can start before DHCP has settled, so the lookup retries for
+             up to three minutes rather than failing the install outright. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Install VMware Tools on VMware virtual machines</Description>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "if ((Get-CimInstance Win32_ComputerSystem).Manufacturer -notmatch 'VMware') { exit }; $q=[char]34; $a='/S /v'+$q+'/qn REBOOT=R'+$q; $cd=Get-CimInstance Win32_CDROMDrive | ForEach-Object { $_.Drive + '\setup64.exe' } | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1; if ($cd) { Start-Process $cd -ArgumentList $a -Wait; exit }; $b='https://packages.vmware.com/tools/releases/latest/windows/x64/'; $f=$null; for ($i=0; $i -lt 18 -and -not $f; $i++) { try { $f=@((Invoke-WebRequest $b -UseBasicParsing -TimeoutSec 15).Links.href | Where-Object { $_ -like '*.exe' -and $_ -notmatch '[\\/:]' })[0] } catch { Start-Sleep -Seconds 10 } }; if (-not $f) { exit }; $o=Join-Path $env:TEMP $f; Invoke-WebRequest ($b+$f) -OutFile $o -UseBasicParsing; Start-Process $o -ArgumentList $a -Wait"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+
+</unattend>

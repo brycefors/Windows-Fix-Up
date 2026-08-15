@@ -13,6 +13,7 @@ This PowerShell script automates the whole process. A clean install or in-place 
   - [Recommended Method: Using the Batch File](#recommended-method-using-the-batch-file)
   - [Running with Parameters (from Command Line)](#running-with-parameters-from-command-line)
 - [Command-Line Parameters](#command-line-parameters)
+- [Unattended Installs](#unattended-installs)
 - [What the Script Does](#what-the-script-does)
 - [How Files Are Downloaded](#how-files-are-downloaded)
 - [Disk Space Requirements](#disk-space-requirements)
@@ -102,6 +103,7 @@ The script supports the following optional parameters:
 | `-SkipSetupDU` | Skip the **Setup Dynamic Update**, which refreshes the loose Windows Setup files in the media's `sources` folder. It is applied **by default**; without it the Windows 11 24H2+ Setup engine can fail with *"Windows 11 installation has failed"*. |
 | `-ServiceWinRE` | Also service the recovery image (`winre.wim`). Off by default; the Safe OS Dynamic Update is used when available. |
 | `-SkipUpdates` | Skip update integration entirely and just extract and recompile the ISO. |
+| `-UnattendPath` | Path to an unattended answer file to place on the finished ISO as `\autounattend.xml`, so Windows Setup runs without prompting. |
 | `-DownloadPath` | Directory to download the ISO/updates into. Defaults to the script folder. |
 | `-WorkPath` | Working folder used to extract and service the media. Defaults to `<SystemDrive>\WISO-Work`. |
 | `-OutputIsoPath` | Full path for the recompiled ISO. Defaults to the download folder with an `-Updated` suffix. |
@@ -112,6 +114,34 @@ The script supports the following optional parameters:
 | `-LogPath` | Directory to write log files to. Defaults to a `Logs` folder inside the working folder. |
 | `-SkipInteractive` | Skips the interactive confirmation prompt (still shows output). |
 
+## Unattended Installs
+
+Pass an answer file with `-UnattendPath` and it is copied to the root of the finished ISO as `autounattend.xml`:
+
+```shell
+.\Run-Windows-ISO-Updater.bat -UnattendPath "C:\Answer\autounattend.xml"
+```
+
+Windows Setup implicitly reads `\autounattend.xml` from the root of read-only boot media during the `windowsPE` pass, so nothing else is needed — boot the ISO and Setup runs without prompting. Generate the file with [Windows System Image Manager](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/wsim/windows-system-image-manager-technical-reference) (part of the ADK) or a generator such as [schneegans.de/windows/unattend-generator](https://schneegans.de/windows/unattend-generator/).
+
+The script validates that the file exists and is well-formed XML before starting the build, and warns if the root element is not `<unattend>`.
+
+### Example: lab machine with no OOBE
+
+[`Examples/autounattend-lab-admin.xml`](Examples/autounattend-lab-admin.xml) skips OOBE entirely, signs in automatically as the built-in Administrator (password `Password123`), enables Remote Desktop, and sets `PreventDeviceEncryption` **only when the install detects it is running in a virtual machine**, so Windows 11 24H2 does not silently turn on BitLocker there. Physical machines built from the same ISO encrypt as normal. On VMware guests it also installs VMware Tools at first logon, using a Tools ISO mounted by the hypervisor if one is present and downloading from `packages.vmware.com` otherwise. The Setup pages before OOBE (language, disk, edition) stay interactive, so building with it cannot wipe a disk unattended.
+
+```shell
+.\Run-Windows-ISO-Updater.bat -UnattendPath ".\Examples\autounattend-lab-admin.xml"
+```
+
+> [!CAUTION]
+> That example produces a deliberately insecure machine: a well-known Administrator password stored in plain text in the answer file and on the finished ISO, an automatic first sign-in as Administrator, Remote Desktop reachable on all firewall profiles, and a first boot that downloads and silently runs an installer from the internet. It is for throwaway VMs on a trusted network only — change the password in both places in the file, and never reuse it anywhere that matters.
+
+> [!WARNING]
+> Two things to watch for:
+> - **Edition selection.** By default this script keeps only the highest edition and renumbers `install.wim`, so an answer file that selects the edition with `/IMAGE/INDEX` will point at the wrong image. Use `/IMAGE/NAME` instead, or build with `-KeepAllEditions`. The script warns when it detects this combination.
+> - **Secrets.** Answer files store passwords in plain text or base64 and product keys in the clear. Anyone who can read the ISO can recover them, so treat the finished ISO as a secret and don't commit the answer file to source control.
+
 ## What the Script Does
 
 1.  **Locate `oscdimg.exe`** — Fails fast (or installs the ADK with `-InstallAdk`) so the build cannot get most of the way through and then be unable to recompile the ISO.
@@ -121,8 +151,9 @@ The script supports the following optional parameters:
 5.  **Integrate the updates** — Uses offline DISM to apply the package(s) to `install.wim` (by default only the highest edition present — override with `-KeepAllEditions` or `-KeepEditions`/`-Edition`), to `boot.wim` (Windows Setup / WinPE), and optionally to `winre.wim`.
 6.  **Refresh the media Setup files** — Expands the **Setup Dynamic Update** over the media's `sources` folder (updated Setup binaries, compatibility database and replacement component manifests), then copies the serviced `setup.exe`, `setuphost.exe` (Windows 11 24H2+) and boot manager files out of `boot.wim` index 2 onto the media. Windows Setup **fails during installation** if these loose files do not match the version inside `boot.wim`.
 7.  **Clean up and shrink** — Runs `DISM /Cleanup-Image /StartComponentCleanup /ResetBase` and re-exports `install.wim` to reclaim space.
-8.  **Recompile the ISO** — Uses `oscdimg` to build a new bootable ISO, preserving both the **BIOS (`etfsboot.com`)** and **UEFI (`efisys.bin`)** boot sectors so the media boots on legacy and modern PCs alike.
-9.  **Clean up** — Removes the extracted working files, leaving the finished ISO.
+8.  **Add the answer file** — If `-UnattendPath` was supplied, copies it to the root of the media as `autounattend.xml`.
+9.  **Recompile the ISO** — Uses `oscdimg` to build a new bootable ISO, preserving both the **BIOS (`etfsboot.com`)** and **UEFI (`efisys.bin`)** boot sectors so the media boots on legacy and modern PCs alike.
+10. **Clean up** — Removes the extracted working files, leaving the finished ISO.
 
 ## How Files Are Downloaded
 
