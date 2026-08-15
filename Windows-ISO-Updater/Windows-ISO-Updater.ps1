@@ -208,6 +208,8 @@ $LineBreak = $null
 # Wall-clock start of the run plus the per-step durations collected by Invoke-Task, reported at the end.
 $script:ScriptStartTime = Get-Date
 $script:StepTimings = [System.Collections.Generic.List[psobject]]::new()
+# Captured from the serviced image while it is still mounted, so the final report does not have to mount it again.
+$script:FinalBuildString = $null
 
 function Get-TimeStamp {
     return (Get-Date -Format '[MM/dd/yyyy|HH:mm:ss]')
@@ -871,9 +873,34 @@ function Add-UpdateGroup {
     }
 }
 
+# Reads the exact build (with UBR) out of an ALREADY-MOUNTED image's offline SOFTWARE hive.
+# Returns a version string, or $null if the hive could not be read.
+function Get-MountedImageBuild {
+    param([Parameter(Mandatory)][string]$MountPath)
+
+    $Hive = 'HKLM\WISO_BUILD'
+    $SoftwareHive = Join-Path $MountPath 'Windows\System32\config\SOFTWARE'
+    if (-not (Test-Path -LiteralPath $SoftwareHive)) { return $null }
+    try {
+        & reg.exe load $Hive $SoftwareHive *> $null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        try {
+            $Cv = Get-ItemProperty -Path "Registry::$Hive\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop
+            return "10.0.$($Cv.CurrentBuildNumber).$($Cv.UBR)$(if ($Cv.DisplayVersion) { " ($($Cv.DisplayVersion))" })"
+        }
+        finally {
+            # The hive will not unload while PowerShell still holds a handle to the key it just read.
+            [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+            & reg.exe unload $Hive *> $null
+        }
+    }
+    catch { return $null }
+}
+
 # Reports the editions (indexes) inside the finished install.wim and the exact OS build. The build number
-# (including the revision/UBR set by the cumulative update) isn't stored in the WIM header, so it is read
-# from the image's offline SOFTWARE registry hive by briefly mounting the first index read-only.
+# (including the revision/UBR set by the cumulative update) isn't stored in the WIM header, so it comes from
+# the image's offline SOFTWARE hive - reusing the value captured during servicing, or mounting read-only if
+# there is none (mounting a finished image, especially a recovery-compressed .esd, costs several minutes).
 function Show-FinalImageInfo {
     param([Parameter(Mandatory)][string]$WimPath)
 
@@ -888,31 +915,25 @@ function Show-FinalImageInfo {
     foreach ($Img in $Images) { Write-Host ("    [{0}] {1}" -f $Img.ImageIndex, $Img.ImageName) }
 
     # Read the exact build (with UBR) from the first index's SOFTWARE hive.
-    $BuildStr = $null
-    $Mnt = Join-Path -Path $WorkRoot -ChildPath 'BuildCheck'
-    $Hive = 'HKLM\WISO_BUILD'
-    try {
-        Reset-MountDirectory -Path $Mnt -ImagePath $WimPath
-        Mount-WindowsImage -ImagePath $WimPath -Index $Images[0].ImageIndex -Path $Mnt -ReadOnly -ErrorAction Stop | Out-Null
-        & reg.exe load $Hive "$Mnt\Windows\System32\config\SOFTWARE" *> $null
+    $BuildStr = $script:FinalBuildString
+    if (-not $BuildStr) {
+        $Mnt = Join-Path -Path $WorkRoot -ChildPath 'BuildCheck'
+        Write-HostTimestamp '  Nothing was serviced this run, so the image has to be mounted to read its exact build. This takes a few minutes...' -ForegroundColor DarkGray
         try {
-            $Cv = Get-ItemProperty -Path "Registry::$Hive\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop
-            $BuildStr = "10.0.$($Cv.CurrentBuildNumber).$($Cv.UBR)$(if ($Cv.DisplayVersion) { " ($($Cv.DisplayVersion))" })"
+            Reset-MountDirectory -Path $Mnt -ImagePath $WimPath
+            Mount-WindowsImage -ImagePath $WimPath -Index $Images[0].ImageIndex -Path $Mnt -ReadOnly -ErrorAction Stop | Out-Null
+            $BuildStr = Get-MountedImageBuild -MountPath $Mnt
+            Dismount-WindowsImage -Path $Mnt -Discard -ErrorAction SilentlyContinue | Out-Null
+        }
+        catch {
+            Dismount-WindowsImage -Path $Mnt -Discard -ErrorAction SilentlyContinue | Out-Null
         }
         finally {
-            [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-            & reg.exe unload $Hive *> $null
-        }
-        Dismount-WindowsImage -Path $Mnt -Discard -ErrorAction SilentlyContinue | Out-Null
-    }
-    catch {
-        Dismount-WindowsImage -Path $Mnt -Discard -ErrorAction SilentlyContinue | Out-Null
-    }
-    finally {
-        # Removing a directory DISM still tracks as mounted is what orphans a mount point, so leave it alone
-        # if the discard above did not take.
-        if (-not (Get-WindowsImage -Mounted -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.TrimEnd('\') -ieq $Mnt.TrimEnd('\') })) {
-            Remove-Item -LiteralPath $Mnt -Recurse -Force -ErrorAction SilentlyContinue
+            # Removing a directory DISM still tracks as mounted is what orphans a mount point, so leave it alone
+            # if the discard above did not take.
+            if (-not (Get-WindowsImage -Mounted -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.TrimEnd('\') -ieq $Mnt.TrimEnd('\') })) {
+                Remove-Item -LiteralPath $Mnt -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
@@ -1537,6 +1558,10 @@ if ($UpdateGroups.Count -gt 0) {
                 Write-HostTimestamp '    Cleaning up the component store (/StartComponentCleanup /ResetBase)...'
                 # ResetBase permanently removes superseded components, shrinking the image. This is slow.
                 & dism.exe /Image:"$MountDir" /Cleanup-Image /StartComponentCleanup /ResetBase | Out-Null
+
+                # Grabbed here because the image is already mounted; mounting the finished image later just to
+                # read this one value costs several minutes.
+                if (-not $script:FinalBuildString) { $script:FinalBuildString = Get-MountedImageBuild -MountPath $MountDir }
 
                 Write-HostTimestamp '    Committing and unmounting...'
                 Dismount-WindowsImage -Path $MountDir -Save -ErrorAction Stop | Out-Null
