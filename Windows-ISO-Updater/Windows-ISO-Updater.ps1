@@ -86,6 +86,9 @@ param(
     [Parameter(HelpMessage = 'Skip integrating updates entirely and simply extract and recompile the ISO (useful for testing the build pipeline)')]
     [switch]$SkipUpdates,
 
+    [Parameter(HelpMessage = 'Export the finished image as install.esd (LZMS "recovery" compression) instead of install.wim. Typically 25-40% smaller, which can bring the image under the 4 GB FAT32 limit for UEFI USB sticks, but the export is slow and the finished media cannot be serviced again without converting it back')]
+    [switch]$CompressEsd,
+
     [Parameter(HelpMessage = 'Path to an unattended answer file to place on the finished ISO as \autounattend.xml, so Windows Setup runs without prompting')]
     [string]$UnattendPath,
 
@@ -241,6 +244,25 @@ function Get-DriveFreeGB {
     }
     catch { }
     return $null
+}
+
+# An export stages a second copy of the image beside the original, so both must fit at the same time.
+# Returns $false (and explains why) when the working drive no longer has room, so the caller can skip
+# the shrink instead of failing a build that is otherwise finished.
+function Test-RoomForExport {
+    param(
+        [Parameter(Mandatory)][string]$SourceImage,
+        [string]$Label = 'image'
+    )
+    $Free = Get-DriveFreeGB -Path $WorkRoot
+    if ($null -eq $Free) { return $true }
+    $SourceGB = try { (Get-Item -LiteralPath $SourceImage -ErrorAction Stop).Length / 1GB } catch { return $true }
+    $NeedGB = [math]::Round($SourceGB * 1.1, 2)
+    if ($Free -lt $NeedGB) {
+        Write-HostTimestamp "  Skipping the $Label re-export: staging a copy needs about $NeedGB GB, but only $Free GB is free on the working drive." -ForegroundColor Yellow
+        return $false
+    }
+    return $true
 }
 
 # Detects the currently-installed Windows version/architecture so the Fido download request can reuse it.
@@ -901,7 +923,7 @@ if ($null -eq $FreeGB) {
 }
 else {
     Write-HostTimestamp "Free space on the working drive: $FreeGB GB"
-    $RequiredGB = 40
+    $RequiredGB = 50
     if ($FreeGB -lt $RequiredGB) {
         Write-HostTimestamp "CRITICAL: Less than $RequiredGB GB free on the working drive. Building a patched ISO needs a lot of scratch space. Free up space, choose another drive with -WorkPath, and try again." -ForegroundColor Red
         Stop-Transcript | Out-Null
@@ -975,6 +997,9 @@ if (-not $Unattended -and -not $SkipInteractive -and -not $ListEditions) {
     }
     else {
         Write-Host "  - Skip update integration (-SkipUpdates) and just recompile the ISO"
+    }
+    if ($CompressEsd) {
+        Write-Host "  - Export the image as install.esd with recovery compression (-CompressEsd): a much smaller ISO, but a slow export and the media cannot be serviced again afterwards" -ForegroundColor Yellow
     }
     if ($ResolvedUnattend) {
         Write-Host "  - Place your answer file on the media as autounattend.xml, so Setup runs unattended: $ResolvedUnattend" -ForegroundColor Yellow
@@ -1548,6 +1573,34 @@ if ($UpdateGroups.Count -gt 0) {
             }
         }
 
+        # Servicing inflates boot.wim and nothing else reclaims that space, so re-export it.
+        if ($BootImages) {
+            Invoke-Task -Description 'Re-exporting boot.wim to shrink it...' -ScriptBlock {
+                if (-not (Test-RoomForExport -SourceImage $BootWim -Label 'boot.wim')) { return }
+                # Staged outside the media folder so a failed export can never be baked into the ISO.
+                $TempBoot = Join-Path -Path $WorkRoot -ChildPath 'boot_new.wim'
+                try {
+                    if (Test-Path -LiteralPath $TempBoot) { Remove-Item -LiteralPath $TempBoot -Force -ErrorAction SilentlyContinue }
+                    $BeforeMB = (Get-Item -LiteralPath $BootWim).Length / 1MB
+                    foreach ($Img in ($BootImages | Sort-Object ImageIndex)) {
+                        # Index 2 (Windows Setup) carries the WIM's bootable flag; without -Setbootable the ISO will not boot.
+                        $Boot = ([int]$Img.ImageIndex -eq 2)
+                        Write-HostTimestamp "  Exporting index $($Img.ImageIndex) ($($Img.ImageName))$(if ($Boot) { ' [bootable]' }) ..."
+                        Export-WindowsImage -SourceImagePath $BootWim -SourceIndex $Img.ImageIndex -DestinationImagePath $TempBoot -CompressionType Max -Setbootable:$Boot -ErrorAction Stop | Out-Null
+                    }
+                    Set-ItemProperty -LiteralPath $BootWim -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $BootWim -Force -ErrorAction Stop
+                    Move-Item -LiteralPath $TempBoot -Destination $BootWim -Force -ErrorAction Stop
+                    $AfterMB = (Get-Item -LiteralPath $BootWim).Length / 1MB
+                    Write-HostTimestamp ('  boot.wim: {0:N0} MB -> {1:N0} MB (saved {2:N0} MB).' -f $BeforeMB, $AfterMB, ($BeforeMB - $AfterMB)) -ForegroundColor Green
+                }
+                catch {
+                    Write-HostTimestamp "  Re-export failed: $($_.Exception.Message). The serviced boot.wim is used as-is." -ForegroundColor Yellow
+                    Remove-Item -LiteralPath $TempBoot -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
         # Push the serviced binaries onto the media so their versions match the serviced boot.wim.
         Invoke-Task -Description 'Updating the media Setup and boot manager files to match the serviced boot.wim...' -ScriptBlock {
             $StagedSetup = Join-Path $SetupStage 'setup.exe'
@@ -1600,24 +1653,39 @@ if ($UpdateGroups.Count -gt 0) {
 # --- Re-export install.wim (shrink after servicing and/or drop editions with -KeepEditions) ---
 # Exporting only the kept indexes both reclaims the space freed by the component cleanup AND physically
 # removes any editions the user chose not to keep. Runs when updates were applied or when trimming.
-if (($UpdateGroups.Count -gt 0) -or $TrimNeeded) {
-    $ExportDesc = if ($TrimNeeded) { "Rebuilding install.wim with only the kept edition(s) and shrinking it..." } else { 'Re-exporting install.wim to shrink it...' }
+# Tracks what Setup will actually read, since -CompressEsd replaces install.wim with install.esd.
+$FinalInstallImage = $InstallWimExtracted
+if (($UpdateGroups.Count -gt 0) -or $TrimNeeded -or $CompressEsd) {
+    $ExportDesc = if ($CompressEsd) { 'Exporting the image as install.esd (recovery compression - this is slow)...' }
+                  elseif ($TrimNeeded) { 'Rebuilding install.wim with only the kept edition(s) and shrinking it...' }
+                  else { 'Re-exporting install.wim to shrink it...' }
     Invoke-Task -Description $ExportDesc -ScriptBlock {
-        $Temp = Join-Path $ExtractDir 'sources\install_new.wim'
+        if (-not (Test-RoomForExport -SourceImage $InstallWimExtracted -Label 'install image')) { return }
+        $TempName    = if ($CompressEsd) { 'install_new.esd' } else { 'install_new.wim' }
+        $FinalName   = if ($CompressEsd) { 'install.esd' } else { 'install.wim' }
+        $Compression = if ($CompressEsd) { 'Recovery' } else { 'Max' }
+        $Temp = Join-Path $ExtractDir "sources\$TempName"
+        $Dest = Join-Path $ExtractDir "sources\$FinalName"
         try {
             if (Test-Path -LiteralPath $Temp) { Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue }
-            # Export the kept indexes in their original order into a fresh WIM (re-indexed 1..N).
+            $BeforeMB = (Get-Item -LiteralPath $InstallWimExtracted).Length / 1MB
+            # Export the kept indexes in their original order into a fresh image (re-indexed 1..N).
             foreach ($Index in ($KeepIndexes | Sort-Object)) {
                 $Name = ($InstallImages | Where-Object { $_.ImageIndex -eq $Index }).ImageName
                 Write-HostTimestamp "  Exporting [$Index] $Name ..."
-                Export-WindowsImage -SourceImagePath $InstallWimExtracted -DestinationImagePath $Temp -CompressionType Max -SourceIndex $Index -ErrorAction Stop | Out-Null
+                Export-WindowsImage -SourceImagePath $InstallWimExtracted -DestinationImagePath $Temp -CompressionType $Compression -SourceIndex $Index -ErrorAction Stop | Out-Null
             }
             Remove-Item -LiteralPath $InstallWimExtracted -Force -ErrorAction Stop
-            Rename-Item -LiteralPath $Temp -NewName 'install.wim' -ErrorAction Stop
-            Write-HostTimestamp '  Re-export complete.' -ForegroundColor Green
+            Move-Item -LiteralPath $Temp -Destination $Dest -Force -ErrorAction Stop
+            $script:FinalInstallImage = $Dest
+            $AfterMB = (Get-Item -LiteralPath $Dest).Length / 1MB
+            Write-HostTimestamp ('  {0}: {1:N0} MB -> {2:N0} MB (saved {3:N0} MB).' -f $FinalName, $BeforeMB, $AfterMB, ($BeforeMB - $AfterMB)) -ForegroundColor Green
+            if ($CompressEsd -and $AfterMB -ge 4096) {
+                Write-HostTimestamp '  Still over 4 GB, so a FAT32 USB stick will need the image split. Consider -KeepEditions to drop more editions.' -ForegroundColor DarkYellow
+            }
         }
         catch {
-            Write-HostTimestamp "  Re-export failed: $($_.Exception.Message). The original serviced install.wim will be used as-is." -ForegroundColor Yellow
+            Write-HostTimestamp "  Export failed: $($_.Exception.Message). The original serviced install.wim will be used as-is." -ForegroundColor Yellow
             Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
         }
     }
@@ -1708,7 +1776,7 @@ Write-Host $LineBreak
 
 # --- Report the final image contents (editions + build) before the working files are removed ---
 Invoke-Task -Description 'Reading the final image details...' -ScriptBlock {
-    Show-FinalImageInfo -WimPath $InstallWimExtracted
+    Show-FinalImageInfo -WimPath $FinalInstallImage
 }
 
 # --- Cleanup the working extraction folder ---

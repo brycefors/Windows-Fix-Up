@@ -105,6 +105,7 @@ The script supports the following optional parameters:
 | `-SkipSetupDU` | Skip the **Setup Dynamic Update**, which refreshes the loose Windows Setup files in the media's `sources` folder. It is applied **by default**; without it the Windows 11 24H2+ Setup engine can fail with *"Windows 11 installation has failed"*. |
 | `-ServiceWinRE` | Also service the recovery image (`winre.wim`). Off by default; the Safe OS Dynamic Update is used when available. |
 | `-SkipUpdates` | Skip update integration entirely and just extract and recompile the ISO. |
+| `-CompressEsd` | Export the finished image as `install.esd` (LZMS "recovery" compression) instead of `install.wim`. Typically **25-40% smaller**, which can bring the image under the 4 GB FAT32 limit for UEFI USB sticks — but the export is slow and the finished media cannot be serviced again without converting it back. |
 | `-UnattendPath` | Path to an unattended answer file to place on the finished ISO as `\autounattend.xml`, so Windows Setup runs without prompting. |
 | `-DownloadPath` | Directory to download the ISO/updates into. Defaults to the script folder. |
 | `-WorkPath` | Working folder used to extract and service the media. Defaults to `<SystemDrive>\WISO-Work`. |
@@ -152,7 +153,7 @@ The script validates that the file exists and is well-formed XML before starting
 4.  **Find the updates** — Detects the feature update (e.g. `24H2`) and architecture from the image, then downloads the latest combined Servicing Stack + Cumulative Update (and, by default, the .NET cumulative update — disable with `-SkipDotNet`, and the Setup Dynamic Update — disable with `-SkipSetupDU`) from the Microsoft Update Catalog. `-UpdatePath` uses your own packages instead.
 5.  **Integrate the updates** — Uses offline DISM to apply the package(s) to `install.wim` (by default only the highest edition present — override with `-KeepAllEditions` or `-KeepEditions`/`-Edition`), to `boot.wim` (Windows Setup / WinPE), and optionally to `winre.wim`.
 6.  **Refresh the media Setup files** — Expands the **Setup Dynamic Update** over the media's `sources` folder (updated Setup binaries, compatibility database and replacement component manifests), then copies the serviced `setup.exe`, `setuphost.exe` (Windows 11 24H2+) and boot manager files out of `boot.wim` index 2 onto the media. Windows Setup **fails during installation** if these loose files do not match the version inside `boot.wim`.
-7.  **Clean up and shrink** — Runs `DISM /Cleanup-Image /StartComponentCleanup /ResetBase` and re-exports `install.wim` to reclaim space.
+7.  **Clean up and shrink** — Runs `DISM /Cleanup-Image /StartComponentCleanup /ResetBase`, re-exports `install.wim` to reclaim space, and re-exports `boot.wim` (which servicing inflates), preserving the bootable flag on the Windows Setup index. With `-CompressEsd` the install image is written as `install.esd` instead, using recovery compression.
 8.  **Add the answer file** — If `-UnattendPath` was supplied, copies it to the root of the media as `autounattend.xml`.
 9.  **Recompile the ISO** — Uses `oscdimg` to build a new bootable ISO, preserving both the **BIOS (`etfsboot.com`)** and **UEFI (`efisys.bin`)** boot sectors so the media boots on legacy and modern PCs alike.
 10. **Clean up** — Removes the extracted working files, leaving the finished ISO.
@@ -183,7 +184,9 @@ Weighed together, the current behaviour risks **wasted minutes in an uncommon ca
 
 ## Disk Space Requirements
 
-Because the download, the extracted media, the mounted image, and the re-exported image all coexist, the working drive should have at least **40 GB free**. The script checks this up front and stops if the working drive is too small — choose a larger drive with `-WorkPath` if needed.
+Because the download, the extracted media, the mounted image, and the re-exported image all coexist, the working drive should have at least **50 GB free**. The script checks this up front and stops if the working drive is too small — choose a larger drive with `-WorkPath` if needed.
+
+The shrink steps near the end of the build stage a second copy of the image beside the original, so each one re-checks free space first. If the drive has filled up, that step is skipped with a warning and the build still finishes — the ISO is just larger than it could have been.
 
 ## Where Files Are Written
 
